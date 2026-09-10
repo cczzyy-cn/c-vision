@@ -14,7 +14,9 @@ import test, { mock } from 'node:test'
 /** 让出一个宏任务：用于推进被 await 的处理器（如「截图进行中」的时序用例）。 */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
 
-const { apply, snipExecutor, clipboardProbe } = await import('../lib/index.js')
+const { apply, snipExecutor, clipboardProbe, describeRuntimeProblem, PIP_HINT, ensureRuntime } = await import(
+  '../lib/index.js'
+)
 
 /** 捕获 apply 注册的路由与工具的数。 */
 function mountHost(resolveModelInfo = async () => ({ inputModalities: ['text'] })) {
@@ -429,4 +431,97 @@ test('剪贴板取图：非 POST（405）与跨站（403）都拒绝，且不触
       assert.equal(calls, 0, '被拒的请求不该读剪贴板')
     },
   )
+})
+
+// ── 运行时体检门（v0.2.18） ──────────────────────────────────────────────────
+/**
+ * 依赖没装时，`see`/`ocr` 原本会抛裸的 `ModuleNotFoundError`，用户看不出该做什么。
+ * `describeRuntimeProblem` 是把体检结论翻译成「可操作提示」的纯函数，这里钉死它的判定与文案
+ * （真去 spawn Python 装/卸依赖在 CI 上不可行，所以只测这个纯函数）。
+ */
+/** 造一份体检结论；`overrides` 用于改单个字段。 */
+function statusOf(overrides = {}) {
+  return {
+    platform: 'win32',
+    python: '3.12.0',
+    backend: 'windows',
+    backend_known: true,
+    backend_implemented: true,
+    deps: { Pillow: true, pyautogui: true, pyperclip: true },
+    ok: true,
+    ...overrides,
+  }
+}
+
+test('体检：环境完整 → 不拦（返回 null）', () => {
+  assert.equal(describeRuntimeProblem(statusOf(), null), null)
+})
+
+test('体检：缺 Pillow → 给出缺什么 + 带绝对路径的 pip 命令', () => {
+  const problem = describeRuntimeProblem(statusOf({ deps: { Pillow: false, pyautogui: true, pyperclip: true } }), null)
+  assert.ok(problem, '缺 Pillow 必须拦下')
+  assert.match(problem, /Pillow/)
+  assert.match(problem, /pip install/)
+  // 命令必须带绝对路径，用户不该自己去猜插件安装目录。
+  assert.ok(problem.includes(PIP_HINT), '要给出可直接复制的安装命令')
+  assert.match(PIP_HINT, /requirements\.txt"?$/)
+  assert.match(problem, /cvision_status\(\)/, '要指向复查手段')
+})
+
+test('体检：缺 pyautogui 且其它都正常 → 不拦，避免误伤 see/ocr', () => {
+  // pyautogui 只影响输入类工具；若拿它当门，用户只是没装输入依赖就看不到截图，属于过度拦截。
+  // 它仍由 cvision_status() 的 deps 报告出来（另有 Python 侧用例钉死探针覆盖）。
+  const problem = describeRuntimeProblem(
+    statusOf({ deps: { Pillow: true, pyautogui: false, pyperclip: true }, ok: true }),
+    null,
+  )
+  assert.equal(problem, null, '缺 pyautogui 不该阻止 see/ocr')
+})
+
+test('体检：已有其它阻塞项时，缺 pyautogui 要作为附加说明列出来', () => {
+  const problem = describeRuntimeProblem(
+    statusOf({ deps: { Pillow: false, pyautogui: false, pyperclip: false }, ok: false }),
+    null,
+  )
+  assert.ok(problem)
+  assert.match(problem, /Pillow/)
+  assert.match(problem, /pyautogui/, '既然报错，就该把「输入类工具也不可用」一并说清')
+  assert.match(problem, /输入类工具不可用/)
+})
+
+test('体检：后端未实现（如 Linux）→ 说清 platform 与 backend，而不是假装依赖问题', () => {
+  const problem = describeRuntimeProblem(
+    statusOf({ platform: 'linux', backend: 'linux', backend_implemented: false }),
+    null,
+  )
+  assert.ok(problem, '后端未实现必须拦下')
+  assert.match(problem, /linux/)
+  assert.match(problem, /后端未实现/)
+  // 平台不支持不是 `pip install` 能解决的，不该误导用户去装包。
+  assert.ok(!problem.includes('pip install'), '后端未实现时不要给安装命令')
+})
+
+test('体检：探针本身跑不起来 → 提示先查解释器/路径，并附 CVISION_PYTHON 线索', () => {
+  const problem = describeRuntimeProblem(null, 'spawn python ENOENT')
+  assert.ok(problem, '探针失败必须拦下')
+  assert.match(problem, /ENOENT/)
+  assert.match(problem, /Python 3\.10\+/)
+  assert.match(problem, /CVISION_PYTHON=/)
+  assert.ok(problem.includes(PIP_HINT))
+})
+
+test('体检：探针结构漂移（deps 缺失）不得被当成「没问题」', () => {
+  const problem = describeRuntimeProblem(statusOf({ deps: undefined }), null)
+  assert.ok(problem, 'deps 读不出来时必须拦，不能默认放行')
+  assert.match(problem, /Pillow/)
+})
+
+test('体检门：真实环境下 ensureRuntime 放行（本机依赖齐全）', async () => {
+  // 这条会真的 spawn 一次 `python -m cvision.cli_capture --status`（本仓库 CI 装了 Pillow）。
+  // 若本机没装 Python/依赖，它会抛出可操作错误——那正是门在起作用的证据，故不强断言成功。
+  try {
+    await ensureRuntime({ signal: AbortSignal.timeout(20000) })
+  } catch (error) {
+    assert.match(String(error.message), /pip install|cvision_status|Python 3\.10\+/)
+  }
 })

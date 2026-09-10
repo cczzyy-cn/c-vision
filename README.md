@@ -10,7 +10,7 @@ Python 版 cvision** 截屏/OCR/输入 → 写入 Harness 附件服务（`ctx.at
 
 同一个包还带一个**浏览器半边**：输入框工具栏的「截图」按钮（人工一键抓屏，或把剪贴板里的图片作为附件）。
 
-**版本**：`0.2.17` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
+**版本**：`0.2.18` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
 **许可**：BSD-3-Clause · 变更历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 目录
@@ -45,6 +45,11 @@ python -m pip install -r <插件安装目录>\requirements.txt
 3) **重启 DSH**（宿主半边生效）→ 4) **硬刷新页面 `Ctrl+Shift+R`**（浏览器半边生效，仅升级时需要）。
 
 验证：让模型调用 `cvision_status()` 看运行环境探针；或直接说「用 see 看一下屏幕」。
+
+> **依赖只在「装」和「升级」时需要管一次**：`pip install` 是幂等的，依赖装在**你的 Python** 里而不是
+> 插件目录里，所以升级插件一般不用重跑（除非换了机器/解释器，或 `requirements.txt` 加了新依赖）。
+> 漏装也别慌：**本会话第一次**调用 `see`/`ocr` 等工具时，插件会先探一次环境，直接把「缺什么 + 带绝对
+> 路径的 pip 命令」告诉你，而不是抛一句裸的 Python 报错（v0.2.18 起）。
 
 > `dsh` 通常不在系统 PATH（在 npx 缓存里），用 `npx -y @deepseek-ai/dsh …`；`dsh plugin` 是 pnpm 前向器，
 > 需本机有 `pnpm`。装完 `npx -y @deepseek-ai/dsh --dump-config` 能看到多出 `# == Vision` 配置层。
@@ -257,7 +262,7 @@ npm run check:deps   # Python 依赖锁定自检（8 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
-当前规模：**JS 54 条 + Python 72 条**。
+当前规模：**JS 62 条 + Python 73 条**。
 
 ### 文档约定（自动校验）
 
@@ -373,7 +378,7 @@ vision/                      # 仓库根 = 插件本体
 | 按钮变蓝、长按却没插入 | 长按阈值 **0.9s**；按住时应看到底部进度条；按钮未点亮时按住不做任何事（按设计） |
 | 单击截图后按钮变蓝 | 已由 `served` 归属解决（v0.2.10/0.2.11）；若仍出现，见 README「取消与归属」的时序说明 |
 | 取消了截图，之后别的截图却进了附件栏 | v0.2.13 起修复（覆盖层判据）；若先前的旧版本仍在跑，重启宿主 |
-| 工具报 `python` 找不到 / 依赖缺失 | 装 Python 3 与 `python -m pip install -r requirements.txt`；`cvision_status()` 会列出缺哪个模块 |
+| 工具报 `python` 找不到 / 依赖缺失 | 装 Python 3.10+ 与 `python -m pip install -r requirements.txt`；**v0.2.18 起首次调用会直接给出带绝对路径的安装命令**；`cvision_status()` 会列出缺哪个模块 |
 | 抓窗口是黑图/空白 | 未装 `winsdk` 时 WGC 不可用，会回退 `PrintWindow`／桌面区域；装 `winsdk` 后最准（微信等 Qt 窗口属已知空白帧场景） |
 | 中文窗口标题匹配不上 | v0.2.2 起所有 Python 子进程强制 UTF-8；若自行调用 Python，请一并设 `PYTHONUTF8=1` |
 | 升级后行为没变 | 见[升级后必须做什么](#升级后必须做什么)：客户端半边要**硬刷新**，宿主半边要**重启** |
@@ -382,7 +387,7 @@ vision/                      # 仓库根 = 插件本体
 
 ## 说明与限制
 
-- **跨语言**：插件用 `child_process` 调包内 Python 做截屏/OCR/输入，需目标机器有桌面环境与 Python 3。
+- **跨语言**：插件用 `child_process` 调包内 Python 做截屏/OCR/输入，需目标机器有桌面环境与 Python 3.10+。
 - **截图后端**：`capture_window` 依次尝试 **Windows Graphics Capture**（真实合成内容，抓 GPU/Chromium/被遮挡
   窗口最准，需 `winsdk`）→ **PrintWindow** → **读合成桌面区域**（兜底，此时才可能置前，抓完立即还原）。
 - **附件限制**：Harness attachment 单图源 ≤20MiB、单边 ≤8192px、每条消息 ≤20 张；输出前会自动缩放到限制内

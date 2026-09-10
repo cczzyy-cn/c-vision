@@ -10,6 +10,32 @@
 > - `v0.1.0` ~ `v0.1.9` 的说明只在 [GitHub Releases](https://github.com/cczzyy-cn/c-vision/releases) 里
 >   （那时还没有本文件）。
 
+## v0.2.18
+
+**首次调用前的运行时体检：依赖没装时给出「装什么、怎么装」，而不是一句裸 Python 报错。**
+
+- 背景：装完插件后必须手动跑一次 `pip install -r requirements.txt`（DSH 不跑 pip，见
+  [STORE 契约](./README.md#dsh-store-上架契约)）。代价是依赖缺失时 `see`/`ocr` 第一句就抛裸的
+  `ModuleNotFoundError` 或子进程报错，用户看不出该做什么——而 `assertCvisionPresent()` 只查
+  `cvision/` 目录在不在，**不查依赖**。
+- 修法：在**本会话第一次调用工具前**用 `cli_capture --status` 探一次环境，把结论翻译成可操作提示
+  （缺什么、运行环境如何、**带绝对路径的 pip 命令**、装完用 `cvision_status()` 复查）。该探针刻意是
+  「无依赖」的（`status.py` 不 import PIL，平台后端有 try/except 兜底），所以**一个依赖都没装的
+  新环境照样能跑出结论**——这正是它能当体检用的原因。结论缓存在进程内，整个会话只探一次。
+- 判定口径：只把**真正会挡住 `see`/`ocr`** 的问题当门——缺 `Pillow`、平台后端未实现、或探针根本跑不起来
+  （没有可用解释器 → 提示 `CVISION_PYTHON`/`CVISION_DIR`）。**缺 `pyautogui` 不拦**（它只影响输入类
+  工具，拿它当门会让「只想截图」的用户被误伤），仅作为附加说明列出。平台后端未实现时**不给** `pip`
+  命令——那不是装包能解决的。
+- 体检门加在 5 个「收口函数」上（`captureDataUrl`/`ocrJson`/`listWindowsJson`/`screenInfoJson`/
+  `runCliInput`、`runPythonCli`），16 个工具除 `cvision_status` 外全部覆盖。**`cvision_status` 刻意不过门**：
+  环境不完整时它正是「唯一还能用」的排错手段，gate 了它用户就失去了查出问题的方法（已有用例钉死）。
+- 顺带补掉体检探针的真实盲区：`pyperclip` 看着只影响非 Windows 的文本剪贴板，实际是**导入期**硬依赖
+  ——`pyautogui` → `mouseinfo` → 模块顶层 `import pyperclip`。它缺失会让 `pyautogui` 整个 import 失败
+  （所有输入类工具都挂），但旧探针只查 `pyautogui`，会**误报 `ok: true`**。现已一并探掉，并加了用例。
+- 测试：JS 54 → **62**（`describeRuntimeProblem` 的判定与文案，含「缺 pyautogui 不拦」「后端未实现不给
+  pip」「探针结构漂移不得当成没问题」等边界；另有一条真实 `ensureRuntime` 冒烟）；Python 72 → **73**
+  （断言探针覆盖 `Pillow`/`pyautogui`/`pyperclip`）。文案是纯函数，所以不必在 CI 里真装/卸依赖。
+
 ## v0.2.17
 
 **锁定 Python 依赖（唯一的供应链面）+ 修 `cli_ocr` 丢失词框的契约不一致。**

@@ -52,6 +52,11 @@ def status() -> dict:
     deps = {
         "Pillow": "PIL",
         "pyautogui": "pyautogui",
+        # pyperclip 看着只影响「非 Windows 的文本剪贴板」，实际是**导入期**硬依赖：
+        # pyautogui -> mouseinfo -> `import pyperclip`（模块顶层，非惰性），
+        # 所以它缺失会让 pyautogui 整个 import 失败 —— 也就是所有输入类工具都挂，
+        # 但旧探针只查 pyautogui 会误报 ok，把「能跑」说成能跑。一并探掉。
+        "pyperclip": "pyperclip",
     }
     if sys.platform.startswith("win"):
         deps["pywin32"] = "win32gui"

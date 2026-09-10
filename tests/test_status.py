@@ -28,6 +28,16 @@ class TestStatus(unittest.TestCase):
     def test_backend_known(self):
         self.assertTrue(status.status()["backend_known"])
 
+    def test_probe_covers_pyautogui_eager_import_deps(self):
+        """探针必须覆盖 pyautogui 的**导入期**硬依赖（pyperclip 经 mouseinfo 顶层 import）。
+
+        只探 pyautogui 会误报 ok：pyperclip 缺失时 pyautogui 根本 import 不进来。
+        """
+        deps = status.status()["deps"]
+        self.assertIn("Pillow", deps)
+        self.assertIn("pyautogui", deps)
+        self.assertIn("pyperclip", deps)
+
     def test_cvison_dir_points_at_package_root(self):
         """该字段是「包根目录」而非 cwd：插件把子进程 cwd 改成临时目录后，cwd 不再代表 cvision 的位置。"""
         import os

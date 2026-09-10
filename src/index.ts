@@ -107,8 +107,102 @@ function assertCvisionPresent(): void {
   }
 }
 
+// ── 首次调用前的运行时体检（把「裸 Python 报错」换成可操作提示） ──────────────
+/**
+ * 装完插件后**必须手动跑一次** `pip install -r requirements.txt`（DSH 不跑 pip：包没有
+ * prepare/postinstall 钩子，且安装期静默装包属于供应链风险）。代价是：依赖没装时
+ * `see`/`ocr` 第一句就会抛裸的 `ModuleNotFoundError` 或子进程报错，用户看不出该做什么。
+ *
+ * 这里在**本会话第一次调用工具前**用 `cli_capture --status` 探一次环境——该探针刻意是
+ * 「无依赖」的（status.py 不 import PIL，platform 后端也有 try/except 兜底），所以**一个
+ * 依赖都没装的新环境照样能跑出结论**。结论缓存在 `runtimeStatus`，整个进程只探一次。
+ */
+type RuntimeDepName = 'Pillow' | 'pyautogui' | 'pyperclip'
+let runtimeStatus: Row | null = null
+let runtimeProbeError: string | null = null
+let runtimeProbed = false
+
+/** 体检失败时给出的安装命令：清单随包分发，`--upgrade` 会在区间内挑最新可用版本。 */
+export const PIP_HINT = `python -m pip install --upgrade -r "${resolve(CVISION_DIR, 'requirements.txt')}"`
+
+/** 判断体检结论里某个依赖是否可用；缺 key 一律当作不可用（探针结构变了也不放过）。 */
+function depOk(status: Row, name: RuntimeDepName): boolean {
+  const deps = status.deps
+  if (deps === null || typeof deps !== 'object') return false
+  return (deps as Row)[name] === true
+}
+
+/**
+ * 把一次体检结论整理成**可操作**的错误信息；环境正常则返回 null。
+ *
+ * 纯函数、不触碰进程，因而可被 `tests/vision.host.test.mjs` 直接注入各种结论来钉死文案
+ * （真去 spawn Python 在 CI 上既慢又不稳）。
+ * @param status - `cli_capture --status` 的 JSON 结论；探针整体失败时为 null。
+ * @param probeError - 探针失败原因（`status` 为 null 时有值），会带上 `PYTHON`/`CVISION_DIR` 便于定位。
+ */
+export function describeRuntimeProblem(status: Row | null, probeError: string | null): string | null {
+  if (status === null) {
+    // 连 `--status` 都跑不起来：基本是「没有可用的 python 解释器」或 `cvision/` 路径不对。
+    return (
+      `无法运行 Python 版 cvision（${PYTHON} -m cvision.cli_capture --status）：${probeError ?? '未知错误'}\n` +
+      `请确认已装 Python 3.10+ 且 \`${PYTHON}\` 可用；插件目录与解释器分别是：` +
+      `CVISION_DIR=${CVISION_DIR}、CVISION_PYTHON=${PYTHON}。\n` +
+      `若依赖缺失，装一次即可：${PIP_HINT}`
+    )
+  }
+  const missing: string[] = []
+  if (!depOk(status, 'Pillow')) missing.push('Pillow')
+  // 除下面两类硬问题外，环境算是可用的 —— 返回 null 表示不拦。
+  if (missing.length === 0 && status.backend_implemented === true) return null
+
+  const lines: string[] = []
+  if (missing.length > 0) lines.push(`Python 环境不完整：缺少 ${missing.join('、')}。`)
+  if (status.backend_implemented !== true) {
+    lines.push(
+      `本平台后端未实现（platform=${String(status.platform ?? '未知')}、backend=${String(status.backend ?? '未知')}）——` +
+        `截屏/OCR 在该平台尚不可用（详见 README 的平台矩阵）。`,
+    )
+  }
+  lines.push(
+    `运行环境：python=${String(status.python ?? '未知')}、platform=${String(status.platform ?? '未知')}、backend=${String(status.backend ?? '未知')}`,
+  )
+  // 输入类工具另有 pyautogui 这一支依赖；它不阻止 see/ocr，但缺了就该说清后果。
+  if (!depOk(status, 'pyautogui')) lines.push(`另外：pyautogui 缺失，输入类工具不可用。`)
+  // 只有在「确实缺依赖」时才给安装命令：平台后端未实现不是装包能解决的。
+  if (missing.length > 0) lines.push(`装一次依赖即可（清单随包分发）：${PIP_HINT}`)
+  lines.push(`装完可调 cvision_status() 复查；依赖装在哪个解释器里，就要让 CVISION_PYTHON 指向它。`)
+  return lines.join('\n')
+}
+
+/** 跑一次体检（进程内只跑一次），失败不抛错——把结论交给 describeRuntimeProblem。 */
+async function probeRuntime(exec: { signal: AbortSignal }): Promise<void> {
+  if (runtimeProbed) return
+  runtimeProbed = true
+  try {
+    assertCvisionPresent()
+    const { stdout } = await execFileAsync(PYTHON, ['-m', 'cvision.cli_capture', '--status'], {
+      cwd: PY_CWD,
+      env: PY_ENV,
+      maxBuffer: 4 * 1024 * 1024,
+      signal: exec.signal,
+    })
+    runtimeStatus = JSON.parse(stdout) as Row
+  } catch (error) {
+    runtimeProbeError = errorMessage(error)
+    runtimeStatus = null
+  }
+}
+
+/** 首次调用前的体检门：环境有问题就抛出可操作错误，而不是让 Python 抛裸异常。 */
+export async function ensureRuntime(exec: { signal: AbortSignal }): Promise<void> {
+  await probeRuntime(exec)
+  const problem = describeRuntimeProblem(runtimeStatus, runtimeProbeError)
+  if (problem !== null) throw new Error(problem)
+}
+
 /** 运行一次用户级输入（python -m cvision.cli_input <args>）。 */
 async function runCliInput(args: string[], exec: { signal: AbortSignal }): Promise<void> {
+  await ensureRuntime(exec)
   assertCvisionPresent()
   await execFileAsync(PYTHON, ['-m', 'cvision.cli_input', ...args], {
     cwd: PY_CWD,
@@ -370,6 +464,7 @@ function isSameOrigin(req: IncomingMessage): boolean {
  * 直接 await 会在非零退出时 reject，把「用户取消」误判成故障。
  */
 async function runPythonCli(module: string, args: string[], exec: { signal: AbortSignal }): Promise<string> {
+  await ensureRuntime(exec)
   assertCvisionPresent()
   try {
     const { stdout } = await execFileAsync(PYTHON, ['-m', module, ...args], {
@@ -688,7 +783,10 @@ export function apply(ctx: Context): void {
   })
 
   // ① server 优先，失败回退 CLI 的采集类辅助（每个返回统一形态）。
+  //    这些是**所有 Python 依赖工具的唯一收口**（16 个工具里除 cvision_status 外都经这里，
+  //    输入类与剪贴板类各有一处），所以体检门只需加在这 5 个函数上，不必逐个工具去改。
   async function captureDataUrl(args: Json, exec: { signal: AbortSignal }): Promise<string> {
+    await ensureRuntime(exec)
     try {
       const resp = await server.request({ op: 'capture', ...args }, exec)
       return String(resp.data_url ?? '')
@@ -704,6 +802,7 @@ export function apply(ctx: Context): void {
   }
 
   async function ocrJson(args: Json, exec: { signal: AbortSignal }): Promise<{ text: string; lines: string[]; words: Row[] }> {
+    await ensureRuntime(exec)
     try {
       const resp = await server.request({ op: 'ocr', ...args }, exec)
       return {
@@ -730,6 +829,7 @@ export function apply(ctx: Context): void {
   }
 
   async function listWindowsJson(exec: { signal: AbortSignal }): Promise<Row[]> {
+    await ensureRuntime(exec)
     try {
       const resp = await server.request({ op: 'list' }, exec)
       return Array.isArray(resp.windows) ? (resp.windows as Row[]) : []
@@ -740,6 +840,7 @@ export function apply(ctx: Context): void {
   }
 
   async function screenInfoJson(exec: { signal: AbortSignal }): Promise<Row[]> {
+    await ensureRuntime(exec)
     try {
       const resp = await server.request({ op: 'screen_info' }, exec)
       return Array.isArray(resp.displays) ? (resp.displays as Row[]) : []
@@ -750,6 +851,9 @@ export function apply(ctx: Context): void {
   }
 
   async function statusJson(exec: { signal: AbortSignal }): Promise<Row> {
+    // ⚠️ 刻意**不**过体检门：cvision_status 是体检/排错工具，环境不完整时它正是
+    // 「唯一还能用」的那条路（cli_capture --status 本身不需要 Pillow）。gate 了它，
+    // 用户就失去了查出问题的手段。
     try {
       const resp = await server.request({ op: 'status' }, exec)
       return (resp.status as Row) ?? {}
