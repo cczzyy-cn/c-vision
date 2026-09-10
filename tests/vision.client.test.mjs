@@ -181,6 +181,46 @@ const okCapability = (image, source = 'declared') => async () => ({
   json: async () => ({ provider: 'p', model: 'm', image, source }),
 })
 
+/**
+ * 按 URL 分流的假 fetch：能力查询返回 JSON，系统截图路由返回可配置结果。
+ * `snip.status = 200` → 一段 PNG 字节；`204` → 用户取消；其它 → 宿主不可用（触发浏览器回退）。
+ * @param options - 两条路由各自的应答。
+ * @returns 假 fetch，并记录每次调用的 `{ url, init }`。
+ */
+function routeFetch(options = {}) {
+  const capability = options.capability ?? { source: 'declared', image: true }
+  const snipStatus = options.snip?.status ?? 501
+  const calls = []
+  const implementation = async (url, init) => {
+    calls.push({ url: String(url), init })
+    if (String(url).includes('/cvision/snip')) {
+      if (snipStatus === 200) {
+        return {
+          ok: true,
+          status: 200,
+          blob: async () => new Blob([new Uint8Array([137, 80, 78, 71, 1, 2, 3])], { type: 'image/png' }),
+          text: async () => '',
+        }
+      }
+      return {
+        ok: false,
+        status: snipStatus,
+        blob: async () => new Blob([]),
+        text: async () => String(options.snip?.message ?? 'snip unavailable'),
+      }
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => capability,
+      blob: async () => new Blob([]),
+      text: async () => '',
+    }
+  }
+  implementation.calls = calls
+  return implementation
+}
+
 /** 换掉全局属性并返回恢复函数（Node 的 navigator 是只读访问器，赋值会抛错）。 */
 function patchGlobal(name, value) {
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, name)
@@ -277,7 +317,7 @@ test('草稿图取自根单例 conversation，并按会话 id 建草稿（会话
 test('兼容旧版 Images 接口（createDraftImages + inputActions.addImages）', async () => {
   const env = patchCaptureEnvironment()
   try {
-    await withFetch(okCapability(true), async () => {
+    await withFetch(routeFetch({ snip: { status: 200 } }), async () => {
       const client = mountClient({ generation: 'images' })
       const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
       const injected = client.slot.inject('session-old')
@@ -372,10 +412,106 @@ test('同一模型只查一次宿主（结果缓存）', async () => {
 
 // ── 插入链 ──────────────────────────────────────────────────────────────────
 
-test('点击按钮：截屏 → 建草稿图 → 进附件栏', async () => {
+test('默认走宿主系统截图：POST /cvision/snip → 直接入附件栏（不经浏览器抓屏）', async () => {
+  const env = patchCaptureEnvironment()
+  let screenCaptureCalls = 0
+  const restoreSpy = patchGlobal('navigator', {
+    mediaDevices: {
+      getDisplayMedia: async () => {
+        screenCaptureCalls += 1
+        return { getTracks: () => [] }
+      },
+    },
+  })
+  try {
+    const fetchStub = routeFetch({ snip: { status: 200 } })
+    await withFetch(fetchStub, async () => {
+      const client = mountClient()
+      const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+      const injected = client.slot.inject('session-snip')
+      const added = []
+      const props = propsFor(state, injected, {
+        inputActions: { addAttachments: (ids) => { added.push(...ids); return true } },
+      })
+      client.component(props)
+      await settle()
+      await clickScreenshot(client.component.bind(client), props)
+
+      const snipCalls = fetchStub.calls.filter((call) => call.url.includes('/cvision/snip'))
+      assert.equal(snipCalls.length, 1, '应当只请求一次系统截图路由')
+      assert.equal(snipCalls[0].init?.method, 'POST', '系统截图必须用 POST（宿主按高权限动作设防）')
+      assert.equal(screenCaptureCalls, 0, '默认通道不该碰浏览器抓屏')
+      assert.deepEqual(added, ['draft-0'], '系统截图的结果要直接进附件栏')
+      assert.equal(client.drafts.created, 1)
+    })
+  } finally {
+    restoreSpy()
+    for (const restore of env.restores.reverse()) restore()
+  }
+})
+
+test('系统截图拿到的字节会包成 image/png 的 File（名字带 snip- 前缀）', async () => {
   const env = patchCaptureEnvironment()
   try {
-    await withFetch(okCapability(true), async () => {
+    const fetchStub = routeFetch({ snip: { status: 200 } })
+    await withFetch(fetchStub, async () => {
+      const client = mountClient()
+      const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+      const injected = client.slot.inject('session-snip')
+      let seen = null
+      const originalCreateDraft = injected.createDraft
+      injected.createDraft = (file) => {
+        seen = file
+        return originalCreateDraft(file)
+      }
+      const props = propsFor(state, injected)
+      client.component(props)
+      await settle()
+      await clickScreenshot(client.component.bind(client), props)
+      assert.ok(seen, 'createDraft 应当收到一个 File')
+      assert.equal(seen.type, 'image/png')
+      assert.match(seen.name, /^snip-\d+\.png$/)
+      assert.ok(seen.size > 0, 'File 必须带真实字节')
+    })
+  } finally {
+    for (const restore of env.restores.reverse()) restore()
+  }
+})
+
+test('用户在系统截图里取消（204）→ 静默、不抓屏、不提示', async () => {
+  const env = patchCaptureEnvironment()
+  let screenCaptureCalls = 0
+  const restoreSpy = patchGlobal('navigator', {
+    mediaDevices: {
+      getDisplayMedia: async () => {
+        screenCaptureCalls += 1
+        return { getTracks: () => [] }
+      },
+    },
+  })
+  try {
+    await withFetch(routeFetch({ snip: { status: 204 } }), async () => {
+      const client = mountClient()
+      const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+      const injected = client.slot.inject('s')
+      const props = propsFor(state, injected)
+      client.component(props)
+      await settle()
+      await clickScreenshot(client.component.bind(client), props)
+      assert.equal(screenCaptureCalls, 0, '取消不是「通道不可用」，不该回退抓屏')
+      assert.equal(client.drafts.created, 0)
+      assert.equal(client.component(props).type, 'button', '取消不该留下提示')
+    })
+  } finally {
+    restoreSpy()
+    for (const restore of env.restores.reverse()) restore()
+  }
+})
+
+test('宿主这条通道不可用（501）→ 回退浏览器抓屏，功能不消失', async () => {
+  const env = patchCaptureEnvironment()
+  try {
+    await withFetch(routeFetch({ snip: { status: 501 } }), async () => {
       const client = mountClient()
       const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
       const injected = client.slot.inject('session-9')
@@ -399,7 +535,7 @@ test('点击按钮：截屏 → 建草稿图 → 进附件栏', async () => {
 test('apply 时 conversation 尚未就绪，之后就绪仍能插入（上游 eager 缓存导致静默丢失）', async () => {
   const env = patchCaptureEnvironment()
   try {
-    await withFetch(okCapability(true), async () => {
+    await withFetch(routeFetch({ snip: { status: 200 } }), async () => {
       // apply 跑完时服务还没注册——上游在这里缓存下 undefined，之后永远插入失败。
       const client = mountClient({ conversationReady: false })
       client.flag.conversationReady = true
@@ -422,7 +558,7 @@ test('apply 时 conversation 尚未就绪，之后就绪仍能插入（上游 ea
 test('输入框暂时拒绝入轨时会重试，不丢用户刚截的图', async () => {
   const env = patchCaptureEnvironment()
   try {
-    await withFetch(okCapability(true), async () => {
+    await withFetch(routeFetch({ snip: { status: 200 } }), async () => {
       const client = mountClient()
       const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
       const injected = client.slot.inject('s')
@@ -454,7 +590,7 @@ test('输入框暂时拒绝入轨时会重试，不丢用户刚截的图', async
 test('失败必须可见：草稿图建不出来时给出提示并写控制台', async () => {
   const env = patchCaptureEnvironment()
   try {
-    await withFetch(okCapability(true), async () => {
+    await withFetch(routeFetch({ snip: { status: 200 } }), async () => {
       await withErrorSpy(async (errors) => {
         const client = mountClient()
         const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
@@ -482,7 +618,7 @@ test('失败必须可见：草稿图建不出来时给出提示并写控制台',
 test('失败必须可见：输入框一直拒绝入轨时提示忙碌并释放草稿', async () => {
   const env = patchCaptureEnvironment()
   try {
-    await withFetch(okCapability(true), async () => {
+    await withFetch(routeFetch({ snip: { status: 200 } }), async () => {
       const client = mountClient()
       const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
       const injected = client.slot.inject('s')
@@ -499,10 +635,11 @@ test('失败必须可见：输入框一直拒绝入轨时提示忙碌并释放�
   }
 })
 
-test('用户取消/拒绝授权保持静默（不该刷提示）', async () => {
+test('浏览器抓屏被拒（用户取消授权）保持静默（不该刷提示）', async () => {
   const env = patchCaptureEnvironment()
   try {
-    await withFetch(okCapability(true), async () => {
+    // 宿主系统截图不可用 → 回退浏览器抓屏 → 用户拒绝授权
+    await withFetch(routeFetch({ snip: { status: 501 } }), async () => {
       const client = mountClient()
       const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
       const injected = client.slot.inject('s')

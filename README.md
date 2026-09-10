@@ -12,8 +12,9 @@
 - **原生看图**：`see` 抓真实截图（WGC 抓窗口合成内容，GPU/被遮挡窗口也稳），模型直接看到。
 - **快速读字**：`ocr` 直接返回文本；`see`/`ocr` 支持 `region="x,y,w,h"` 只取一块，省 token。
 - **用户级操作**：鼠标点击/移动/滚动、键盘输入/快捷键、窗口聚焦（模拟人操作）。
-- **输入框截图按钮**：浏览器半边在输入框工具栏加「截图」按钮，点一下抓屏并作为草稿图进附件栏；
-  显示与否由**宿主真实 `inputModalities`** 决定——不是按模型名猜。
+- **输入框截图按钮**：浏览器半边在输入框工具栏加「截图」按钮，**默认走系统级框选截图**
+  （Windows Win+Shift+S / macOS screencapture -i，可框选可标注），抓到的图直接进附件栏；
+  宿主这条通道不可用时自动回退浏览器抓屏。显示与否由**宿主真实 `inputModalities`** 决定。
 - **跨平台**：Windows（完整）/ macOS(Phase 1) / Linux(Phase 2)。
 - **开箱即用**：包内自带 Python cvision 与依赖清单，`CVISION_DIR` 默认指向包内。
 
@@ -21,6 +22,18 @@
 
 > 维护约定：凡是改行为，就升 `package.json` 版本并在此追加一条（附提交号），避免版本与文档漂移。
 
+- **v0.2.6**：截图按钮**默认改走系统级框选截图**（人工通道），浏览器抓屏降为回退。
+  - 宿主新增 `POST /cvision/snip`：拉起系统截图 UI（Windows `Win+Shift+S` / `ms-screenclip:` 兜底、
+    macOS `screencapture -i -x`），把用户框选的图交回浏览器半边。**只认调用之后新出现的结果**
+    （Windows 用 `GetClipboardSequenceNumber` 前后对比），绝不读用户上一次复制的旧图。
+  - 安全：仅 POST、仅同源（`Origin` 必须等于 `Host`）、客户端断开即中止 Python 等待；抓屏授权由
+    系统 UI 承载，因此**没有**「一条请求就能静默抓桌面」的口子（这是放弃宿主静默抓屏的原因）。
+  - 回退：宿主返回 501（Linux Phase 2）/不可达/旧版宿主 → 自动回退浏览器 `getDisplayMedia`；
+    用户 Esc 取消（204）→ 静默恢复，不弹提示。
+  - UX：等待框选期间按钮 `aria-busy` + 禁用，避免重复拉起系统 UI；`see` 工具与按钮的图片都经
+    `encoding.fit_for_attachment` 缩放，成本模型一致。
+  - 新增 `cvision/snip.py` + `cvision/cli_snip.py`；JS 单测 33 条（含系统截图 501 回退、204 取消、
+    同源/方法拒绝、执行器注入）。真机实测：热键 → 覆盖层 → 拖拽框选 → PNG（IHDR 与框选尺寸一致）。
 - **v0.2.5**：修掉 v0.2.4 插入链的两个真实错误，截图按钮端到端跑通（浏览器内实测：缩略图进入附件栏）。
   1. **取错了 conversation face**：草稿 API 在 **conversation 根服务**上，而
      `ctx.sessions.scope(id).get('conversation')` 是**会话动作面**（send / cancel / updateQueue）。
@@ -87,10 +100,29 @@
 
 本包是**双面包**：除宿主半边的工具外，还声明了 `dsh.client`，由 DSH 的客户端模块系统把
 `exports["./client"]`（`lib/client.js`，经典脚本）送进浏览器，在输入框工具栏
-`conversation.input.right` 挂一个「截图」按钮：点一下 → `getDisplayMedia` 抓一屏 →
-作为草稿图进附件栏 → 跟随消息发给模型。
+`conversation.input.right` 挂一个「截图」按钮。
 
-**可见性判定（本次集成修复的核心）**：DSH 给浏览器的模型目录（`buildModelCatalog`）只投影
+**默认通道：系统级框选截图**（v0.2.6 起）。点按钮 → 宿主拉起系统截图 UI →
+
+```text
+Windows  Win+Shift+S（`ms-screenclip:` 兜底）→ 系统覆盖层，框选后结果进剪贴板
+macOS    screencapture -i -x <tmp.png>          → 交互框选直接写文件（Esc 不留文件）
+Linux    Phase 2：返回 501，浏览器半边自动回退到下面的浏览器抓屏
+```
+
+→ 宿主把用户刚框出来的那张图（`POST /cvision/snip`）交回浏览器 → 包成 `File` → 作为草稿图进
+附件栏 → 跟随消息发给模型。
+
+为什么默认走这条：框选与**标注**（箭头/高亮/文字）都是系统原生、天然跨显示器，**抓屏授权由系统 UI
+承载**——宿主只读「用户刚放进剪贴板/文件的那张新图」（Windows 用 `GetClipboardSequenceNumber`
+做前后对比，绝不读用户上一次复制的旧图），因此不存在「页面里任何脚本都能静默截屏」的口子。
+代价是这一步会**占用剪贴板**（Win+Shift+S 本身的固有行为）。
+
+**回退通道：浏览器 `getDisplayMedia`**。只有宿主那条路不可用（非桌面平台组合、Electron
+`file://` 里没有 web 服务器、旧版宿主）或明确返回不支持时，才回退到浏览器抓屏——功能在任何平台上
+都不会消失。点按钮后按钮进入「等待框选」态（期间禁用，Esc 取消即静默恢复）。
+
+**可见性判定**：DSH 给浏览器的模型目录（`buildModelCatalog`）只投影
 `id/name/description/reasoning`，**刻意剥掉了 `inputModalities`**，所以客户端无法自行判断当前模型
 收不收图。本包改为向自己宿主半边的**只读**路由查询：
 
@@ -278,14 +310,16 @@ vision/                      # 仓库根 = 插件本体
     encoding.py         #   PIL -> base64 data URL；crop_region；fit_for_attachment(附件缩图)
     ocr.py              #   OCR（Windows.Media.Ocr 优先 / pytesseract 回退）
     input.py            #   用户级输入（pyautogui：点击/移动/滚动/输入/快捷键/聚焦）
+    snip.py             #   系统级区域截图（人工通道）：拉起系统截图 UI 并取回框选结果
     cli_capture.py      #   跨语言 CLI：python -m cvision.cli_capture [--list] [--region] [--delay]
     cli_ocr.py          #   OCR CLI：python -m cvision.cli_ocr [--window] [--region]
     cli_input.py        #   输入 CLI：python -m cvision.cli_input --click/--type/--keys/--focus ...
+    cli_snip.py         #   系统截图 CLI：python -m cvision.cli_snip [--timeout 60]（JSON 结果）
   tests/
     test_detect.py      #   detect 模块单测（PIL only）
     test_encoding.py    #   encoding 模块单测（dataURL/crop/fit，PIL only）
-    vision.client.test.mjs # 客户端半边单测（门控/兜底/缓存/截屏落草稿图，node --test）
-    vision.host.test.mjs   # 宿主能力路由单测（判定口径/降级/缺参数，node --test）
+    vision.client.test.mjs # 客户端半边单测（门控/系统截图与回退/草稿入轨/失败可见，node --test）
+    vision.host.test.mjs   # 宿主两条路由单测（能力判定口径 + 系统截图同源/方法/降级，node --test）
   README.md
 ```
 
@@ -319,9 +353,14 @@ vision/                      # 仓库根 = 插件本体
   devDependency（因此 `npm ci` 不需要额外下载）。`lib/index.js` 运行时**只** import 前者
   （`cordis` / `dsh-attachment` / `node:http` 都是 `import type`，编译后不残留）；`ctx.tools`
   / `ctx.attachments` 由宿主注入。
-- **宿主入站路由**：仅注册一条**只读** `GET /cvision/model-capability`（同源、无副作用、不回传任何凭据），
-  供浏览器半边判断当前模型是否收图；通过 `ctx.inject(['webServer','llm'])` 可选挂载，组合里没有
-  web 服务器时整段跳过。
+- **宿主入站路由**：两条，都通过 `ctx.inject(['webServer', ...])` 可选挂载，组合里没有 web 服务器时
+  整段跳过。
+  - `GET /cvision/model-capability`：**只读**、同源、无副作用、不回传任何凭据，供浏览器半边判断当前
+    模型是否收图。
+  - `POST /cvision/snip`：**仅 POST、仅同源**（`Origin` host 必须等于 `Host`，否则 403），拉起系统
+    截图 UI 并把用户框选的那张图回传（200 图片字节 / 204 用户取消 / 501 平台不支持）。抓屏动作由用户
+    在系统 UI 里完成，本路由只读「调用之后新出现」的剪贴板图片，因此不构成静默抓屏能力；客户端断开
+    （关页/取消）会中止等待中的 Python 子进程。
 
 ### 权限说明（真实高权限）
 - 通过**跨语言 spawn 包内 Python cvision** 子进程（`child_process`/进程管理）。

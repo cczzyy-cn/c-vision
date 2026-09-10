@@ -287,6 +287,87 @@ async function modelImageCapability(host: CapabilityHost, provider: string, mode
   }
 }
 
+/**
+ * 浏览器半边请求「系统级框选截图」的路由路径。
+ * 必须与 `src/client.js` 的 SNIP_PATH 保持一致。
+ */
+const SNIP_PATH = '/cvision/snip'
+
+/** 一次系统截图的结果。 */
+type SnipOutcome =
+  | { kind: 'captured'; dataUrl: string }
+  | { kind: 'cancelled' }
+  | { kind: 'unsupported'; message: string }
+  | { kind: 'failed'; message: string }
+
+/** 把任意抛出物整理成一行可读信息。 */
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** 给路由回一个 JSON 响应（截图路由与能力路由共用）。 */
+function sendJson(res: ServerResponse, status: number, payload: Row): void {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+  res.end(JSON.stringify(payload))
+}
+
+/**
+ * 只接受同源请求：`Origin` 的 host 必须等于 `Host` 头。
+ * 截图会拉起系统 UI 并读取剪贴板，属于高权限动作，不能给跨站页面开口子
+ * （与 dshmarket 对写路由的做法一致）。
+ */
+function isSameOrigin(req: IncomingMessage): boolean {
+  const host = req.headers.host
+  const origin = req.headers.origin
+  if (host === undefined || origin === undefined) return false
+  try {
+    return new URL(origin).host === host
+  } catch {
+    return false
+  }
+}
+
+/** 运行一次系统截图 CLI（python -m cvision.cli_snip），把 JSON 结果翻译成 SnipOutcome。 */
+async function runSnipCli(exec: { signal: AbortSignal }): Promise<SnipOutcome> {
+  assertCvisionPresent()
+  let stdout: string
+  try {
+    ({ stdout } = await execFileAsync(PYTHON, ['-m', 'cvision.cli_snip', '--timeout', '60'], {
+      cwd: CVISION_DIR,
+      env: PY_ENV,
+      maxBuffer: 64 * 1024 * 1024,
+      signal: exec.signal,
+    }))
+  } catch (error) {
+    // 用户中途取消（客户端断开 → signal 中止）不算故障。
+    if (exec.signal.aborted) return { kind: 'cancelled' }
+    return { kind: 'failed', message: errorMessage(error) }
+  }
+  let parsed: Row
+  try {
+    parsed = JSON.parse(stdout.trim()) as Row
+  } catch {
+    return { kind: 'failed', message: `无法解析 cli_snip 输出（${stdout.length} 字节）` }
+  }
+  if (parsed.ok === true) {
+    const dataUrl = String(parsed.data_url ?? '')
+    return dataUrl === '' ? { kind: 'failed', message: 'cli_snip 未返回图片数据' } : { kind: 'captured', dataUrl }
+  }
+  const reason = String(parsed.reason ?? '')
+  const message = String(parsed.message ?? reason)
+  if (reason === 'cancelled') return { kind: 'cancelled' }
+  if (reason === 'unsupported') return { kind: 'unsupported', message }
+  return { kind: 'failed', message }
+}
+
+/**
+ * 截图执行器。默认实现 spawn 包内 Python cvision 拉起系统截图 UI。
+ * **导出可变对象只为单测注入假实现**（真实实现需要桌面与人工框选，CI 里跑不了）。
+ */
+export const snipExecutor: { run: (exec: { signal: AbortSignal }) => Promise<SnipOutcome> } = {
+  run: runSnipCli,
+}
+
 export function apply(ctx: Context): void {
   const server = new CvisionServer(30000)
   ctx.effect(() => () => server.dispose())
@@ -311,15 +392,60 @@ export function apply(ctx: Context): void {
             const url = new URL(req.url ?? '/', 'http://localhost')
             const provider = url.searchParams.get('provider') ?? ''
             const model = url.searchParams.get('model') ?? ''
-            const payload = await modelImageCapability(host, provider, model)
-            res.writeHead(200, {
-              'content-type': 'application/json; charset=utf-8',
-              'cache-control': 'no-store',
-            })
-            res.end(JSON.stringify(payload))
+            sendJson(res, 200, await modelImageCapability(host, provider, model))
           },
         }),
       'vision: model capability route',
+    )
+  })
+
+  // ② 截图按钮的默认通道：**系统级框选截图**。
+  //    抓屏动作本身由用户在系统 UI 里完成（切片可标注），本路由只负责拉起 UI 并把
+  //    用户刚框出来的那张图取回来交给浏览器半边——因此不需要绕过浏览器的截图授权模型，
+  //    但仍然按高权限动作设防：仅 POST、仅同源、客户端断开即中止 Python 等待。
+  injectHost(['webServer'], (host) => {
+    host.effect(
+      () =>
+        host.webServer.register({
+          kind: 'exact',
+          path: SNIP_PATH,
+          handler: async (req, res) => {
+            if (req.method !== 'POST') {
+              sendJson(res, 405, { message: 'system snip requires POST' })
+              return
+            }
+            if (!isSameOrigin(req)) {
+              sendJson(res, 403, { message: 'cross-origin system snip refused' })
+              return
+            }
+            const controller = new AbortController()
+            req.on('close', () => {
+              controller.abort()
+            })
+            const outcome = await snipExecutor.run({ signal: controller.signal })
+            if (outcome.kind === 'captured') {
+              try {
+                const { data, mediaType } = parseDataUrl(outcome.dataUrl)
+                res.writeHead(200, { 'content-type': mediaType, 'cache-control': 'no-store' })
+                res.end(Buffer.from(data))
+              } catch (error) {
+                sendJson(res, 500, { message: errorMessage(error) })
+              }
+              return
+            }
+            if (outcome.kind === 'cancelled') {
+              res.writeHead(204)
+              res.end()
+              return
+            }
+            if (outcome.kind === 'unsupported') {
+              sendJson(res, 501, { message: outcome.message })
+              return
+            }
+            sendJson(res, 500, { message: outcome.message })
+          },
+        }),
+      'vision: system snip route',
     )
   })
 
