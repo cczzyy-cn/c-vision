@@ -79,6 +79,38 @@ def _launch_windows_snip() -> bool:
         return False
 
 
+#: Windows 11 截图覆盖层的窗口类名（语言无关；标题会随语言变，类名不会）。
+#: 实测：覆盖层打开时 SnippingTool.exe 有 `SnipOverlayRootWindow`，取消后该窗口消失。
+_SNIP_OVERLAY_CLASS = "SnipOverlayRootWindow"
+#: 等覆盖层出现的上限（拉起来通常 0.3~1s；超时说明这次观测不到 UI，退回「只等剪贴板」的旧行为）。
+_UI_APPEAR_TIMEOUT_SECONDS = 6.0
+#: 覆盖层消失后再确认一眼剪贴板，避开「先关窗后写入」的极小竞态。
+_CANCEL_RECHECK_SECONDS = 0.3
+
+
+def _snip_overlay_visible() -> bool:
+    """系统截图覆盖层此刻是否在屏幕上（纯 ctypes，不依赖 pywin32）。"""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    visible = []
+
+    def visit(hwnd, _param):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        buffer = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buffer, 256)
+        if buffer.value == _SNIP_OVERLAY_CLASS:
+            visible.append(hwnd)
+            return False  # 找到一个就够
+        return True
+
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(visit)
+    user32.EnumWindows(callback, 0)
+    return bool(visible)
+
+
 def _settle_clipboard_image(image, grace: float):
     """第一张图到手后短暂静置：期间剪贴板又更新（用户去标注了）就取更新的那张。"""
     started = time.monotonic()
@@ -99,15 +131,45 @@ def _settle_clipboard_image(image, grace: float):
 
 
 def _snip_windows(timeout: float):
+    """Windows：拉起截图覆盖层，等剪贴板出现「用户刚框选的那张」。
+
+    **必须识别用户取消**：早期版本只看剪贴板变化，用户按 Esc 取消后循环会一直等到超时（默认 60s），
+    这段时间里任何新出现的剪贴板图片（例如之后用微信截的图）都会被当成本次截图返回——线上实测就是
+    「点了截图→取消→再微信截图，附件栏自动多出那张微信截图」。现在用覆盖层窗口作判据：
+
+    - 覆盖层**在**：继续等剪贴板；
+    - 覆盖层**消失且剪贴板始终没有新图** → 用户取消，立即返回 ``None``（宿主据此回 204，客户端静默）；
+    - 覆盖层观测不到（老版本 Windows / 类名不同）→ 退回旧行为，只等剪贴板与超时。
+    """
     if not _launch_windows_snip():
         raise SnipUnsupported("无法拉起 Windows 截图（pyautogui 与 ms-screenclip: 均不可用）")
 
     before = clipboard.token()
+    # 等覆盖层出现：等到了才启用「消失即取消」的判据（避免把「没观测到 UI」误判成取消）。
+    seen_overlay = False
+    appear_deadline = time.monotonic() + _UI_APPEAR_TIMEOUT_SECONDS
+    while time.monotonic() < appear_deadline:
+        if _snip_overlay_visible():
+            seen_overlay = True
+            break
+        time.sleep(_POLL_SECONDS)
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(_POLL_SECONDS)
         current = clipboard.token()
         if current == before:
+            if seen_overlay and not _snip_overlay_visible():
+                # 覆盖层关了却始终没等到图 → 用户取消。先确认一眼剪贴板（避开「先关窗后写入」的竞态）。
+                time.sleep(_CANCEL_RECHECK_SECONDS)
+                late = clipboard.token()
+                if late != before:
+                    image = clipboard.read_image()
+                    if image is not None:
+                        return _settle_clipboard_image(image, _SETTLE_SECONDS)
+                    before = late
+                    continue
+                return None
             continue
         image = clipboard.read_image()
         if image is None:
