@@ -10,7 +10,25 @@
 > - `v0.1.0` ~ `v0.1.9` 的说明只在 [GitHub Releases](https://github.com/cczzyy-cn/c-vision/releases) 里
 >   （那时还没有本文件）。
 
-## v0.2.14
+## v0.2.15
+
+**新增文档一致性自检 `npm run check:docs`**（`scripts/check-docs.mjs`，14 项；CI 每次都会跑）——把「文档不能
+漂移」从口头约定变成断言：
+
+- `package.json` 版本 ↔ README 头部版本 ↔ CHANGELOG 最新条目，三者必须一致；
+- CHANGELOG 最新条目有实质内容且没有 `TODO/待填` 占位；
+- README 里的**长按阈值**必须等于 `src/client.js` 的 `LONG_PRESS_MS`，且不残留旧值；
+- `cvision/`、`tests/`、`scripts/` 下**每个文件**都要出现在 README 的目录结构里；
+- 全部顶层文档（README/CHANGELOG）都要在 `package.json` 的 `files` 里；
+- README 必须覆盖宿主注册的**全部工具**与**全部路由**（从 `lib/index.js` 反查）；
+- README 声称的**测试条数**必须等于实际条数；
+- README 的**内部锚点**必须都能落到标题上。
+
+每条都对应一次真实漂移：550ms→900ms 的阈值过期、README 漏写 `snip.py`/`clipboard.py`/`test_snip_windows.py`、
+README 重写时又漏掉 `__init__.py` 与新脚本——**最后这条正是本脚本第一次运行时就抓到的**。
+CI 增一步 `npm run check:docs`；README 增「文档约定（自动校验）」小节。无行为变化（代码逻辑未改）。
+
+## v0.2.14 · `86cb839` · [Release](https://github.com/cczzyy-cn/c-vision/releases/tag/v0.2.14)
 
 **文档整理（无行为变化）**：README 从 513 行压到一页能读完的结构，并把版本记录拆到本文件。
 

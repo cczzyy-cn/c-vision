@@ -29,6 +29,10 @@ jobs:
       - name: Check DSH package contract
         run: npm run check:dsh
 
+      # 文档一致性：版本号/行为阈值/目录结构/工具与路由/测试条数/内部锚点。
+      - name: Check docs consistency
+        run: npm run check:docs
+
       # 防止只改 src/index.ts 而忘了重新编译：编译产物若与已提交的 lib/ 不一致则失败。
       - name: Verify compiled lib/ is in sync
         run: |

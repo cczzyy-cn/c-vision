@@ -10,7 +10,7 @@ Python 版 cvision** 截屏/OCR/输入 → 写入 Harness 附件服务（`ctx.at
 
 同一个包还带一个**浏览器半边**：输入框工具栏的「截图」按钮（人工一键抓屏，或把剪贴板里的图片作为附件）。
 
-**版本**：`0.2.14` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
+**版本**：`0.2.15` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
 **许可**：BSD-3-Clause · 变更历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 目录
@@ -238,17 +238,33 @@ npm ci
 npm run build        # tsc -p tsconfig.json && node scripts/copy-client.mjs
 npm run test:js      # node --test：客户端半边 + 宿主四条路由
 npm run check:dsh    # DSH 组合包/客户端契约自检（30 项）
+npm run check:docs   # 文档一致性自检（14 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
 当前规模：**JS 54 条 + Python 67 条**。
+
+### 文档约定（自动校验）
+
+文档漂移靠人记不住，所以 `npm run check:docs` 把下面这些变成断言（CI 每次都会跑）：
+
+| 断言 | 防止的漂移 |
+| --- | --- |
+| `package.json` 版本 == README 头部版本 == CHANGELOG 最新条目 | 改了代码忘了升版/记条目 |
+| CHANGELOG 最新条目有实质内容、无 `TODO/待填` | 占位条目混进发布 |
+| README 里的长按阈值 == `src/client.js` 的 `LONG_PRESS_MS`（且不残留旧值） | 改了行为忘了改文档（真的发生过：550ms → 900ms） |
+| `cvision/`、`tests/`、`scripts/` 下每个文件都出现在 README 目录结构里 | 新增文件忘了写文档（也真的发生过） |
+| 全部顶层文档都在 `package.json` 的 `files` 里 | 新文档没随包发布 |
+| README 覆盖宿主注册的**全部工具**与**全部路由** | 加了工具/路由却没有文档 |
+| README 声称的测试条数 == 实际条数 | 测试增减后数字过期 |
+| README 内部锚点都能落到标题 | 目录断链 |
 
 ## CI / 发布
 
 `.github/workflows/ci.yml` 在每次 `push` / `pull_request` 时：
 
 - `npm ci && npm run build`，并校验 **`lib/` 与源码编译产物一致**（改了 `src` 却忘编译会失败）；
-- `npm run check:dsh`（30 项契约）；
+- `npm run check:dsh`（30 项契约）+ `npm run check:docs`（14 项文档一致性）；
 - `npm run test:js`（客户端半边 + 宿主路由）；
 - Python 单测跑在 **ubuntu + macOS** 矩阵（仅装 Pillow，不需要桌面）。
 
@@ -293,13 +309,16 @@ vision/                      # 仓库根 = 插件本体
   scripts/
     copy-client.mjs      #   把 src/client.js 拷到 lib/
     check-dsh-contract.mjs #  DSH 组合包/客户端契约自检（30 项，CI 跑）
+    check-docs.mjs       #   文档一致性自检（14 项：版本号/阈值/目录/工具/路由/测试数/锚点，CI 跑）
   tsconfig.json          # TS 配置
   package.json           # 声明 dsh.bundle + dsh.client，files 含 lib/cvision/requirements.txt/CHANGELOG
   cordis.patch.yml       # bundle 的配置层，按包名引用
   requirements.txt       # Python 依赖（Pillow/pyautogui/pyperclip；Windows 加 pywin32/winsdk；macOS 加 pyobjc）
   cvision/               # 捆绑的 Python 版 cvision（截屏/OCR/用户级输入/系统截图/剪贴板）
+    __init__.py          #   包标记
     capturer.py          #   兼容层：转发到平台捕获后端
     capture/             #   平台捕获后端（门面，按 sys.platform 选）
+      __init__.py        #     选后端并暴露 list_windows/capture_window/capture_screen
       base.py            #     平台无关 Window + CaptureBackend 协议
       windows.py         #     Windows 后端（WGC > PrintWindow > 读合成桌面区域）
       macos.py           #     macOS 后端（Quartz 枚举 + screencapture -l）

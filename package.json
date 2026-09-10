@@ -1,6 +1,6 @@
 {
   "name": "vision",
-  "version": "0.2.14",
+  "version": "0.2.15",
   "description": "Vision DSH bundle: give the agent screen/window vision — see tool captures via the bundled Python cvision and returns the image natively",
   "type": "module",
   "main": "./lib/index.js",
@@ -26,6 +26,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/copy-client.mjs",
     "check:dsh": "node scripts/check-dsh-contract.mjs",
+    "check:docs": "node scripts/check-docs.mjs",
     "test:js": "node --test tests/vision.client.test.mjs tests/vision.host.test.mjs"
   },
   "dsh": {
