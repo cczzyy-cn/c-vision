@@ -83,6 +83,16 @@ function clipboardFetch(options = {}) {
       }
       return { ok: false, status: 204, blob: async () => new Blob([]), json: async () => ({}), text: async () => '' }
     }
+    if (target.includes('/cvision/snip')) {
+      // 系统截图：返回一张小 PNG，便于断言「短按确实走了截图那条路」。
+      return {
+        ok: true,
+        status: 200,
+        blob: async () => new Blob([new Uint8Array([137, 80, 78, 71])], { type: 'image/png' }),
+        json: async () => ({}),
+        text: async () => '',
+      }
+    }
     if (target.includes('/cvision/clipboard')) {
       const state = states[Math.min(stateIndex, states.length - 1)]
       stateIndex += 1
@@ -876,6 +886,109 @@ test('已经亮起之后宿主才告诉我们「那是我们自己产出的」�
   )
 })
 
+test('短按（远未到阈值）只走系统截图，绝不插入剪贴板图片', async () => {
+  await withClipboardTest(
+    {
+      states: [
+        { supported: true, image: true, token: '1' },
+        { supported: true, image: true, token: '2' },
+      ],
+      image: 'png',
+    },
+    async (stub) => {
+      const client = mountClient()
+      const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+      const props = propsFor(state, client.slot.inject('s'))
+      await renderVisibleButton(client, props)
+      mock.timers.tick(1000)
+      await settle()
+      const before = buttonOf(client.component(props))
+      assert.match(before.props.className, /--clipboard/)
+
+      before.props.onPointerDown()
+      await new Promise((resolve) => {
+        setTimeout(resolve, 300) // 人手慢点击也远小于 900ms 阈值
+      })
+      before.props.onPointerUp()
+      before.props.onClick()
+      await settle()
+      await settle()
+
+      assert.equal(
+        stub.calls.some((call) => call.url.includes('/cvision/clipboard/image')),
+        false,
+        '短按绝不能把剪贴板图片插进附件栏',
+      )
+      assert.equal(
+        stub.calls.some((call) => call.url.includes('/cvision/snip')),
+        true,
+        '短按必须走系统截图那条路',
+      )
+    },
+  )
+})
+
+test('按钮没点亮时按住 → 不插剪贴板图片，点击仍正常截图（慢点击不该塞进旧图）', async () => {
+  await withClipboardTest({ states: [{ supported: true, image: true, token: '1' }] }, async (stub) => {
+    const client = mountClient()
+    const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+    const props = propsFor(state, client.slot.inject('s'))
+    await renderVisibleButton(client, props) // 首次轮询只建基线 → 按钮未点亮
+    assert.equal(buttonOf(client.component(props)).props.className, 'cvision-screenshot-button')
+
+    const button = buttonOf(client.component(props))
+    button.props.onPointerDown()
+    await new Promise((resolve) => {
+      setTimeout(resolve, 1100) // 超过阈值，但未点亮 → 不该启动长按
+    })
+    await settle()
+    assert.equal(
+      stub.calls.some((call) => call.url.includes('/cvision/clipboard/image')),
+      false,
+      '未点亮说明剪贴板里那张不是「新图片」，按住也不该把它塞进附件栏',
+    )
+
+    button.props.onPointerUp()
+    button.props.onClick() // 长按没消费掉这次点击 → 应正常走系统截图
+    await settle()
+    await settle()
+    assert.equal(
+      stub.calls.some((call) => call.url.includes('/cvision/snip')),
+      true,
+      '这次点击仍应正常触发系统截图',
+    )
+  })
+})
+
+test('按住期间有进度反馈（--holding + 提示文案），松手即撤销', async () => {
+  await withClipboardTest(
+    {
+      states: [
+        { supported: true, image: true, token: '1' },
+        { supported: true, image: true, token: '2' },
+      ],
+    },
+    async () => {
+      const client = mountClient()
+      const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+      const props = propsFor(state, client.slot.inject('s'))
+      await renderVisibleButton(client, props)
+      mock.timers.tick(1000)
+      await settle()
+
+      const button = buttonOf(client.component(props))
+      button.props.onPointerDown()
+      const holding = buttonOf(client.component(props))
+      assert.match(holding.props.className, /cvision-screenshot-button--holding/, '按住要有看得见的反馈')
+      assert.equal(holding.props.title, 'clipboard.hold', '按住时提示要说明继续按住会插入')
+
+      button.props.onPointerUp()
+      const released = buttonOf(client.component(props))
+      assert.doesNotMatch(released.props.className, /--holding/, '松手后反馈要撤销')
+    },
+  )
+})
+
 test('长按按钮：剪贴板图片作为附件插入，随后颜色恢复正常', async () => {
   await withClipboardTest(
     {
@@ -901,7 +1014,7 @@ test('长按按钮：剪贴板图片作为附件插入，随后颜色恢复正�
 
       lit.props.onPointerDown()
       await new Promise((resolve) => {
-        setTimeout(resolve, 700) // 等长按阈值（550ms）触发
+        setTimeout(resolve, 1000) // 等长按阈值（900ms）触发
       })
       await settle()
       await settle()

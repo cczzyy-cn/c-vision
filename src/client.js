@@ -213,9 +213,19 @@ window.__ModuleLoader__.load({
     //#endregion
 
     //#region 样式
+    /**
+     * 长按插入剪贴板图片的阈值。
+     *
+     * 别调太短：**短按必须是系统截图**，而人手一次「慢点击」轻松超过 0.5 秒——早期用 550ms 时，
+     * 用户只是按得久一点，长按就触发了，把剪贴板里那张**旧的**微信截图直接塞进附件栏，而真正的
+     * 点击又被「长按已消费」吞掉。现在 900ms + 按住期间有进度条反馈 + 只在按钮已点亮时才允许长按。
+     */
+    const LONG_PRESS_MS = 900
     const BUTTON_CLASS = 'cvision-screenshot-button'
     /** 剪贴板里有新图片时加在按钮上的修饰类：变色 + 右上角小圆点。 */
     const CLIPBOARD_CLASS = 'cvision-screenshot-button--clipboard'
+    /** 按住（长按进行中）时加上的修饰类：底色变化 + 底部进度条走完即插入。 */
+    const HOLD_CLASS = 'cvision-screenshot-button--holding'
     const DOT_CLASS = 'cvision-screenshot-dot'
     const NOTICE_CLASS = 'cvision-screenshot-notice'
     const CSS =
@@ -234,6 +244,18 @@ window.__ModuleLoader__.load({
       '.' +
       CLIPBOARD_CLASS +
       '{color:var(--dsh-accent,#3b82f6);background:color-mix(in srgb,var(--dsh-accent,#3b82f6) 12%,transparent)}' +
+      '.' +
+      HOLD_CLASS +
+      '{background:color-mix(in srgb,var(--dsh-accent,#3b82f6) 20%,transparent)}' +
+      // 按住期间底部走一条进度条：时长与 JS 阈值一致，走完即插入（给用户「还在按」的确定反馈，
+      // 也让慢点击的人一眼看出自己触发了另一种手势）。
+      '.' +
+      HOLD_CLASS +
+      '::before{content:"";position:absolute;left:3px;right:3px;bottom:2px;height:2px;border-radius:1px;' +
+      'background:var(--dsh-accent,#3b82f6);transform-origin:left;animation:cvision-hold-fill ' +
+      String(LONG_PRESS_MS) +
+      'ms linear forwards}' +
+      '@keyframes cvision-hold-fill{from{transform:scaleX(0)}to{transform:scaleX(1)}}' +
       '.' +
       DOT_CLASS +
       '{position:absolute;top:2px;right:2px;width:6px;height:6px;border-radius:50%;background:var(--dsh-accent,#3b82f6)}' +
@@ -259,6 +281,7 @@ window.__ModuleLoader__.load({
       'button.tooltip': '短按：系统框选截图（可标注）；长按：插入剪贴板里的图片',
       'button.waiting': '请在系统截图里框选（Esc 取消）',
       'clipboard.hint': '剪贴板有新图片：长按按钮插入',
+      'clipboard.hold': '继续按住，插入剪贴板图片',
       'clipboard.attach': '正在从剪贴板插入…',
       'failure.capture': '截图失败',
       'failure.draft': '截图无法进入附件栏',
@@ -271,6 +294,7 @@ window.__ModuleLoader__.load({
       'button.tooltip': 'Click: system region capture; hold: insert the clipboard image',
       'button.waiting': 'Pick a region in the system screenshot tool (Esc cancels)',
       'clipboard.hint': 'New clipboard image: hold the button to insert',
+      'clipboard.hold': 'Keep holding to insert the clipboard image',
       'clipboard.attach': 'Inserting from the clipboard…',
       'failure.capture': 'Screenshot failed',
       'failure.draft': 'The screenshot could not enter the attachment rail',
@@ -611,6 +635,7 @@ window.__ModuleLoader__.load({
      */
     async function runScreenshot(props) {
       if (readSnipPending() || readClipboardBusy()) return
+      cancelLongPress() // 短按开始截图：把任何还没到阈值的按住计时收掉
       setSnipPending(true)
       try {
         await insertScreenshot(props)
@@ -619,19 +644,49 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** 长按计时器与「本次按下是否已被长按消费」——模块级即可，按下的生命周期只有几百毫秒。 */
+    /** 长按计时器与「本次按下是否已被长按消费」——模块级即可，按下的生命周期只有一两秒。 */
     let pressTimer = null
     let pressConsumed = false
+    /** 按住中（长按进行中）：组件据此加 HOLD_CLASS，显示进度条反馈。 */
+    let pressing = false
+    const pressListeners = new Set()
 
-    /** 按下开始计时：到阈值就按「长按」处理（插入剪贴板图片）。 */
+    function subscribePress(listener) {
+      pressListeners.add(listener)
+      return () => {
+        pressListeners.delete(listener)
+      }
+    }
+
+    function readPressing() {
+      return pressing
+    }
+
+    function setPressing(next) {
+      if (pressing === next) return
+      pressing = next
+      for (const listener of Array.from(pressListeners)) listener()
+    }
+
+    /**
+     * 按下开始计时：到阈值才按「长按」处理（插入剪贴板图片）。
+     *
+     * 两条硬约束，都是为了「短按必须是截图」：
+     * - **只有按钮已点亮**（剪贴板里确有新图片）才启动计时。否则一次慢点击会把剪贴板里那张**旧图**
+     *   静默塞进附件栏——这正是线上反馈的问题（点截图/取消，附件里却多出微信截图）。
+     * - 阈值 **900ms** 且按住期间有进度条：慢点击在走完进度条之前就松手了，长按不会触发。
+     */
     function beginLongPress(props) {
       cancelLongPress()
       pressConsumed = false
+      if (!readClipboardNew()) return
+      setPressing(true)
       pressTimer = setTimeout(() => {
         pressTimer = null
         pressConsumed = true
+        setPressing(false)
         void insertClipboardImage(props)
-      }, 550)
+      }, LONG_PRESS_MS)
     }
 
     function cancelLongPress() {
@@ -639,6 +694,7 @@ window.__ModuleLoader__.load({
         clearTimeout(pressTimer)
         pressTimer = null
       }
+      setPressing(false)
     }
 
     /**
@@ -653,6 +709,7 @@ window.__ModuleLoader__.load({
       const busy = react.useSyncExternalStore(subscribeSnip, readSnipPending)
       const clipboardReady = react.useSyncExternalStore(subscribeClipboard, readClipboardNew)
       const clipboardBusyNow = react.useSyncExternalStore(subscribeClipboard, readClipboardBusy)
+      const holding = react.useSyncExternalStore(subscribePress, readPressing)
       const visible = verdict === 'yes' || (verdict === 'error' && nameSuggestsImage(state))
       // ⚠️ hook 必须**无条件**调用。这里曾经把 useEffect 放在下面那句 `return null` 之后，于是
       // 「能力查询在途（少一个 hook）→ 拿到可收图（多一个 hook）」直接触发 React #310
@@ -662,21 +719,26 @@ window.__ModuleLoader__.load({
       }, [visible])
       if (!visible) return null
       const pending = busy || clipboardBusyNow
-      const title = busy
-        ? props.t('button.waiting')
-        : clipboardBusyNow
-          ? props.t('clipboard.attach')
-          : clipboardReady
-            ? props.t('clipboard.hint')
-            : props.t('button.tooltip')
+      const title = holding
+        ? props.t('clipboard.hold')
+        : busy
+          ? props.t('button.waiting')
+          : clipboardBusyNow
+            ? props.t('clipboard.attach')
+            : clipboardReady
+              ? props.t('clipboard.hint')
+              : props.t('button.tooltip')
+      let className = clipboardReady ? BUTTON_CLASS + ' ' + CLIPBOARD_CLASS : BUTTON_CLASS
+      if (holding) className += ' ' + HOLD_CLASS
       const button = react.createElement(
         'button',
         {
           type: 'button',
-          className: clipboardReady ? BUTTON_CLASS + ' ' + CLIPBOARD_CLASS : BUTTON_CLASS,
+          className,
           title,
           'aria-label': props.t('button.aria'),
           'aria-busy': pending ? 'true' : 'false',
+          'data-holding': holding ? 'true' : 'false',
           disabled: pending,
           onMouseDown: (event) => {
             event.preventDefault()
