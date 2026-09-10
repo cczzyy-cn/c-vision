@@ -424,6 +424,15 @@ window.__ModuleLoader__.load({
         setClipboardNew(false)
         return
       }
+      // 宿主说「这是我们自己产出的」（单击系统截图刚交回来的那张）：一律不提示，并**强制清掉**可能
+      // 已经亮起的高亮。必须强制：轮询有可能早于宿主记下归属（剪贴板是在截图返回**之前**被系统写入
+      // 的），那种情况下 token 不会再变，只靠「变化才更新」会留下一个永不消失的蓝色高亮。
+      if (state.served === true) {
+        clipboardBaselineSet = true
+        clipboardSeenToken = token
+        setClipboardNew(false)
+        return
+      }
       if (!clipboardBaselineSet) {
         // 首次轮询只建基线：页面打开前就存在的旧图不该让按钮一上来就变色。
         clipboardBaselineSet = true
@@ -431,11 +440,9 @@ window.__ModuleLoader__.load({
         return
       }
       if (token !== clipboardSeenToken) {
+        // 不是我们自己产出的新图（别家软件截图、或用户标注后重新复制）：点亮。
         clipboardSeenToken = token
-        // `served`：宿主说这张图是**我们自己刚（单击系统截图时）交给页面的**——它刚刚已经进过附件栏，
-        // 再亮「长按插入剪贴板图片」就自相矛盾。别家软件的截图、用户标注后重新复制的新版本 token
-        // 都不同（served=false），照常点亮。
-        setClipboardNew(state.served !== true)
+        setClipboardNew(true)
       }
     }
 

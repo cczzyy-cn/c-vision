@@ -846,6 +846,36 @@ test('单击系统截图后：我们自己产出的那张图（served=true）不
   )
 })
 
+test('已经亮起之后宿主才告诉我们「那是我们自己产出的」→ 强制清掉（token 没变也要清）', async () => {
+  await withClipboardTest(
+    {
+      states: [
+        { supported: true, image: true, token: '1' }, // 基线
+        { supported: true, image: true, token: '2' }, // 轮询早于宿主记下归属 → 先亮了
+        { supported: true, image: true, token: '2', served: true }, // token 不变，但宿主说是我们产出的
+      ],
+    },
+    async () => {
+      const client = mountClient()
+      const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+      const props = propsFor(state, client.slot.inject('s'))
+      await renderVisibleButton(client, props)
+
+      mock.timers.tick(1000)
+      await settle()
+      assert.match(buttonOf(client.component(props)).props.className, /--clipboard/, '这张图第一次轮到时先亮了')
+
+      mock.timers.tick(1000)
+      await settle()
+      assert.equal(
+        buttonOf(client.component(props)).props.className,
+        'cvision-screenshot-button',
+        '宿主确认是自己产出的之后，即使 token 没变也必须清掉高亮（否则蓝色永不消失）',
+      )
+    },
+  )
+})
+
 test('长按按钮：剪贴板图片作为附件插入，随后颜色恢复正常', async () => {
   await withClipboardTest(
     {

@@ -9,7 +9,10 @@
  * 需要先构建（`npm run build`）——这里跑的是 DSH 真正会加载的 `lib/index.js`。
  */
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { mock } from 'node:test'
+
+/** 让出一个宏任务：用于推进被 await 的处理器（如「截图进行中」的时序用例）。 */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
 
 const { apply, snipExecutor, clipboardProbe } = await import('../lib/index.js')
 
@@ -299,22 +302,63 @@ test('剪贴板状态：单击系统截图之后，我们自己那张图标记�
   })
 })
 
-test('剪贴板状态：截图之后剪贴板换成别家的图（token 变了）→ served=false，提示照旧亮', async () => {
+test('剪贴板状态：截图**还在进行中**出现的图也算我们的（否则期间一次轮询就点亮了）', async () => {
+  const { route } = mountHost()
+  let release = () => {}
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  await withSnipExecutor(
+    async () => {
+      await gate // 卡住截图，模拟「用户还在框选/标注」
+      return { kind: 'captured', dataUrl: PNG_DATA_URL }
+    },
+    async () => {
+      await withClipboardProbe(
+        { state: async () => ({ supported: true, image: true, token: '777', reason: '' }) },
+        async () => {
+          const snipPromise = invoke(route(SNIP)) // 故意不 await：截图进行中
+          await settle()
+          const during = JSON.parse((await invoke(route(CLIPBOARD), fakeRequest({ method: 'GET', url: CLIPBOARD }))).body)
+          assert.equal(during.served, true, '截图进行中就写进剪贴板的图，必须算我们自己产出的')
+          // 慢截图：用户拖框/标注十几秒（远超完成后那个 4s 窗口），只要请求还在进行中就必须继续归属。
+          mock.timers.enable({ apis: ['Date'] })
+          try {
+            mock.timers.tick(15000)
+            const slow = JSON.parse((await invoke(route(CLIPBOARD), fakeRequest({ method: 'GET', url: CLIPBOARD }))).body)
+            assert.equal(slow.served, true, '慢截图期间也得算我们的（窗口不该从第一次轮询开始算）')
+          } finally {
+            mock.timers.reset()
+          }
+          release()
+          assert.equal((await snipPromise).statusCode, 200)
+        },
+      )
+    },
+  )
+})
+
+test('剪贴板状态：归属窗口内截图工具再写一次剪贴板仍算我们的；窗口过后换图才 served=false', async () => {
   const { route } = mountHost()
   await withSnipExecutor({ kind: 'captured', dataUrl: PNG_DATA_URL }, async () => {
     let token = '601'
     await withClipboardProbe(
       { state: async () => ({ supported: true, image: true, token, reason: '' }) },
       async () => {
-        await invoke(route(SNIP))
-        assert.equal(
-          JSON.parse((await invoke(route(CLIPBOARD), fakeRequest({ method: 'GET', url: CLIPBOARD }))).body).served,
-          true,
-        )
-        token = '602' // 用户又截了别的东西，或标注后重新复制
-        const changed = JSON.parse((await invoke(route(CLIPBOARD), fakeRequest({ method: 'GET', url: CLIPBOARD }))).body)
-        assert.equal(changed.token, '602')
-        assert.equal(changed.served, false, '内容换了就不是「我们自己那张」了，提示该亮')
+        mock.timers.enable({ apis: ['Date'] })
+        try {
+          const readServed = async () =>
+            JSON.parse((await invoke(route(CLIPBOARD), fakeRequest({ method: 'GET', url: CLIPBOARD }))).body).served
+          await invoke(route(SNIP))
+          assert.equal(await readServed(), true)
+          token = '602' // 截图工具打开编辑器又写了一次剪贴板
+          assert.equal(await readServed(), true, '窗口内仍归我们，不该点亮')
+          mock.timers.tick(5000) // 归属窗口（4s）过期
+          token = '603' // 这次是别家的新图
+          assert.equal(await readServed(), false, '窗口过后换了内容，提示该亮')
+        } finally {
+          mock.timers.reset()
+        }
       },
     )
   })
