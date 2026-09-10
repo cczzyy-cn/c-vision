@@ -72,7 +72,10 @@ def status() -> dict:
     return {
         "platform": sys.platform,
         "python": sys.version.split()[0],
-        "cvison_dir": os.getcwd(),
+        # 键名是历史拼写（`cvison_dir`，少个 i），保留以兼容既有消费方；值 = **包根目录**。
+        # 不能用 os.getcwd()：插件侧为了让 Windows 能替换安装目录，已把子进程 cwd 改成系统临时目录
+        # （见 src/index.ts 的 PY_CWD），那里的 cwd 不再代表 cvision 的位置。
+        "cvison_dir": os.environ.get("CVISION_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "backend": backend,
         "backend_known": backend_known,
         "backend_implemented": backend_implemented,

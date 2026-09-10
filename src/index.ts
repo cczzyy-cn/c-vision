@@ -18,8 +18,9 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { promisify } from 'node:util'
 import { existsSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { dirname, resolve } from 'node:path'
+import { dirname, delimiter, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -53,8 +54,33 @@ const PLUGIN_DIR = findPluginRoot()
 const PYTHON = process.env.CVISION_PYTHON ?? 'python'
 const CVISION_DIR = process.env.CVISION_DIR || PLUGIN_DIR
 
-/** Python 子进程一律强制 UTF-8 stdio，避免 Windows 控制台/ANSI 代码页把中文窗口标题与 OCR 输出弄乱。 */
-const PY_ENV = { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' }
+/**
+ * Python 子进程一律强制 UTF-8 stdio，避免 Windows 控制台/ANSI 代码页把中文窗口标题与 OCR 输出弄乱。
+ * 同时把插件目录挂到 `PYTHONPATH` 前面，让 `python -m cvision.*` 在**任意工作目录**下都能 import 到包内源码。
+ */
+const PY_ENV = {
+  ...process.env,
+  PYTHONUTF8: '1',
+  PYTHONIOENCODING: 'utf-8',
+  PYTHONPATH: [CVISION_DIR, process.env.PYTHONPATH].filter(Boolean).join(delimiter),
+}
+
+/**
+ * Python 子进程的工作目录：**绝不能用插件安装目录**。
+ *
+ * Windows 下「进程的当前目录」就是该目录上的一个句柄，于是插件自己拉起的常驻
+ * `python -m cvision.cli_server` 会把安装目录锁住 —— `dsh plugin add` 升级/重装时，pnpm 需要把临时目录
+ * rename 成 `node_modules/vision`，会直接失败：
+ *
+ * ```text
+ * [ERR_PNPM_EPERM] [importPackage …\node_modules\vision] EPERM: operation not permitted,
+ *   rename '…\vision_tmp_23816_2' -> '…\vision'
+ * ```
+ *
+ * 实测踩到过（用户执行 `dsh plugin add github:` 时）。改成系统临时目录后，任何子进程都不再持有安装目录，
+ * 边跑边升级也能成功；`cvision` 仍靠 `PYTHONPATH` 解析得到。
+ */
+const PY_CWD = tmpdir()
 
 /** 解析 `data:<mime>;base64,<data>` 为附件服务所需的字节与媒体类型。 */
 function parseDataUrl(dataUrl: string): { data: Uint8Array; mediaType: MediaType; ext: string } {
@@ -85,7 +111,7 @@ function assertCvisionPresent(): void {
 async function runCliInput(args: string[], exec: { signal: AbortSignal }): Promise<void> {
   assertCvisionPresent()
   await execFileAsync(PYTHON, ['-m', 'cvision.cli_input', ...args], {
-    cwd: CVISION_DIR,
+    cwd: PY_CWD,
     env: PY_ENV,
     maxBuffer: 1 * 1024 * 1024,
     signal: exec.signal,
@@ -96,7 +122,7 @@ async function runCliInput(args: string[], exec: { signal: AbortSignal }): Promi
 async function runCliCapture(args: string[], exec: { signal: AbortSignal }): Promise<string> {
   assertCvisionPresent()
   const { stdout } = await execFileAsync(PYTHON, ['-m', 'cvision.cli_capture', ...args], {
-    cwd: CVISION_DIR,
+    cwd: PY_CWD,
     env: PY_ENV,
     maxBuffer: 64 * 1024 * 1024,
     signal: exec.signal,
@@ -124,7 +150,7 @@ class CvisionServer {
   private ensure(): void {
     if (this.child) return
     const child = spawn(PYTHON, ['-m', 'cvision.cli_server'], {
-      cwd: CVISION_DIR,
+      cwd: PY_CWD,
       env: PY_ENV,
       stdio: ['pipe', 'pipe', 'pipe'],
     })
@@ -347,7 +373,7 @@ async function runPythonCli(module: string, args: string[], exec: { signal: Abor
   assertCvisionPresent()
   try {
     const { stdout } = await execFileAsync(PYTHON, ['-m', module, ...args], {
-      cwd: CVISION_DIR,
+      cwd: PY_CWD,
       env: PY_ENV,
       maxBuffer: 64 * 1024 * 1024,
       signal: exec.signal,
@@ -693,7 +719,7 @@ export function apply(ctx: Context): void {
       if (args.region) cli.push('--region', String(args.region))
       if (args.delay) cli.push('--delay', String(args.delay))
       const { stdout } = await execFileAsync(PYTHON, ['-m', 'cvision.cli_ocr', ...cli], {
-        cwd: CVISION_DIR,
+        cwd: PY_CWD,
         env: PY_ENV,
         maxBuffer: 4 * 1024 * 1024,
         signal: exec.signal,
@@ -1115,7 +1141,7 @@ export function apply(ctx: Context): void {
       timeoutMs: 30000,
       async execute(_args, exec) {
         const { stdout } = await execFileAsync(PYTHON, ['-m', 'cvision.cli_input', '--get-clipboard'], {
-          cwd: CVISION_DIR,
+          cwd: PY_CWD,
           env: PY_ENV,
           maxBuffer: 4 * 1024 * 1024,
           signal: exec.signal,

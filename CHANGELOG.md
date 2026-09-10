@@ -10,6 +10,27 @@
 > - `v0.1.0` ~ `v0.1.9` 的说明只在 [GitHub Releases](https://github.com/cczzyy-cn/c-vision/releases) 里
 >   （那时还没有本文件）。
 
+## v0.2.16
+
+**修复：`dsh plugin add` 升级/重装时报 `ERR_PNPM_EPERM`（pnpm 无法替换 `node_modules/vision`）**。
+
+```text
+[ERR_PNPM_EPERM] [importPackage …\node_modules\vision] EPERM: operation not permitted,
+  rename '…\vision_tmp_23816_2' -> '…\vision'
+```
+
+- 根因：插件自己拉起的**常驻 Python 子进程**（`python -m cvision.cli_server`）**以插件安装目录为工作目录**
+  （`cwd: CVISION_DIR`）。Windows 下「进程的当前目录」就是该目录上的一个句柄，于是 pnpm 无法把临时目录
+  rename 成 `node_modules/vision` —— 用户实际执行 `plugin add github:` 时踩到。
+- 修法：所有 Python 子进程的 `cwd` 改为**系统临时目录**（`PY_CWD = tmpdir()`），改用
+  `PYTHONPATH = CVISION_DIR`（拼在用户已有值前面，不覆盖）让 `python -m cvision.*` 在任何工作目录下都能
+  import 到包内源码。6 处 spawn 全部改掉；实测该组合下 CLI 与常驻 server 均正常应答。
+- 附带修正 `cvision_status()` 的 `cvison_dir`：以前报 `os.getcwd()`，改用包根目录（`CVISION_DIR` 或由
+  `__file__` 推导）——cwd 已不再代表 cvision 的位置；键名是历史拼写，保留以兼容消费方。新增 1 条 Python
+  用例（断言该字段指向含 `cvision/` 的目录），Python 67 → **68**。
+- 文档：README「升级后必须做什么」补上这条错误的成因与「0.2.16 起可边跑边升级」，故障排查表加一行。
+  ⚠️ **从 ≤0.2.15 升到 0.2.16 这\*一次\*仍需先关 DSH**（旧版本还在用旧行为）。
+
 ## v0.2.15
 
 **新增文档一致性自检 `npm run check:docs`**（`scripts/check-docs.mjs`，14 项；CI 每次都会跑）——把「文档不能

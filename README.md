@@ -10,7 +10,7 @@ Python 版 cvision** 截屏/OCR/输入 → 写入 Harness 附件服务（`ctx.at
 
 同一个包还带一个**浏览器半边**：输入框工具栏的「截图」按钮（人工一键抓屏，或把剪贴板里的图片作为附件）。
 
-**版本**：`0.2.15` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
+**版本**：`0.2.16` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
 **许可**：BSD-3-Clause · 变更历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 目录
@@ -213,6 +213,20 @@ focus_window("Google Chrome") → press_key("ctrl+l") → type_text("https://…
 
 升级方式：`dsh plugin --profile web add`（重新装）/ `rm` 后再 `add`；或换成新的 Release tarball。
 
+> **装/升级前需要先关掉 DSH 吗？** **v0.2.16 起不需要**。若你遇到过这条错误：
+>
+> ```text
+> [ERR_PNPM_EPERM] [importPackage …\node_modules\vision] EPERM: operation not permitted,
+>   rename '…\vision_tmp_23816_2' -> '…\vision'
+> ```
+>
+> 根因是插件自己拉起的常驻 Python 子进程（`python -m cvision.cli_server`）**以安装目录为工作目录**，
+> 而 Windows 下「进程的当前目录」就是该目录上的一个句柄 → pnpm 无法把临时目录替换成 `node_modules/vision`。
+> 现在子进程的 cwd 改为**系统临时目录**、靠 `PYTHONPATH` 找到包内源码，任何子进程都不再持有安装目录，
+> 于是**可以边跑边升级**。
+>
+> ⚠️ 但从 **≤0.2.15** 升到 **0.2.16** 这**一次**仍然要先关 DSH（旧版本还在用旧行为）。
+
 ## 配置（可选）
 
 默认即可用；如需覆盖：
@@ -242,7 +256,7 @@ npm run check:docs   # 文档一致性自检（14 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
-当前规模：**JS 54 条 + Python 67 条**。
+当前规模：**JS 54 条 + Python 68 条**。
 
 ### 文档约定（自动校验）
 
@@ -359,6 +373,7 @@ vision/                      # 仓库根 = 插件本体
 | 抓窗口是黑图/空白 | 未装 `winsdk` 时 WGC 不可用，会回退 `PrintWindow`／桌面区域；装 `winsdk` 后最准（微信等 Qt 窗口属已知空白帧场景） |
 | 中文窗口标题匹配不上 | v0.2.2 起所有 Python 子进程强制 UTF-8；若自行调用 Python，请一并设 `PYTHONUTF8=1` |
 | 升级后行为没变 | 见[升级后必须做什么](#升级后必须做什么)：客户端半边要**硬刷新**，宿主半边要**重启** |
+| `plugin add` 报 `ERR_PNPM_EPERM … rename '…vision_tmp_…' -> '…vision'` | 安装目录被占用（≤0.2.15 的插件 Python 子进程以它为 cwd）。**先关 DSH** 再装；0.2.16 起不会再有此问题（cwd 已改为系统临时目录） |
 | macOS 上窗口标题为空 | 需在「系统设置 → 隐私与安全 → 屏幕录制」授权 |
 
 ## 说明与限制
