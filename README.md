@@ -22,6 +22,16 @@
 
 > 维护约定：凡是改行为，就升 `package.json` 版本并在此追加一条（附提交号），避免版本与文档漂移。
 
+- **v0.2.7**：修复 **`focus_window` 会把窗口改成半屏** —— 它无条件调用
+  `ShowWindow(SW_RESTORE)`，而 `SW_RESTORE` 不只是「还原最小化」：**最大化**的窗口也会被降级成
+  普通尺寸（全屏浏览器缩回上次的普通大小，看起来就是「窗口被改成半屏」）。现在拆出可测的
+  `show_command_for()` / `bring_to_front()`：**只有最小化**的窗口才 `SW_RESTORE`，最大化/普通窗口
+  一律保持原状，只做置前（与 `capture/windows.py:_prepare_window_for_capture` 的守卫一致）。
+  工具描述与 README 同步写明「只改前后层级，不改尺寸/最大化状态」。新增 `tests/test_input.py` 7 条
+  （用假 win32 驱动，平台无关），Python 单测 44 → 51。
+  > 起因（诚实记录）：我在会话里为「让 Chrome 置前好发按键」调了三次 `focus_window`，把你的全屏
+  > 浏览器缩成了半屏；我一开始误判成 DevTools 停靠，是**你指出后重查抓图尺寸（2560 → 1280 → 2560）
+  > 才定位到真正的调用点**。
 - **v0.2.6**：截图按钮**默认改走系统级框选截图**（人工通道），浏览器抓屏降为回退。
   - 宿主新增 `POST /cvision/snip`：拉起系统截图 UI（Windows `Win+Shift+S` / `ms-screenclip:` 兜底、
     macOS `screencapture -i -x`），把用户框选的图交回浏览器半边。**只认调用之后新出现的结果**
@@ -91,7 +101,7 @@
 | `type_text(text)` | 像键盘一样**输入文本**到当前焦点 |
 | `press_key(keys)` | 发送**快捷键**，如 `ctrl+l`、`enter`、`ctrl+shift+t`、`alt+tab` |
 | `get_clipboard()` / `set_clipboard(text)` | 读写剪贴板文本 |
-| `focus_window(title?, handle?)` | 把窗口**置前**（用户级激活）；**`handle` 优先于 `title`** |
+| `focus_window(title?, handle?)` | 把窗口**置前**（用户级激活）；**`handle` 优先于 `title`**；**只改前后层级，不改窗口尺寸/最大化状态**（仅最小化的窗口会被还原） |
 
 > **关键**：默认**不最大化、不切前台**——WGC 抓窗口合成内容，与前台/遮挡无关。
 > **computer-use 闭环**：`see` 看清 → `click`/`type_text`/`press_key`/`scroll` 操作 → 再 `see` 确认 …（"看→操作→看"循环）。

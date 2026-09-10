@@ -43,10 +43,50 @@ def _parse_keys(keys: str) -> tuple[list[str], str]:
     return mods, main
 
 
+def show_command_for(*, is_minimized: bool, is_maximized: bool) -> str | None:
+    """置前前是否需要 ``ShowWindow``，以及用哪个语义。
+
+    **只有最小化的窗口**才需要 ``SW_RESTORE``；**最大化的窗口绝不能调用它**——``SW_RESTORE``
+    会把最大化窗口降级成普通尺寸（用户看到的就是「窗口被改成半屏」）。最大化和普通窗口都保持原状，
+    只做置前。这条守卫与 ``capture/windows.py:_prepare_window_for_capture`` 保持一致。
+
+    :returns: ``"restore"`` → 调用 ``ShowWindow(SW_RESTORE)``；``"keep"`` / ``None`` → 不碰它的
+        尺寸与位置。
+    """
+    if is_minimized:
+        return "restore"
+    if is_maximized:
+        return "keep"
+    return None
+
+
+def bring_to_front(hwnd: int, gui, con) -> None:
+    """把一个窗口置前，且**不改变**它的最大化/普通状态。
+
+    ``gui`` / ``con`` 是 ``win32gui`` / ``win32con``，由调用方传入——这样这条逻辑可以在非 Windows
+    环境里用假对象单测（本仓库的 CI 在 Linux/macOS 上跑）。
+    """
+    try:
+        command = show_command_for(
+            is_minimized=bool(gui.IsIconic(hwnd)),
+            is_maximized=bool(gui.IsZoomed(hwnd)),
+        )
+        if command == "restore":
+            gui.ShowWindow(hwnd, con.SW_RESTORE)  # 仅最小化时还原，最大化不能被降级
+    except Exception:
+        pass
+    try:
+        gui.SetForegroundWindow(hwnd)
+        gui.BringWindowToTop(hwnd)
+    except Exception:
+        pass
+
+
 def focus_window(title_substr: str | None = None, handle: int | None = None) -> int | None:
     """把窗口置前：优先按 ``handle`` 精确定位，否则按标题（精确标题优先，其次子串）。
 
-    Windows 用 pywin32；仅 Windows 支持。返回最终置前的窗口句柄。
+    **只置前，不改窗口状态**：最小化的窗口会被还原，最大化/普通窗口保持原样（同理，不抢前台时也不
+    改尺寸）。Windows 用 pywin32；仅 Windows 支持。返回最终置前的窗口句柄。
     """
     if not _is_windows():
         raise RuntimeError("focus_window 仅在 Windows 上支持（依赖 pywin32）")
@@ -67,15 +107,7 @@ def focus_window(title_substr: str | None = None, handle: int | None = None) -> 
     hwnd = int(handle)
     if not win32gui.IsWindow(hwnd):
         raise LookupError(f"无效窗口句柄 {handle}")
-    try:
-        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)  # 最小化了先还原
-    except Exception:
-        pass
-    try:
-        win32gui.SetForegroundWindow(hwnd)
-        win32gui.BringWindowToTop(hwnd)
-    except Exception:
-        pass
+    bring_to_front(hwnd, win32gui, win32con)
     time.sleep(0.2)
     return hwnd
 

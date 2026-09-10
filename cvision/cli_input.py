@@ -28,8 +28,8 @@ from cvision import input as inp
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="模拟用户级输入（鼠标/键盘/聚焦/剪贴板）")
-    p.add_argument("--focus", default=None, help="按标题子串把窗口置前（精确标题优先）")
-    p.add_argument("--focus-handle", type=int, default=None, help="按窗口句柄把窗口置前")
+    p.add_argument("--focus", default=None, help="按标题子串把窗口置前（精确标题优先；不改尺寸/最大化状态）")
+    p.add_argument("--focus-handle", type=int, default=None, help="按窗口句柄把窗口置前（不改尺寸/最大化状态）")
     p.add_argument("--click", nargs=2, type=int, metavar=("X", "Y"), help="鼠标单击屏幕坐标(绝对像素)")
     p.add_argument("--button", default="left", choices=["left", "right", "middle"])
     p.add_argument("--double", nargs=2, type=int, metavar=("X", "Y"), help="鼠标双击")
