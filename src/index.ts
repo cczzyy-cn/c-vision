@@ -395,8 +395,15 @@ export const snipExecutor: { run: (exec: { signal: AbortSignal }) => Promise<Sni
   run: runSnipCli,
 }
 
-/** 剪贴板状态（廉价：只查格式 + token，不解码图片）。 */
-type ClipboardState = { supported: boolean; image: boolean; token: string | null; reason: string }
+/** 剪贴板状态（廉价：只查格式 + token，不解码图片）。`served` 由状态路由附加。 */
+type ClipboardState = {
+  supported: boolean
+  image: boolean
+  token: string | null
+  reason: string
+  /** 这张图是不是我们自己刚（单击系统截图时）交给页面的——客户端据此不把它当「新图片」。 */
+  served?: boolean
+}
 
 /** 一次剪贴板取图的结果。 */
 type ClipboardImage =
@@ -407,6 +414,23 @@ type ClipboardImage =
 
 /** 最近一次 apply 创建的常驻 Python server（状态轮询优先走它，免得每秒冷启动一个解释器）。 */
 let activeServer: CvisionServer | null = null
+
+/**
+ * 「我们自己刚交给页面的那张剪贴板图片」的归属。
+ *
+ * 解决的问题：单击系统截图后，系统会把刚截的图放进剪贴板，于是剪贴板监视立刻亮起「长按插入剪贴板
+ * 图片」——而那张图刚刚已经进了附件栏，提示自相矛盾。这里记住那张图的剪贴板 token，状态路由多回一个
+ * `served: true`，客户端据此**不把自己产出的图当成新图片**。
+ *
+ * 为什么用身份而不是时间窗：时间窗取多少都是猜（用户可能十几秒后才标注完再复制），token 则精确；
+ * 标注后的新版本 token 会变，`served` 自然为 false——那确实是一张新图，亮起来是合理的。
+ *
+ * 归属是**惰性**的：截图路由只立一个「待归属」标记，等下一次状态轮询（页面本来就每秒来一次）再记下
+ * 当时的 token。这样截图路径不额外拉起任何探测；代价是「截图完成到首次轮询之间（≤1s）用户又复制了
+ * 别的内容」会被误归属一次（表现为那一次不亮，下次变化即自愈），比每次截图多打一次探针划算。
+ */
+let snipServedPending = false
+let snipServedToken: string | null = null
 
 /** 把 CLI/常驻进程返回的原始 JSON 收敛成 ClipboardState。 */
 function toClipboardState(raw: Json): ClipboardState {
@@ -530,6 +554,9 @@ export function apply(ctx: Context): void {
             })
             const outcome = await snipExecutor.run({ signal: controller.signal })
             if (outcome.kind === 'captured') {
+              // 立个「待归属」标记：下一次状态轮询看到的就是我们自己刚截的那张（不在这里额外探测，
+              // 免得截图路径多拉一次 Python）。
+              snipServedPending = true
               try {
                 const { data, mediaType } = parseDataUrl(outcome.dataUrl)
                 res.writeHead(200, { 'content-type': mediaType, 'cache-control': 'no-store' })
@@ -569,7 +596,17 @@ export function apply(ctx: Context): void {
             return
           }
           try {
-            sendJson(res, 200, await clipboardProbe.state())
+            const state = await clipboardProbe.state()
+            // 惰性归属：截图刚完成后的第一次轮询，把此刻剪贴板里那张记成「我们自己产出的」。
+            if (snipServedPending) {
+              snipServedToken = state.token
+              snipServedPending = false
+            }
+            // `served`：这张图是不是我们自己刚（单击系统截图时）交给页面的？客户端据此不把它当新图片。
+            sendJson(res, 200, {
+              ...state,
+              served: state.token !== null && state.token === snipServedToken,
+            })
           } catch (error) {
             sendJson(res, 500, { message: errorMessage(error) })
           }

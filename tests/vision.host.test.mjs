@@ -272,9 +272,52 @@ test('剪贴板状态：200 + JSON（页面每秒轮询这条）', async () => {
       const res = await invoke(route(CLIPBOARD), fakeRequest({ method: 'GET', url: CLIPBOARD }))
       assert.equal(res.statusCode, 200)
       assert.match(res.headers['content-type'], /^application\/json/)
-      assert.deepEqual(JSON.parse(res.body), { supported: true, image: true, token: '42', reason: '' })
+      const payload = JSON.parse(res.body)
+      assert.equal(payload.supported, true)
+      assert.equal(payload.image, true)
+      assert.equal(payload.token, '42')
+      // served 的语义由下面两条专门用例钉住（它们自己控制「先截图、再轮询」的时序）；
+      // 这里只要确认字段存在且是布尔值，避免用例之间因「待归属标记」互相干扰。
+      assert.equal(typeof payload.served, 'boolean')
     },
   )
+})
+
+test('剪贴板状态：单击系统截图之后，我们自己那张图标记为 served=true（客户端据此不亮提示）', async () => {
+  const { route } = mountHost()
+  await withSnipExecutor({ kind: 'captured', dataUrl: PNG_DATA_URL }, async () => {
+    await withClipboardProbe(
+      { state: async () => ({ supported: true, image: true, token: '501', reason: '' }) },
+      async () => {
+        // 先走一次系统截图：宿主会记下「此刻剪贴板的 token 就是我刚交出去的那张」
+        assert.equal((await invoke(route(SNIP))).statusCode, 200)
+        const same = JSON.parse((await invoke(route(CLIPBOARD), fakeRequest({ method: 'GET', url: CLIPBOARD }))).body)
+        assert.equal(same.token, '501')
+        assert.equal(same.served, true, '刚截的那张必须标成我们自己产出的')
+      },
+    )
+  })
+})
+
+test('剪贴板状态：截图之后剪贴板换成别家的图（token 变了）→ served=false，提示照旧亮', async () => {
+  const { route } = mountHost()
+  await withSnipExecutor({ kind: 'captured', dataUrl: PNG_DATA_URL }, async () => {
+    let token = '601'
+    await withClipboardProbe(
+      { state: async () => ({ supported: true, image: true, token, reason: '' }) },
+      async () => {
+        await invoke(route(SNIP))
+        assert.equal(
+          JSON.parse((await invoke(route(CLIPBOARD), fakeRequest({ method: 'GET', url: CLIPBOARD }))).body).served,
+          true,
+        )
+        token = '602' // 用户又截了别的东西，或标注后重新复制
+        const changed = JSON.parse((await invoke(route(CLIPBOARD), fakeRequest({ method: 'GET', url: CLIPBOARD }))).body)
+        assert.equal(changed.token, '602')
+        assert.equal(changed.served, false, '内容换了就不是「我们自己那张」了，提示该亮')
+      },
+    )
+  })
 })
 
 test('剪贴板状态：只接受 GET（405），且探测失败时 500 而不是崩掉轮询', async () => {

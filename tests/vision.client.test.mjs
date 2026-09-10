@@ -812,6 +812,40 @@ test('剪贴板出现新图片 → 按钮变色 + 悬浮提示 + 圆点', async 
   )
 })
 
+test('单击系统截图后：我们自己产出的那张图（served=true）不亮提示，别家的图照旧亮', async () => {
+  await withClipboardTest(
+    {
+      states: [
+        { supported: true, image: true, token: '1' }, // 基线
+        { supported: true, image: true, token: '2', served: true }, // 我们自己刚截的（已在附件栏里）
+        { supported: true, image: true, token: '3', served: false }, // 别家软件放进来的新图
+      ],
+    },
+    async () => {
+      const client = mountClient()
+      const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+      const props = propsFor(state, client.slot.inject('s'))
+      await renderVisibleButton(client, props)
+
+      mock.timers.tick(1000)
+      await settle()
+      assert.equal(
+        buttonOf(client.component(props)).props.className,
+        'cvision-screenshot-button',
+        '自己刚截的那张不该亮「长按插入剪贴板图片」——它刚刚已经进过附件栏',
+      )
+
+      mock.timers.tick(1000)
+      await settle()
+      assert.match(
+        buttonOf(client.component(props)).props.className,
+        /--clipboard/,
+        '别家软件的截图（served=false）要照常点亮',
+      )
+    },
+  )
+})
+
 test('长按按钮：剪贴板图片作为附件插入，随后颜色恢复正常', async () => {
   await withClipboardTest(
     {

@@ -432,7 +432,10 @@ window.__ModuleLoader__.load({
       }
       if (token !== clipboardSeenToken) {
         clipboardSeenToken = token
-        setClipboardNew(true)
+        // `served`：宿主说这张图是**我们自己刚（单击系统截图时）交给页面的**——它刚刚已经进过附件栏，
+        // 再亮「长按插入剪贴板图片」就自相矛盾。别家软件的截图、用户标注后重新复制的新版本 token
+        // 都不同（served=false），照常点亮。
+        setClipboardNew(state.served !== true)
       }
     }
 
