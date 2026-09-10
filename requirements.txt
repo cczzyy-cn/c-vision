@@ -1,5 +1,7 @@
 Pillow>=12.0.0
 pyautogui>=0.9.54  # 用户级输入（鼠标/键盘）
+pyperclip>=1.8.2  # 跨平台文本剪贴板（Windows 优先原生 pywin32；macOS/Linux 用它）
 pywin32>=311; sys_platform == 'win32'
 pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'   # macOS 后端（Quartz / CGWindowList + screencapture）
+pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'    # macOS 读剪贴板图片（NSPasteboard）
 winsdk>=1.0.0b10; sys_platform == 'win32'  # Windows Graphics Capture 后端（可选；未装则回退 PrintWindow/桌面区域抓取）

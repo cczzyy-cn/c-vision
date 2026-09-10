@@ -5,8 +5,10 @@
 最小化才还原、最大化必须保持最大化、普通窗口保持原样；并且这三种情况下都要置前。
 """
 
+import sys
 import unittest
 
+from cvision import input as input_module
 from cvision.input import bring_to_front, show_command_for
 
 SW_RESTORE = 9
@@ -57,6 +59,18 @@ class TestShowCommandFor(unittest.TestCase):
 
     def test_normal_window_is_left_alone(self):
         self.assertIsNone(show_command_for(is_minimized=False, is_maximized=False))
+
+
+class TestCapabilities(unittest.TestCase):
+    def test_capabilities_match_platform(self):
+        """能力清单必须按平台如实报告：focus_window 只在 Windows 上存在（别处调用会抛错）。"""
+        if sys.platform.startswith("win"):
+            self.assertIn("focus_window", input_module.CAPABILITIES)
+        else:
+            self.assertNotIn("focus_window", input_module.CAPABILITIES)
+        # 这些是跨平台的（pyautogui / pyperclip）
+        for name in ("click", "type_text", "press_keys", "get_clipboard", "set_clipboard"):
+            self.assertIn(name, input_module.CAPABILITIES)
 
 
 class TestBringToFront(unittest.TestCase):

@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-const { apply, snipExecutor } = await import('../lib/index.js')
+const { apply, snipExecutor, clipboardProbe } = await import('../lib/index.js')
 
 /** 捕获 apply 注册的路由与工具的数。 */
 function mountHost(resolveModelInfo = async () => ({ inputModalities: ['text'] })) {
@@ -100,15 +100,31 @@ async function withSnipExecutor(outcome, run) {
 
 const CAPABILITY = '/cvision/model-capability'
 const SNIP = '/cvision/snip'
+const CLIPBOARD = '/cvision/clipboard'
+const CLIPBOARD_IMAGE = '/cvision/clipboard/image'
 const PNG_DATA_URL = `data:image/png;base64,${Buffer.from([137, 80, 78, 71, 1, 2, 3]).toString('base64')}`
+
+/** 注入一次性的假剪贴板探测，并在用例结束后还原。 */
+async function withClipboardProbe(probe, run) {
+  const original = { state: clipboardProbe.state, image: clipboardProbe.image }
+  if (probe.state !== undefined) clipboardProbe.state = probe.state
+  if (probe.image !== undefined) clipboardProbe.image = probe.image
+  try {
+    return await run()
+  } finally {
+    Object.assign(clipboardProbe, original)
+  }
+}
 
 // ── 路由注册 ────────────────────────────────────────────────────────────────
 
-test('注册两条精确路由（能力 + 系统截图），并保留原有工具注册', () => {
+test('注册四条精确路由（能力 + 系统截图 + 剪贴板状态/取图），并保留原有工具注册', () => {
   const { routes, tools, route } = mountHost()
-  assert.equal(routes.length, 2)
+  assert.equal(routes.length, 4)
   assert.ok(route(CAPABILITY), '能力路由必须存在')
   assert.ok(route(SNIP), '系统截图路由必须存在')
+  assert.ok(route(CLIPBOARD), '剪贴板状态路由必须存在')
+  assert.ok(route(CLIPBOARD_IMAGE), '剪贴板取图路由必须存在')
   for (const entry of routes) assert.equal(entry.kind, 'exact')
   assert.ok(tools > 0, 'apply 仍然要注册 vision 的工具')
 })
@@ -244,4 +260,86 @@ test('执行器拿到一个未中止的 AbortSignal（供客户端断开时中�
     assert.equal(typeof calls[0].signal?.aborted, 'boolean')
     assert.equal(calls[0].signal.aborted, false)
   })
+})
+
+// ── 剪贴板路由 ──────────────────────────────────────────────────────────────
+
+test('剪贴板状态：200 + JSON（页面每秒轮询这条）', async () => {
+  const { route } = mountHost()
+  await withClipboardProbe(
+    { state: async () => ({ supported: true, image: true, token: '42', reason: '' }) },
+    async () => {
+      const res = await invoke(route(CLIPBOARD), fakeRequest({ method: 'GET', url: CLIPBOARD }))
+      assert.equal(res.statusCode, 200)
+      assert.match(res.headers['content-type'], /^application\/json/)
+      assert.deepEqual(JSON.parse(res.body), { supported: true, image: true, token: '42', reason: '' })
+    },
+  )
+})
+
+test('剪贴板状态：只接受 GET（405），且探测失败时 500 而不是崩掉轮询', async () => {
+  const { route } = mountHost()
+  await withClipboardProbe({ state: async () => {
+    throw new Error('clipboard busy')
+  } }, async () => {
+    const wrong = await invoke(route(CLIPBOARD), fakeRequest({ method: 'POST', url: CLIPBOARD }))
+    assert.equal(wrong.statusCode, 405)
+    const failed = await invoke(route(CLIPBOARD), fakeRequest({ method: 'GET', url: CLIPBOARD }))
+    assert.equal(failed.statusCode, 500)
+    assert.match(JSON.parse(failed.body).message, /busy/)
+  })
+})
+
+test('剪贴板取图：200 + image/png + 原始字节', async () => {
+  const { route } = mountHost()
+  await withClipboardProbe(
+    { image: async () => ({ kind: 'captured', dataUrl: PNG_DATA_URL }) },
+    async () => {
+      const res = await invoke(route(CLIPBOARD_IMAGE))
+      assert.equal(res.statusCode, 200)
+      assert.equal(res.headers['content-type'], 'image/png')
+      assert.deepEqual([...res.body], [137, 80, 78, 71, 1, 2, 3])
+    },
+  )
+})
+
+test('剪贴板取图：剪贴板里没有图 → 204（客户端据此熄灭高亮）', async () => {
+  const { route } = mountHost()
+  await withClipboardProbe({ image: async () => ({ kind: 'empty' }) }, async () => {
+    const res = await invoke(route(CLIPBOARD_IMAGE))
+    assert.equal(res.statusCode, 204)
+  })
+})
+
+test('剪贴板取图：平台不支持 → 501', async () => {
+  const { route } = mountHost()
+  await withClipboardProbe(
+    { image: async () => ({ kind: 'unsupported', message: 'Linux Phase 2' }) },
+    async () => {
+      const res = await invoke(route(CLIPBOARD_IMAGE))
+      assert.equal(res.statusCode, 501)
+      assert.match(JSON.parse(res.body).message, /Phase 2/)
+    },
+  )
+})
+
+test('剪贴板取图：非 POST（405）与跨站（403）都拒绝，且不触碰探测', async () => {
+  const { route } = mountHost()
+  let calls = 0
+  await withClipboardProbe(
+    {
+      image: async () => {
+        calls += 1
+        return { kind: 'empty' }
+      },
+    },
+    async () => {
+      assert.equal((await invoke(route(CLIPBOARD_IMAGE), fakeRequest({ method: 'GET' }))).statusCode, 405)
+      assert.equal(
+        (await invoke(route(CLIPBOARD_IMAGE), fakeRequest({ headers: { origin: 'http://evil.example' } }))).statusCode,
+        403,
+      )
+      assert.equal(calls, 0, '被拒的请求不该读剪贴板')
+    },
+  )
 })

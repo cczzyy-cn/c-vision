@@ -37,6 +37,10 @@ window.__ModuleLoader__.load({
     const CAPABILITY_PATH = '/cvision/model-capability'
     /** 与宿主半边 `src/index.ts` 的 SNIP_PATH 必须一致：系统级框选截图。 */
     const SNIP_PATH = '/cvision/snip'
+    /** 与宿主半边 CLIPBOARD_STATE_PATH 一致：剪贴板状态（每秒轮询）。 */
+    const CLIPBOARD_STATE_PATH = '/cvision/clipboard'
+    /** 与宿主半边 CLIPBOARD_IMAGE_PATH 一致：取剪贴板图片（长按按钮时）。 */
+    const CLIPBOARD_IMAGE_PATH = '/cvision/clipboard/image'
     /**
      * `provider\0model` → 'yes' | 'no' | 'error'（'pending' 是未落地的在途态）。
      * 'error' 表示宿主答不上来（路由缺失/网络失败/组合里没有 web 服务器），
@@ -210,17 +214,29 @@ window.__ModuleLoader__.load({
 
     //#region 样式
     const BUTTON_CLASS = 'cvision-screenshot-button'
+    /** 剪贴板里有新图片时加在按钮上的修饰类：变色 + 右上角小圆点。 */
+    const CLIPBOARD_CLASS = 'cvision-screenshot-button--clipboard'
+    const DOT_CLASS = 'cvision-screenshot-dot'
     const NOTICE_CLASS = 'cvision-screenshot-notice'
     const CSS =
       '.' +
       BUTTON_CLASS +
-      '{width:28px;height:28px;color:var(--dsh-foreground-2,#000000a6);cursor:pointer;background:0 0;border:1px solid #0000;border-radius:8px;justify-content:center;align-items:center;padding:0;transition:background-color .1s,color .1s;display:inline-flex}' +
+      '{position:relative;width:28px;height:28px;color:var(--dsh-foreground-2,#000000a6);cursor:pointer;background:0 0;border:1px solid #0000;border-radius:8px;justify-content:center;align-items:center;padding:0;transition:background-color .1s,color .1s;display:inline-flex}' +
       '.' +
       BUTTON_CLASS +
       ':hover{background:var(--dsh-surface-2,#0000000f);color:var(--dsh-foreground-1,#000000e6)}' +
       '.' +
       BUTTON_CLASS +
       ':focus-visible{outline:2px solid var(--dsh-accent,#3b82f6);outline-offset:1px}' +
+      '.' +
+      BUTTON_CLASS +
+      ':disabled{opacity:.55;cursor:default}' +
+      '.' +
+      CLIPBOARD_CLASS +
+      '{color:var(--dsh-accent,#3b82f6);background:color-mix(in srgb,var(--dsh-accent,#3b82f6) 12%,transparent)}' +
+      '.' +
+      DOT_CLASS +
+      '{position:absolute;top:2px;right:2px;width:6px;height:6px;border-radius:50%;background:var(--dsh-accent,#3b82f6)}' +
       '.' +
       NOTICE_CLASS +
       '{max-width:180px;color:var(--dsh-alias-state-error-primary,#d4380d);font-size:12px;line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'
@@ -240,20 +256,26 @@ window.__ModuleLoader__.load({
     /** 简体中文（键集基准）。 */
     const zh = {
       'button.aria': '截图并插入到输入框',
-      'button.tooltip': '截图（系统框选，可标注）',
+      'button.tooltip': '短按：系统框选截图（可标注）；长按：插入剪贴板里的图片',
       'button.waiting': '请在系统截图里框选（Esc 取消）',
+      'clipboard.hint': '剪贴板有新图片：长按按钮插入',
+      'clipboard.attach': '正在从剪贴板插入…',
       'failure.capture': '截图失败',
       'failure.draft': '截图无法进入附件栏',
       'failure.busy': '输入框正忙，请稍后重试',
+      'failure.clipboard': '剪贴板里没有图片',
     }
     /** English，与 zh 键集一一对应。 */
     const en = {
       'button.aria': 'Capture a screenshot and insert it into the input',
-      'button.tooltip': 'Screenshot (system region capture)',
+      'button.tooltip': 'Click: system region capture; hold: insert the clipboard image',
       'button.waiting': 'Pick a region in the system screenshot tool (Esc cancels)',
+      'clipboard.hint': 'New clipboard image: hold the button to insert',
+      'clipboard.attach': 'Inserting from the clipboard…',
       'failure.capture': 'Screenshot failed',
       'failure.draft': 'The screenshot could not enter the attachment rail',
       'failure.busy': 'The composer is busy; try again shortly',
+      'failure.clipboard': 'The clipboard holds no image',
     }
     //#endregion
 
@@ -319,6 +341,124 @@ window.__ModuleLoader__.load({
     }
     //#endregion
 
+    //#region 剪贴板监视
+    /**
+     * 「剪贴板里有新图片」的状态。
+     *
+     * 为什么由宿主代查：浏览器**不可能**在后台读剪贴板——`navigator.clipboard.read()` 需要用户手势
+     * 与授权，也没有剪贴板变更事件。所以宿主原生侧查（只查格式 + token，不解码图片），页面每秒
+     * 同源轮询一次；这也天然覆盖「其它软件截图」（微信/QQ/Win+Shift+S 都是往系统剪贴板放图）。
+     */
+    let clipboardNew = false
+    let clipboardBusy = false
+    const clipboardListeners = new Set()
+    /** 已见过的图片 token：只有**变了**才算「新图片」（首次轮询只建基线，避免页面一加载就亮）。 */
+    let clipboardSeenToken = null
+    let clipboardBaselineSet = false
+    let clipboardFailures = 0
+    let clipboardWatchStarted = false
+    let clipboardVisibilityHooked = false
+    let clipboardTimer = null
+
+    function subscribeClipboard(listener) {
+      clipboardListeners.add(listener)
+      return () => {
+        clipboardListeners.delete(listener)
+      }
+    }
+
+    function readClipboardNew() {
+      return clipboardNew
+    }
+
+    function readClipboardBusy() {
+      return clipboardBusy
+    }
+
+    function setClipboardNew(next) {
+      if (clipboardNew === next) return
+      clipboardNew = next
+      for (const listener of Array.from(clipboardListeners)) listener()
+    }
+
+    function setClipboardBusy(next) {
+      if (clipboardBusy === next) return
+      clipboardBusy = next
+      for (const listener of Array.from(clipboardListeners)) listener()
+    }
+
+    /** 停掉轮询（宿主不支持 / 连续失败时），只提示一次。 */
+    function stopClipboardWatch(reason) {
+      if (clipboardTimer !== null) {
+        clearInterval(clipboardTimer)
+        clipboardTimer = null
+      }
+      console.warn('[vision] 剪贴板监视已停止：' + reason)
+    }
+
+    /** 轮询一次宿主状态；只在「图片 token 变了」时点亮按钮。 */
+    async function pollClipboard() {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      let state = null
+      try {
+        const response = await fetch(CLIPBOARD_STATE_PATH, { headers: { accept: 'application/json' } })
+        if (!response.ok) throw new Error('HTTP ' + String(response.status))
+        state = await response.json()
+      } catch (error) {
+        clipboardFailures += 1
+        // 宿主还没有这条路由（未升级/未重启）或网络异常：别刷屏，失败几次就停。
+        if (clipboardFailures >= 3) stopClipboardWatch(describeError(error))
+        return
+      }
+      clipboardFailures = 0
+      if (state === null || typeof state !== 'object') return
+      if (state.supported !== true) {
+        stopClipboardWatch('宿主不支持读剪贴板图片（' + String(state.reason || '') + '）')
+        return
+      }
+      const token = state.image === true && state.token != null ? String(state.token) : null
+      if (token === null) {
+        // 剪贴板当前不是图片：清掉高亮并丢掉基线，等下一张新图。
+        clipboardBaselineSet = true
+        clipboardSeenToken = null
+        setClipboardNew(false)
+        return
+      }
+      if (!clipboardBaselineSet) {
+        // 首次轮询只建基线：页面打开前就存在的旧图不该让按钮一上来就变色。
+        clipboardBaselineSet = true
+        clipboardSeenToken = token
+        return
+      }
+      if (token !== clipboardSeenToken) {
+        clipboardSeenToken = token
+        setClipboardNew(true)
+      }
+    }
+
+    /** 首次渲染按钮时开始监视（模型不支持图片时按钮不渲染，也就不会白轮询）。 */
+    function ensureClipboardWatch() {
+      if (clipboardWatchStarted || typeof setInterval !== 'function') return
+      const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden'
+      if (hidden) {
+        // 页面不可见时不轮询（隐藏标签页/后台页面空转没意义），等它可见再启动。
+        if (!clipboardVisibilityHooked && typeof document.addEventListener === 'function') {
+          clipboardVisibilityHooked = true
+          document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') return
+            ensureClipboardWatch()
+          })
+        }
+        return
+      }
+      clipboardWatchStarted = true
+      void pollClipboard()
+      clipboardTimer = setInterval(() => {
+        void pollClipboard()
+      }, 1000)
+    }
+    //#endregion
+
     //#region 系统截图（默认通道）
     /**
      * 请宿主拉起**系统级框选截图**（Windows 的 Win+Shift+S / macOS 的 screencapture -i），
@@ -359,6 +499,35 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 把一个 File 落进附件栏：建草稿 → 入轨（被拒不丢，短暂重试）→ 失败释放并提示。
+     * 系统截图与剪贴板插图共用这条链路。
+     * @returns 成功 true；失败已在界面上提示。
+     */
+    async function attachFile(props, file) {
+      let id = null
+      try {
+        id = props.createDraft(file)
+      } catch (error) {
+        reportFailure(props.t('failure.draft'), error)
+        return false
+      }
+      if (id === null) {
+        reportFailure(props.t('failure.draft'))
+        return false
+      }
+      // 输入框处于裁决/提交相位时会拒绝入轨并返回 false：短暂重试，别把用户刚截的图丢掉。
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        if (addDraftIds(props.inputActions, [id])) return true
+        await new Promise((resolve) => {
+          setTimeout(resolve, 200)
+        })
+      }
+      props.releaseDraft(id)
+      reportFailure(props.t('failure.busy'))
+      return false
+    }
+
+    /**
      * 截图落成草稿图并塞进输入框附件栏。
      *
      * **默认通道是宿主系统截图**（用户在自己的系统截图 UI 里框选，可标注）：抓屏授权由系统
@@ -384,26 +553,45 @@ window.__ModuleLoader__.load({
         file = hosted
       }
       if (file === null) return
-      let id = null
+      await attachFile(props, file)
+    }
+
+    /**
+     * 长按入口：把**剪贴板里的图片**作为附件插入（其它软件的截图也能这样带进来）。
+     * 成功后按钮配色恢复正常（`clipboardNew` 清掉）。
+     * @param props - slot 注入面。
+     */
+    async function insertClipboardImage(props) {
+      if (readClipboardBusy() || readSnipPending()) return
+      setClipboardBusy(true)
       try {
-        id = props.createDraft(file)
-      } catch (error) {
-        reportFailure(props.t('failure.draft'), error)
-        return
+        let response
+        try {
+          response = await fetch(CLIPBOARD_IMAGE_PATH, { method: 'POST', headers: { accept: 'image/png' } })
+        } catch (error) {
+          reportFailure(props.t('failure.clipboard'), error)
+          return
+        }
+        if (response.status === 204) {
+          setClipboardNew(false)
+          reportFailure(props.t('failure.clipboard'))
+          return
+        }
+        if (!response.ok) {
+          reportFailure(props.t('failure.clipboard'), new Error('HTTP ' + String(response.status)))
+          return
+        }
+        const blob = await response.blob().catch(() => null)
+        if (blob === null || blob.size === 0) {
+          reportFailure(props.t('failure.clipboard'))
+          return
+        }
+        const type = blob.type === '' ? 'image/png' : blob.type
+        const file = new File([blob], 'clipboard-' + Date.now() + '.png', { type })
+        if (await attachFile(props, file)) setClipboardNew(false)
+      } finally {
+        setClipboardBusy(false)
       }
-      if (id === null) {
-        reportFailure(props.t('failure.draft'))
-        return
-      }
-      // 输入框处于裁决/提交相位时会拒绝入轨并返回 false：短暂重试，别把用户刚截的图丢掉。
-      for (let attempt = 0; attempt < 6; attempt += 1) {
-        if (addDraftIds(props.inputActions, [id])) return
-        await new Promise((resolve) => {
-          setTimeout(resolve, 200)
-        })
-      }
-      props.releaseDraft(id)
-      reportFailure(props.t('failure.busy'))
     }
 
     /**
@@ -412,12 +600,34 @@ window.__ModuleLoader__.load({
      * @param props - slot 注入面。
      */
     async function runScreenshot(props) {
-      if (readSnipPending()) return
+      if (readSnipPending() || readClipboardBusy()) return
       setSnipPending(true)
       try {
         await insertScreenshot(props)
       } finally {
         setSnipPending(false)
+      }
+    }
+
+    /** 长按计时器与「本次按下是否已被长按消费」——模块级即可，按下的生命周期只有几百毫秒。 */
+    let pressTimer = null
+    let pressConsumed = false
+
+    /** 按下开始计时：到阈值就按「长按」处理（插入剪贴板图片）。 */
+    function beginLongPress(props) {
+      cancelLongPress()
+      pressConsumed = false
+      pressTimer = setTimeout(() => {
+        pressTimer = null
+        pressConsumed = true
+        void insertClipboardImage(props)
+      }, 550)
+    }
+
+    function cancelLongPress() {
+      if (pressTimer !== null) {
+        clearTimeout(pressTimer)
+        pressTimer = null
       }
     }
 
@@ -431,20 +641,51 @@ window.__ModuleLoader__.load({
       const verdict = useVerdict(state.current)
       const notice = react.useSyncExternalStore(subscribeNotice, readNotice)
       const busy = react.useSyncExternalStore(subscribeSnip, readSnipPending)
+      const clipboardReady = react.useSyncExternalStore(subscribeClipboard, readClipboardNew)
+      const clipboardBusyNow = react.useSyncExternalStore(subscribeClipboard, readClipboardBusy)
       if (verdict !== 'yes' && !(verdict === 'error' && nameSuggestsImage(state))) return null
+      // 按钮可见时才开监视（模型不支持图片时按钮不渲染，也就不白轮询宿主）。
+      react.useEffect(() => {
+        ensureClipboardWatch()
+      }, [])
+      const pending = busy || clipboardBusyNow
+      const title = busy
+        ? props.t('button.waiting')
+        : clipboardBusyNow
+          ? props.t('clipboard.attach')
+          : clipboardReady
+            ? props.t('clipboard.hint')
+            : props.t('button.tooltip')
       const button = react.createElement(
         'button',
         {
           type: 'button',
-          className: BUTTON_CLASS,
-          title: busy ? props.t('button.waiting') : props.t('button.tooltip'),
+          className: clipboardReady ? BUTTON_CLASS + ' ' + CLIPBOARD_CLASS : BUTTON_CLASS,
+          title,
           'aria-label': props.t('button.aria'),
-          'aria-busy': busy ? 'true' : 'false',
-          disabled: busy,
+          'aria-busy': pending ? 'true' : 'false',
+          disabled: pending,
           onMouseDown: (event) => {
             event.preventDefault()
           },
+          onPointerDown: () => {
+            beginLongPress(props)
+          },
+          onPointerUp: () => {
+            cancelLongPress()
+          },
+          onPointerLeave: () => {
+            cancelLongPress()
+          },
+          onPointerCancel: () => {
+            cancelLongPress()
+          },
           onClick: () => {
+            // 长按已经消费了这次交互（已按长按插入剪贴板图片）→ 不再触发短按的系统截图。
+            if (pressConsumed) {
+              pressConsumed = false
+              return
+            }
             void runScreenshot(props)
           },
         },
@@ -456,6 +697,8 @@ window.__ModuleLoader__.load({
             fill: 'currentColor',
           }),
         ),
+        // 剪贴板有新的图片时，右上角点一个小圆点（配合修饰类的配色变化）。
+        clipboardReady ? react.createElement('span', { className: DOT_CLASS, 'aria-hidden': true }) : null,
       )
       if (notice === null) return button
       return react.createElement(

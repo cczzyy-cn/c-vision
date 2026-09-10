@@ -22,6 +22,8 @@ import sys
 import tempfile
 import time
 
+from cvision import clipboard
+
 #: 轮询间隔（秒）；序列号比较是常数开销，可以问得勤一点。
 _POLL_SECONDS = 0.2
 #: 拿到第一张图后再静置多久，等用户可能继续去标注（Windows 截图工具是先入剪贴板再开编辑器）。
@@ -77,35 +79,19 @@ def _launch_windows_snip() -> bool:
         return False
 
 
-def _read_clipboard_image():
-    """读剪贴板里的图片；不是图片（空 / 文件列表 / 文本）返回 None。"""
-    from PIL import ImageGrab
-
-    try:
-        content = ImageGrab.grabclipboard()
-    except Exception:  # noqa: BLE001 - 剪贴板被别的进程占用时按「没有图」处理
-        return None
-    if content is None or isinstance(content, list):
-        return None
-    try:
-        return _to_rgb(content)
-    except Exception:  # noqa: BLE001 - 非图像句柄
-        return None
-
-
-def _settle_clipboard_image(user32, image, grace: float):
+def _settle_clipboard_image(image, grace: float):
     """第一张图到手后短暂静置：期间剪贴板又更新（用户去标注了）就取更新的那张。"""
     started = time.monotonic()
     deadline = started + grace
     hard_deadline = started + _SETTLE_HARD_CAP_SECONDS
-    sequence = user32.GetClipboardSequenceNumber()
+    sequence = clipboard.token()
     while time.monotonic() < min(deadline, hard_deadline):
         time.sleep(0.15)
-        current = user32.GetClipboardSequenceNumber()
+        current = clipboard.token()
         if current == sequence:
             continue
         sequence = current
-        newer = _read_clipboard_image()
+        newer = clipboard.read_image()
         if newer is not None:
             image = newer
             deadline = min(time.monotonic() + grace, hard_deadline)
@@ -113,25 +99,22 @@ def _settle_clipboard_image(user32, image, grace: float):
 
 
 def _snip_windows(timeout: float):
-    import ctypes
-
-    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
     if not _launch_windows_snip():
         raise SnipUnsupported("无法拉起 Windows 截图（pyautogui 与 ms-screenclip: 均不可用）")
 
-    before = user32.GetClipboardSequenceNumber()
+    before = clipboard.token()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(_POLL_SECONDS)
-        current = user32.GetClipboardSequenceNumber()
+        current = clipboard.token()
         if current == before:
             continue
-        image = _read_clipboard_image()
+        image = clipboard.read_image()
         if image is None:
             # 变了但不是图片（用户复制了别的东西）：记下新序列号继续等真正的截图。
             before = current
             continue
-        return _settle_clipboard_image(user32, image, _SETTLE_SECONDS)
+        return _settle_clipboard_image(image, _SETTLE_SECONDS)
     return None
 
 

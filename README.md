@@ -22,6 +22,26 @@
 
 > 维护约定：凡是改行为，就升 `package.json` 版本并在此追加一条（附提交号），避免版本与文档漂移。
 
+- **v0.2.8**：截图按钮新增**剪贴板监视 + 长按插入**；剪贴板能力跨平台化。
+  - 页面**每秒**轮询宿主 `GET /cvision/clipboard`（廉价：只查剪贴板格式 + token，**不解码图片**；
+    优先走常驻 Python 进程，免得每秒冷启动解释器）。剪贴板里**出现新图片**（其它软件截图、微信/QQ、
+    Win+Shift+S 都算）→ 按钮**变色 + 右上角圆点 + 悬浮提示**；**长按按钮（≥550ms）**→ 把剪贴板图片
+    作为附件插入 → 配色恢复正常。**短按仍是系统框选截图**。
+  - 为什么轮询在宿主：浏览器**不可能**后台读剪贴板（`navigator.clipboard.read()` 需要用户手势与授权，
+    而且没有剪贴板变更事件）。页面只做同源 HTTP 轮询，真正读剪贴板的是宿主原生侧。
+  - 新增 `cvision/clipboard.py`（Windows：`IsClipboardFormatAvailable` + 剪贴板序列号 + `ImageGrab`；
+    macOS：NSPasteboard/changeCount，**未在真机验证**；Linux：Phase 2，如实返回不支持——按钮就不监视
+    也不提示）与 `cvision/cli_clipboard.py`；常驻进程新增 `clipboard_state` op。
+  - **剪贴板跨平台**：`requirements.txt` 补 `pyperclip`（非 Windows 的文本剪贴板）与
+    `pyobjc-framework-Cocoa`（macOS 读剪贴板图片）；`focus_window` 按平台如实从能力清单里消失
+    （`cvision_status` 不再在非 Windows 上高报）。
+  - 省电与降级：页面隐藏时不轮询；宿主没有这条路由（未升级/未重启）或连续失败 3 次即停止，且只告警一次。
+  - 安全：状态路由只读；取图路由 **POST + 同源**，且只在用户长按按钮时调用。**已知取舍**：页面里的脚本
+    （含其它客户端插件）可以通过这条路由读到剪贴板里的图片——这是「让按钮看见其它软件的截图」的固有
+    代价，已在下面 STORE 契约里如实记录。
+  - 测试：JS 33 → **44** 条（剪贴板监视/长按/降级 + 宿主两条新路由），Python 51 → **60** 条。
+  - 实测：真机模拟「其它软件把图放进剪贴板」→ 状态 `image: true` 且 token 变化 → `--image` 返回 PNG
+    data URL（160×60 测试图）。
 - **v0.2.7**：修复 **`focus_window` 会把窗口改成半屏** —— 它无条件调用
   `ShowWindow(SW_RESTORE)`，而 `SW_RESTORE` 不只是「还原最小化」：**最大化**的窗口也会被降级成
   普通尺寸（全屏浏览器缩回上次的普通大小，看起来就是「窗口被改成半屏」）。现在拆出可测的
@@ -100,7 +120,7 @@
 | `drag(x1, y1, x2, y2, button?)` | 从 (x1,y1) 拖拽到 (x2,y2)（框选/拖文件） |
 | `type_text(text)` | 像键盘一样**输入文本**到当前焦点 |
 | `press_key(keys)` | 发送**快捷键**，如 `ctrl+l`、`enter`、`ctrl+shift+t`、`alt+tab` |
-| `get_clipboard()` / `set_clipboard(text)` | 读写剪贴板文本 |
+| `get_clipboard()` / `set_clipboard(text)` | 读写剪贴板文本（Windows 原生；macOS/Linux 走 `pyperclip`） |
 | `focus_window(title?, handle?)` | 把窗口**置前**（用户级激活）；**`handle` 优先于 `title`**；**只改前后层级，不改窗口尺寸/最大化状态**（仅最小化的窗口会被还原） |
 
 > **关键**：默认**不最大化、不切前台**——WGC 抓窗口合成内容，与前台/遮挡无关。
@@ -131,6 +151,23 @@ Linux    Phase 2：返回 501，浏览器半边自动回退到下面的浏览器
 **回退通道：浏览器 `getDisplayMedia`**。只有宿主那条路不可用（非桌面平台组合、Electron
 `file://` 里没有 web 服务器、旧版宿主）或明确返回不支持时，才回退到浏览器抓屏——功能在任何平台上
 都不会消失。点按钮后按钮进入「等待框选」态（期间禁用，Esc 取消即静默恢复）。
+
+**剪贴板监视与长按插入**（v0.2.8）：
+
+```text
+每秒        GET  /cvision/clipboard         宿主原生查：有没有图片 + token（不解码）
+出现新图片  按钮变色 + 右上角圆点 + 提示「剪贴板有新图片：长按按钮插入」
+长按 ≥550ms POST /cvision/clipboard/image   图片进附件栏 → 配色恢复正常
+短按        系统框选截图（上面的默认通道）
+```
+
+平台：读剪贴板图片 **Windows 完整（实测）** / macOS 代码已写（NSPasteboard，未真机验证）/
+Linux Phase 2（如实返回不支持，按钮就不监视也不提示）。文本剪贴板（`get_clipboard`/`set_clipboard`）
+Windows 走原生，其它平台走 `pyperclip`（已进 `requirements.txt`）。
+
+> ⚠️ **已知取舍**：这条取图路由让**页面里的脚本**（包括其它客户端插件）也能读到剪贴板里的图片——
+> 这是「让按钮看见其它软件的截图」的固有代价（浏览器本身不允许后台读剪贴板），所以取了
+> **同源 + 仅 POST + 只在长按时调用**三个约束，并在下面的 STORE 契约里写明。
 
 **可见性判定**：DSH 给浏览器的模型目录（`buildModelCatalog`）只投影
 `id/name/description/reasoning`，**刻意剥掉了 `inputModalities`**，所以客户端无法自行判断当前模型
@@ -321,15 +358,20 @@ vision/                      # 仓库根 = 插件本体
     ocr.py              #   OCR（Windows.Media.Ocr 优先 / pytesseract 回退）
     input.py            #   用户级输入（pyautogui：点击/移动/滚动/输入/快捷键/聚焦）
     snip.py             #   系统级区域截图（人工通道）：拉起系统截图 UI 并取回框选结果
+    clipboard.py        #   剪贴板图片读取 + 「是否变了」判定（Windows/macOS；Linux Phase 2）
     cli_capture.py      #   跨语言 CLI：python -m cvision.cli_capture [--list] [--region] [--delay]
     cli_ocr.py          #   OCR CLI：python -m cvision.cli_ocr [--window] [--region]
     cli_input.py        #   输入 CLI：python -m cvision.cli_input --click/--type/--keys/--focus ...
     cli_snip.py         #   系统截图 CLI：python -m cvision.cli_snip [--timeout 60]（JSON 结果）
+    cli_clipboard.py    #   剪贴板 CLI：--state（廉价状态）/ --image（取图），都是 JSON 契约
   tests/
     test_detect.py      #   detect 模块单测（PIL only）
     test_encoding.py    #   encoding 模块单测（dataURL/crop/fit，PIL only）
-    vision.client.test.mjs # 客户端半边单测（门控/系统截图与回退/草稿入轨/失败可见，node --test）
-    vision.host.test.mjs   # 宿主两条路由单测（能力判定口径 + 系统截图同源/方法/降级，node --test）
+    test_input.py       #   置前语义单测（假 win32：最大化绝不被降级）+ 能力清单按平台
+    test_snip.py        #   系统截图 CLI 的 JSON 契约
+    test_clipboard.py   #   剪贴板模块与 CLI 契约（平台分支 / empty / unsupported / error）
+    vision.client.test.mjs # 客户端半边单测（门控/系统截图与回退/剪贴板监视与长按/失败可见，node --test）
+    vision.host.test.mjs   # 宿主四条路由单测（能力判定 + 系统截图 + 剪贴板状态/取图，node --test）
   README.md
 ```
 
@@ -363,7 +405,7 @@ vision/                      # 仓库根 = 插件本体
   devDependency（因此 `npm ci` 不需要额外下载）。`lib/index.js` 运行时**只** import 前者
   （`cordis` / `dsh-attachment` / `node:http` 都是 `import type`，编译后不残留）；`ctx.tools`
   / `ctx.attachments` 由宿主注入。
-- **宿主入站路由**：两条，都通过 `ctx.inject(['webServer', ...])` 可选挂载，组合里没有 web 服务器时
+- **宿主入站路由**：四条，都通过 `ctx.inject(['webServer', ...])` 可选挂载，组合里没有 web 服务器时
   整段跳过。
   - `GET /cvision/model-capability`：**只读**、同源、无副作用、不回传任何凭据，供浏览器半边判断当前
     模型是否收图。
@@ -371,6 +413,11 @@ vision/                      # 仓库根 = 插件本体
     截图 UI 并把用户框选的那张图回传（200 图片字节 / 204 用户取消 / 501 平台不支持）。抓屏动作由用户
     在系统 UI 里完成，本路由只读「调用之后新出现」的剪贴板图片，因此不构成静默抓屏能力；客户端断开
     （关页/取消）会中止等待中的 Python 子进程。
+  - `GET /cvision/clipboard`：**只读**、廉价（只查剪贴板格式 + token，不解码图片），供页面每秒轮询
+    「剪贴板里有没有图片」。不回传图片内容本身。
+  - `POST /cvision/clipboard/image`：**仅 POST、仅同源**，返回剪贴板里的图片（200 图片字节 / 204 没有
+    图片 / 501 平台不支持）。**注意**：它让页面里的脚本（含其它客户端插件）也能读到剪贴板图片——这是
+    「按钮要看见其它软件的截图」的固有代价，故限制为同源 + 仅 POST + 只在用户长按时调用。
 
 ### 权限说明（真实高权限）
 - 通过**跨语言 spawn 包内 Python cvision** 子进程（`child_process`/进程管理）。

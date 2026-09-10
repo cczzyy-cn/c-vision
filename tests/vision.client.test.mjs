@@ -12,7 +12,7 @@
  */
 import { readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { mock } from 'node:test'
 
 const SOURCE = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
 
@@ -27,9 +27,68 @@ const reactStub = {
 }
 
 const documentStub = {
+  // 默认「隐藏」：剪贴板轮询在隐藏页面里根本不启动，这样其它用例（渲染按钮但不管剪贴板）
+  // 不会留下真实定时器干扰后续用例；剪贴板用例显式把 visibilityState 设为 visible。
+  visibilityState: 'hidden',
   querySelector: () => null,
   createElement: () => ({ dataset: {}, textContent: '', style: {} }),
   head: { appendChild: () => {} },
+}
+
+/** 取渲染结果里的按钮元素（有提示时外层是 Fragment）。 */
+function buttonOf(rendered) {
+  assert.ok(rendered, '能力允许时必须渲染出按钮')
+  return rendered.type === reactStub.Fragment ? rendered.children[1] : rendered
+}
+
+/**
+ * 剪贴板相关的假 fetch：`/cvision/clipboard` 依次返回给定状态（用完重复最后一个），
+ * `/cvision/clipboard/image` 按 `image` 选项返回 PNG 或 204，其余（能力查询）照常返回可收图。
+ */
+function clipboardFetch(options = {}) {
+  const states = options.states ?? [{ supported: true, image: false, token: null }]
+  const calls = []
+  let stateIndex = 0
+  const implementation = async (url, init) => {
+    const target = String(url)
+    calls.push({ url: target, init })
+    if (target.includes('/cvision/clipboard/image')) {
+      if (options.image === 'png') {
+        return {
+          ok: true,
+          status: 200,
+          blob: async () => new Blob([new Uint8Array([137, 80, 78, 71])], { type: 'image/png' }),
+          json: async () => ({}),
+          text: async () => '',
+        }
+      }
+      return { ok: false, status: 204, blob: async () => new Blob([]), json: async () => ({}), text: async () => '' }
+    }
+    if (target.includes('/cvision/clipboard')) {
+      const state = states[Math.min(stateIndex, states.length - 1)]
+      stateIndex += 1
+      return { ok: true, status: 200, json: async () => state, blob: async () => new Blob([]), text: async () => '' }
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ source: 'declared', image: true }),
+      blob: async () => new Blob([]),
+      text: async () => '',
+    }
+  }
+  implementation.calls = calls
+  return implementation
+}
+
+/** 可见页面（剪贴板用例用）。 */
+function visibleDocument() {
+  return {
+    visibilityState: 'visible',
+    querySelector: () => null,
+    createElement: () => ({ dataset: {}, textContent: '', style: {} }),
+    head: { appendChild: () => {} },
+  }
 }
 
 /** 把 bundle 求值一遍，返回它的导出。每次都重新求值，保证内部缓存互不串味。 */
@@ -394,9 +453,16 @@ test('source 不是 declared（宿主答不上来）时同样走兜底', async (
 
 test('同一模型只查一次宿主（结果缓存）', async () => {
   let calls = 0
-  await withFetch(async () => {
-    calls += 1
-    return { ok: true, json: async () => ({ source: 'declared', image: true }) }
+  await withFetch(async (url) => {
+    // 只数能力查询：按钮可见后还会轮询剪贴板状态，那是另一条路由。
+    if (String(url).includes('/cvision/model-capability')) calls += 1
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ source: 'declared', image: true }),
+      blob: async () => new Blob([]),
+      text: async () => '',
+    }
   }, async () => {
     const client = mountClient()
     const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
@@ -633,6 +699,233 @@ test('失败必须可见：输入框一直拒绝入轨时提示忙碌并释放�
   } finally {
     for (const restore of env.restores.reverse()) restore()
   }
+})
+
+// ── 剪贴板监视与长按插入 ────────────────────────────────────────────────────
+
+/** 剪贴板用例统一：可见页面 + 假剪贴板 fetch + 只模拟 setInterval（setTimeout 保持真实）。 */
+async function withClipboardTest(options, run) {
+  const restoreDocument = patchGlobal('document', visibleDocument())
+  const fetchStub = clipboardFetch(options)
+  mock.timers.enable({ apis: ['setInterval'] })
+  try {
+    return await withFetch(fetchStub, () => run(fetchStub))
+  } finally {
+    mock.timers.reset()
+    restoreDocument()
+  }
+}
+
+/** 渲染到「按钮可见且监视已启动」：第一次渲染时能力查询还在途，组件会先返回 null。 */
+async function renderVisibleButton(client, props) {
+  client.component(props) // 能力查询在途 → 还不渲染
+  await settle() // 能力返回
+  client.component(props) // 按钮可见 → useEffect 启动监视（立即轮询一次建基线）
+  await settle()
+}
+
+/** 捕获 console.warn（监视降级只该告警一次）。 */
+async function withWarnSpy(run) {
+  const original = console.warn
+  const seen = []
+  console.warn = (...args) => {
+    seen.push(args.join(' '))
+  }
+  try {
+    return await run(seen)
+  } finally {
+    console.warn = original
+  }
+}
+
+test('剪贴板首次轮询只建基线：页面打开前就存在的旧图不点亮按钮', async () => {
+  await withClipboardTest({ states: [{ supported: true, image: true, token: '1' }] }, async () => {
+    const client = mountClient()
+    const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+    const props = propsFor(state, client.slot.inject('s'))
+    await renderVisibleButton(client, props)
+    const button = buttonOf(client.component(props))
+    assert.equal(button.props.className, 'cvision-screenshot-button', '基线不该点亮')
+    assert.equal(button.props.title, 'button.tooltip')
+  })
+})
+
+test('剪贴板出现新图片 → 按钮变色 + 悬浮提示 + 圆点', async () => {
+  await withClipboardTest(
+    {
+      states: [
+        { supported: true, image: true, token: '1' },
+        { supported: true, image: true, token: '2' },
+      ],
+    },
+    async () => {
+      const client = mountClient()
+      const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+      const props = propsFor(state, client.slot.inject('s'))
+      await renderVisibleButton(client, props)
+      mock.timers.tick(1000)
+      await settle()
+      const button = buttonOf(client.component(props))
+      assert.match(button.props.className, /cvision-screenshot-button--clipboard/, '新图片要让按钮变色')
+      assert.equal(button.props.title, 'clipboard.hint', '悬浮提示要说明长按插入')
+      assert.equal(button.children[1].props.className, 'cvision-screenshot-dot', '右上角要有圆点')
+    },
+  )
+})
+
+test('长按按钮：剪贴板图片作为附件插入，随后颜色恢复正常', async () => {
+  await withClipboardTest(
+    {
+      states: [
+        { supported: true, image: true, token: '1' },
+        { supported: true, image: true, token: '2' },
+      ],
+      image: 'png',
+    },
+    async (stub) => {
+      const client = mountClient()
+      const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+      const injected = client.slot.inject('s')
+      const added = []
+      const props = propsFor(state, injected, {
+        inputActions: { addAttachments: (ids) => { added.push(...ids); return true } },
+      })
+      await renderVisibleButton(client, props)
+      mock.timers.tick(1000)
+      await settle()
+      const lit = buttonOf(client.component(props))
+      assert.match(lit.props.className, /--clipboard/)
+
+      lit.props.onPointerDown()
+      await new Promise((resolve) => {
+        setTimeout(resolve, 700) // 等长按阈值（550ms）触发
+      })
+      await settle()
+      await settle()
+      lit.props.onPointerUp()
+      lit.props.onClick() // 长按已消费：不该再触发短按的系统截图
+
+      assert.deepEqual(added, ['draft-0'], '剪贴板图片要进附件栏')
+      const imageCalls = stub.calls.filter((call) => call.url.includes('/cvision/clipboard/image'))
+      assert.equal(imageCalls.length, 1)
+      assert.equal(imageCalls[0].init?.method, 'POST')
+      assert.equal(
+        stub.calls.some((call) => call.url.includes('/cvision/snip')),
+        false,
+        '长按之后不该再走系统截图',
+      )
+      assert.equal(
+        buttonOf(client.component(props)).props.className,
+        'cvision-screenshot-button',
+        '插入成功后配色要恢复正常',
+      )
+    },
+  )
+})
+
+test('剪贴板不再是图片 → 高亮被清掉；再来一张新图又重新点亮', async () => {
+  await withClipboardTest(
+    {
+      states: [
+        { supported: true, image: true, token: '1' },
+        { supported: true, image: true, token: '2' },
+        { supported: true, image: false, token: '3' },
+        { supported: true, image: true, token: '4' },
+      ],
+    },
+    async () => {
+      const client = mountClient()
+      const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+      const props = propsFor(state, client.slot.inject('s'))
+      await renderVisibleButton(client, props)
+
+      mock.timers.tick(1000)
+      await settle()
+      assert.match(buttonOf(client.component(props)).props.className, /--clipboard/, '第二张图点亮')
+
+      mock.timers.tick(1000)
+      await settle()
+      assert.equal(
+        buttonOf(client.component(props)).props.className,
+        'cvision-screenshot-button',
+        '剪贴板不是图片时要熄灭',
+      )
+
+      mock.timers.tick(1000)
+      await settle()
+      assert.match(buttonOf(client.component(props)).props.className, /--clipboard/, '再来的新图要重新点亮')
+    },
+  )
+})
+
+test('宿主还没这条路由（未升级/未重启）→ 连续失败三次后停止，只告警一次', async () => {
+  await withWarnSpy(async (warnings) => {
+    const restoreDocument = patchGlobal('document', visibleDocument())
+    mock.timers.enable({ apis: ['setInterval'] })
+    let clipboardCalls = 0
+    const failing = async (url) => {
+      if (String(url).includes('/cvision/clipboard')) {
+        clipboardCalls += 1
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+          blob: async () => new Blob([]),
+          text: async () => '{"message":"Route not found"}',
+        }
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ source: 'declared', image: true }),
+        blob: async () => new Blob([]),
+        text: async () => '',
+      }
+    }
+    try {
+      await withFetch(failing, async () => {
+        const client = mountClient()
+        const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+        const props = propsFor(state, client.slot.inject('s'))
+        await renderVisibleButton(client, props) // 第 1 次失败
+        mock.timers.tick(1000) // 第 2 次
+        mock.timers.tick(1000) // 第 3 次 → 停止
+        await settle()
+        assert.equal(warnings.filter((line) => line.includes('剪贴板监视已停止')).length, 1)
+        const stopped = clipboardCalls
+        mock.timers.tick(1000)
+        mock.timers.tick(1000)
+        await settle()
+        assert.equal(clipboardCalls, stopped, '停掉之后不该再空转')
+        assert.equal(buttonOf(client.component(props)).props.className, 'cvision-screenshot-button')
+      })
+    } finally {
+      mock.timers.reset()
+      restoreDocument()
+    }
+  })
+})
+
+test('宿主不支持读剪贴板（如 Linux）→ 停止轮询，且只告警一次', async () => {
+  await withWarnSpy(async (warnings) => {
+    await withClipboardTest(
+      { states: [{ supported: false, image: false, token: null, reason: 'Phase 2' }] },
+      async (stub) => {
+        const client = mountClient()
+        const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+        const props = propsFor(state, client.slot.inject('s'))
+        await renderVisibleButton(client, props)
+        const counting = () => stub.calls.filter((call) => call.url.includes('/cvision/clipboard')).length
+        assert.equal(counting(), 1)
+
+        mock.timers.tick(1000)
+        mock.timers.tick(1000)
+        await settle()
+        assert.equal(counting(), 1, '不支持就该停掉，不要每秒空转')
+        assert.equal(warnings.filter((line) => line.includes('剪贴板监视已停止')).length, 1)
+      },
+    )
+  })
 })
 
 test('浏览器抓屏被拒（用户取消授权）保持静默（不该刷提示）', async () => {

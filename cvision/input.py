@@ -248,5 +248,18 @@ def press_keys(keys: str) -> None:
         pg.press(main)
 
 
-# 供 CLI/测试判断能力
-CAPABILITIES = ["click", "double_click", "move", "scroll", "drag", "type_text", "press_keys", "focus_window", "get_clipboard", "set_clipboard"]
+# 供 CLI/测试判断能力。**按平台如实报告**：focus_window 只在 Windows 实现（别的地方调用会抛错），
+# 所以非 Windows 上不能把它算作能力——`cvision_status` 就是这么读的。
+_BASE_CAPABILITIES = [
+    "click",
+    "double_click",
+    "move",
+    "scroll",
+    "drag",
+    "type_text",
+    "press_keys",
+    "focus_window",
+    "get_clipboard",
+    "set_clipboard",
+]
+CAPABILITIES = [cap for cap in _BASE_CAPABILITIES if cap != "focus_window" or _is_windows()]

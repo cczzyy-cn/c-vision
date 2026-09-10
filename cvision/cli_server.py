@@ -17,6 +17,7 @@
     {"op":"list"}
     {"op":"screen_info"}
     {"op":"status"}
+    {"op":"clipboard_state"}   # 廉价剪贴板状态（页面每秒轮询用）
 
 响应::
 
@@ -25,6 +26,7 @@
     {"ok":true,"kind":"list","windows":[{...}]}
     {"ok":true,"kind":"screen_info","displays":[{...}]}
     {"ok":true,"kind":"status","status":{...}}
+    {"ok":true,"kind":"clipboard_state","supported":bool,"image":bool,"token":str?,"reason":str}
     {"ok":true,"kind":"pong"}
     {"ok":false,"error":"..."}
 """
@@ -99,6 +101,13 @@ def _status():
     return {"ok": True, "kind": "status", "status": status.status()}
 
 
+def _clipboard_state():
+    """廉价剪贴板状态：只查格式 + token，不解码图片——供页面每秒轮询（走这个常驻进程最省）。"""
+    from cvision import clipboard
+
+    return {"ok": True, "kind": "clipboard_state", **clipboard.state()}
+
+
 def handle(req: dict) -> dict:
     op = req.get("op")
     if op == "ping":
@@ -113,6 +122,8 @@ def handle(req: dict) -> dict:
         return _screen_info()
     if op == "status":
         return _status()
+    if op == "clipboard_state":
+        return _clipboard_state()
     return {"ok": False, "error": f"unknown op: {op!r}"}
 
 
