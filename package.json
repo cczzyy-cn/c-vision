@@ -1,6 +1,6 @@
 {
   "name": "vision",
-  "version": "0.2.2",
+  "version": "0.2.5",
   "description": "Vision DSH bundle: give the agent screen/window vision — see tool captures via the bundled Python cvision and returns the image natively",
   "type": "module",
   "main": "./lib/index.js",
@@ -8,10 +8,14 @@
     ".": {
       "default": "./lib/index.js"
     },
+    "./client": {
+      "default": "./lib/client.js"
+    },
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "files": [
     "lib/index.js",
+    "lib/client.js",
     "cordis.patch.yml",
     "requirements.txt",
     "cvision/**/*.py",
@@ -19,11 +23,24 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json && node scripts/copy-client.mjs",
+    "check:dsh": "node scripts/check-dsh-contract.mjs",
+    "test:js": "node --test tests/vision.client.test.mjs tests/vision.host.test.mjs"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-model-selection",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-session"
+      ]
     }
   },
   "devDependencies": {
@@ -32,6 +49,10 @@
     "@deepseek-ai/dsh-tools": "^0.1.1-rc.2",
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-attachment": "^0.1.1-rc.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0-rc <5",
+    "@deepseek-ai/dsh-tools": ">=0.1.1-rc <2"
   },
   "repository": {
     "type": "git",

@@ -18,8 +18,16 @@ jobs:
       - name: Install (npm ci)
         run: npm ci
 
-      - name: Build (tsc -> lib/index.js)
+      - name: Build (tsc -> lib/index.js + lib/client.js)
         run: npm run build
+
+      # 客户端 bundle 的门控与宿主能力路由（node --test，无 DOM 依赖）。
+      - name: Test JS bundles (client gate + host capability route)
+        run: npm run test:js
+
+      # DSH 组合包/客户端契约：manifest、patch 按包名引用、files 覆盖、经典脚本约束、peer 声明等。
+      - name: Check DSH package contract
+        run: npm run check:dsh
 
       # 防止只改 src/index.ts 而忘了重新编译：编译产物若与已提交的 lib/ 不一致则失败。
       - name: Verify compiled lib/ is in sync

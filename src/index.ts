@@ -18,6 +18,7 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { promisify } from 'node:util'
 import { existsSync } from 'node:fs'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -234,9 +235,93 @@ class CvisionServer {
   }
 }
 
+/**
+ * 浏览器半边查询「当前模型是否接受图片输入」的路由路径。
+ * 必须与 `src/client.js` 的 CAPABILITY_PATH 保持一致。
+ */
+const MODEL_CAPABILITY_PATH = '/cvision/model-capability'
+
+/**
+ * 本插件用到的宿主服务的最小结构视图。DSH 把 `webServer` 声明在
+ * `@deepseek-ai/dsh-host-webserver`、`llm` 声明在 `@deepseek-ai/dsh-llm`；这里只
+ * 声明实际用到的成员，避免为一个只读探针把整个宿主包拉进开发依赖。
+ */
+type CapabilityHost = {
+  webServer: {
+    register(route: {
+      kind: 'exact'
+      path: string
+      handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+    }): () => void
+  }
+  llm: {
+    resolveModelInfo(provider: string, model: string): Promise<{ inputModalities?: readonly string[] }>
+  }
+}
+
+/**
+ * 宿主侧的图片输入能力投影，供浏览器半边决定截图按钮是否出现。
+ *
+ * 判定口径与 Session 的图片准入保持一致：只有**显式声明**了 inputModalities 且
+ * 不含 `image` 才算不收图；未声明（undefined）在 DSH 里仍会被准入放行，因此按
+ * 「可收图」回答。解析不出该 provider/model 时返回 `source: 'unknown'`，交给客户端
+ * 退回名字启发式，而不是谎报一个能力。
+ * @param host - 已具备 webServer / llm 的作用域上下文。
+ * @param provider - 模型提供方 id（来自浏览器目录快照）。
+ * @param model - 模型 id（来自浏览器目录快照）。
+ */
+async function modelImageCapability(host: CapabilityHost, provider: string, model: string): Promise<Row> {
+  if (provider === '' || model === '') return { provider, model, image: false, source: 'unknown' }
+  try {
+    const info = await host.llm.resolveModelInfo(provider, model)
+    const modalities = info.inputModalities
+    return {
+      provider,
+      model,
+      image: modalities === undefined || modalities.includes('image'),
+      source: 'declared',
+      modalities: [...(modalities ?? [])],
+    }
+  } catch {
+    return { provider, model, image: false, source: 'unknown' }
+  }
+}
+
 export function apply(ctx: Context): void {
   const server = new CvisionServer(30000)
   ctx.effect(() => () => server.dispose())
+
+  // ① 浏览器半边（输入框截图按钮）的权威能力通道。
+  //    DSH 给浏览器的模型目录由 buildModelCatalog 主动剥掉了 inputModalities
+  //    （只投影 id/name/description/reasoning），客户端因此无法自行判断当前模型
+  //    收不收图——上游插件只能按模型名猜 vision|visual，既漏判也误判。这里由宿主
+  //    按真实适配器目录回答。组合里没有 web 服务器（如 Electron/headless）时这段
+  //    注册整体跳过，客户端会自动退回名字启发式。
+  const injectHost = ctx.inject as unknown as (
+    deps: readonly string[],
+    callback: (scoped: Context & CapabilityHost) => void,
+  ) => unknown
+  injectHost(['webServer', 'llm'], (host) => {
+    host.effect(
+      () =>
+        host.webServer.register({
+          kind: 'exact',
+          path: MODEL_CAPABILITY_PATH,
+          handler: async (req, res) => {
+            const url = new URL(req.url ?? '/', 'http://localhost')
+            const provider = url.searchParams.get('provider') ?? ''
+            const model = url.searchParams.get('model') ?? ''
+            const payload = await modelImageCapability(host, provider, model)
+            res.writeHead(200, {
+              'content-type': 'application/json; charset=utf-8',
+              'cache-control': 'no-store',
+            })
+            res.end(JSON.stringify(payload))
+          },
+        }),
+      'vision: model capability route',
+    )
+  })
 
   // ① server 优先，失败回退 CLI 的采集类辅助（每个返回统一形态）。
   async function captureDataUrl(args: Json, exec: { signal: AbortSignal }): Promise<string> {
