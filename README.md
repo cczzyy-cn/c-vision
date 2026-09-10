@@ -15,7 +15,14 @@
 
 ## 版本
 
-- **v0.2.0**：OCR 返回**词级边界框** `words`；新增 `screen_info` / `cvision_status` / `wait_for_window` /
+> 维护约定：凡是改行为，就升 `package.json` 版本并在此追加一条（附提交号），避免版本与文档漂移。
+
+- **v0.2.2**（`c35df09`）：修复 **Windows 下中文窗口标题乱码导致窗口匹配失败** —— 此前 Python 子进程按
+  控制台/ANSI 代码页解码 argv/stdin，中文标题到达时已损坏（`????`）；现所有 spawn 的 Python
+  （server + CLI）强制 `PYTHONUTF8=1` + `PYTHONIOENCODING=utf-8`。
+- **v0.2.1**（`b4b181b`）：修复 `ocr` / `see(ocr:true)` 的**词级边界框没有真正送到模型** ——
+  值里带了 `words`，但渲染回调只发文本，模型看不到词框；现在 `words` 非空时追加一个 `word_boxes` 文本块。
+- **v0.2.0**（`115fd50`）：OCR 返回**词级边界框** `words`；新增 `screen_info` / `cvision_status` / `wait_for_window` /
   `drag` / `get_clipboard` / `set_clipboard`；`scroll` 支持水平、`see(ocr:true)` 一次返回图片+文本；
   新增**持久化 Python server**（复用 D3D 设备/编码，失败自动回退每调用 CLI）。
 
@@ -24,8 +31,8 @@
 ### 看（观察）
 | 工具 | 说明 |
 | --- | --- |
-| `see(window?, region?, delay?, maximize?, format?, ocr?)` | 截屏/窗口 → **图片**返回（模型原生看）。`region="x,y,w,h"` 只取一块（省 token）；`delay=毫秒` 等渲染；`maximize` 默认关；`ocr=true` 同时返回 OCR 文本/词框 |
-| `ocr(window?, region?, delay?)` | 截屏后 **OCR** → 返回**文本 + 词级边界框 `words`**（`{text,x,y,w,h}`，供 computer-use 精确定位点击点） |
+| `see(handle?, window?, region?, delay?, maximize?, format?, ocr?)` | 截屏/窗口 → **图片**返回（模型原生看）。`handle`（来自 `list_windows`）比 `window` 标题**更精确、标题变化时更稳**，二者二选一且**优先 `handle`**；`region="x,y,w,h"` 只取一块（省 token）；`delay=毫秒` 等渲染；`maximize` 默认关；`format` 可选 PNG/JPEG/WEBP/GIF（默认 PNG）；`ocr=true` 同时返回 OCR 文本/词框 |
+| `ocr(handle?, window?, region?, delay?)` | 截屏后 **OCR** → 返回**文本 + 词级边界框 `words`**（`{text,x,y,w,h}`，供 computer-use 精确定位点击点）；同样 **`handle` 优先于 `window`** |
 | `list_windows()` | 列出可见窗口（标题+句柄+尺寸） |
 | `screen_info()` | 列出显示器/DPI 布局（`x/y/width/height/primary/scale`），高 DPI 折算坐标用 |
 | `cvision_status()` | 运行环境健康探针（python 版本、平台后端、OCR 引擎、依赖/后端可用性） |
@@ -42,7 +49,7 @@
 | `type_text(text)` | 像键盘一样**输入文本**到当前焦点 |
 | `press_key(keys)` | 发送**快捷键**，如 `ctrl+l`、`enter`、`ctrl+shift+t`、`alt+tab` |
 | `get_clipboard()` / `set_clipboard(text)` | 读写剪贴板文本 |
-| `focus_window(title)` | 按标题子串把窗口**置前**（用户级激活） |
+| `focus_window(title?, handle?)` | 把窗口**置前**（用户级激活）；**`handle` 优先于 `title`** |
 
 > **关键**：默认**不最大化、不切前台**——WGC 抓窗口合成内容，与前台/遮挡无关。
 > **computer-use 闭环**：`see` 看清 → `click`/`type_text`/`press_key`/`scroll` 操作 → 再 `see` 确认 …（"看→操作→看"循环）。
@@ -145,7 +152,8 @@ npx -y @deepseek-ai/dsh plugin --profile web add C:\Users\14339\Desktop\git\C-Vi
 - **不要为了截图去激活/切换前台窗口**：WGC 路径**不抢焦点、不切走你正在用的窗口**，全程无打扰。
 - **什么情况才用 `maximize=true`**：仅当窗口已**最小化**（内容很小/看不清）、或**太小**、
   或**被其它窗口完全挡住且内容读不出来**时才用。插件抓完会**自动还原**窗口原状态。
-- **推荐流程**：先 `list_windows()` 看有哪些窗口 → 直接 `see(window="<窗口标题>")` 抓目标窗口；
+- **推荐流程**：先 `list_windows()` 看有哪些窗口 → 直接 `see(handle=<句柄>)` 抓目标窗口
+  （或 `see(window="<窗口标题>")`；**标题会变时（如文档名带时间戳）优先用 `handle`**）；
   需要整屏用 `see()`。
 
 ## 电脑使用（computer-use）推荐流程
@@ -172,6 +180,10 @@ focus_window("Google Chrome") → press_key("ctrl+l") → type_text("https://…
 - 回退：装 `pytesseract` + Tesseract 后用其识别（跨平台）。
 
 ## 多平台支持
+
+> ⚠️ **只有 Windows 这条链路经过实测。** macOS 为 Phase 1（代码已写，**未在真机验证**，
+> 且需「屏幕录制」授权）；Linux 为 Phase 2 占位（调用即 `NotImplementedError`）。
+> 在 macOS/Linux 上反馈问题时请附平台、Python 版本与完整报错。
 
 - **Windows**：完整支持（WGC/PrintWindow/桌面区域回退），最稳。
 - **macOS**：Phase 1 已支持（`Quartz/CGWindowList` 枚举 + `screencapture -l` 抓窗口，与前台无关）；需在「系统设置 → 隐私与安全 → 屏幕录制」授权，否则标题为空/只能抓到壁纸。
