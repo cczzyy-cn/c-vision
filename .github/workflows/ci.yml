@@ -33,6 +33,10 @@ jobs:
       - name: Check docs consistency
         run: npm run check:docs
 
+      # Python 依赖锁定：requirements.txt 是本插件唯一的独立供应链面，每条依赖都要有上下界。
+      - name: Check Python dependency pins
+        run: npm run check:deps
+
       # 防止只改 src/index.ts 而忘了重新编译：编译产物若与已提交的 lib/ 不一致则失败。
       - name: Verify compiled lib/ is in sync
         run: |

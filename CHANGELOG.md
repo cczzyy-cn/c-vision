@@ -10,6 +10,31 @@
 > - `v0.1.0` ~ `v0.1.9` 的说明只在 [GitHub Releases](https://github.com/cczzyy-cn/c-vision/releases) 里
 >   （那时还没有本文件）。
 
+## v0.2.17
+
+**锁定 Python 依赖（唯一的供应链面）+ 修 `cli_ocr` 丢失词框的契约不一致。**
+
+- **`requirements.txt` 全部改为双向锁定**：原先只有下界（`Pillow>=12.0.0`），同一份清单在不同时间
+  `pip install` 会装到不同版本，且可能被静默拖进破坏性升级——重装环境因此不可复现。现在每条都是
+  `>=x,<y`，**上界取下一个可能破坏兼容的边界**（常规包 = 下一个主版本；0.x 包 = 下一个次版本；
+  逐 build 计数的 pywin32 = 下一个 build）。`winsdk` 从 `>=1.0.0b10` 收敛为 `>=1.0.0b10,<1.0.0`
+  （它是 beta 通道，且上游已转向 `winrt` 分包）；macOS 的 pyobjc 两个 framework 从 `>=10.0` 提到
+  `>=12.0,<13`（当前线是 12.x，写 `>=10.0` 会允许装到没验证过的 13）。文件头写明锁定约定与
+  「为什么不写死精确版本」（保留一段安全补丁可自动装上的窗口）。同时标注 **Python 3.10+** 前提
+  （Pillow 12 的下限，插件只用 3.10 起可用的语法）；`pytesseract` 作为可选回退给出注释形态的锁定示例。
+- **新增 `npm run check:deps`**（`scripts/check-deps.mjs`，8 项，CI 每次都会跑），把上面的约定变成断言：
+  清单存在且随包发布、每条依赖都能解析、**每条都有下界与上界**（不允许裸 `>=`）、上下界都是具体版本
+  （拒绝 `~=`/`*`/空版本）、包名不重复、平台 marker 只用已验证的 `sys_platform == win32|darwin`。
+  已做反向验证：故意去掉 Pillow 上界即 `❌ → exit 1`，不是空跑。
+- **修复 `cli_ocr` 的 stdout 契约不一致**（真实缺陷）：README「内部 CLI 契约」表一直写它返回
+  `{ok:true,text,lines,words:[{text,x,y,w,h}]}`，但实现只输出 `{text,lines}` —— 少了 `ok`，也**完全丢掉了
+  `words`**。宿主 `src/index.ts` 的 `ocrJson()` CLI 回退分支正是按 `ok`/`words` 读这条路径，于是**常驻
+  server 不可用时（回退路径）`ocr` 工具的词级边界框恒为空**，文档承诺的「词框供 computer-use 精确定位
+  点击」在回退时静默失效。现在输出与 `cli_server` 的 `{"op":"ocr"}` 响应同形状，两条路径行为一致。
+  新增 `tests/test_cli_ocr.py`（4 条，平台无关：stub 截屏与 OCR）钉死该契约——含一条「词框原样透传」的
+  核心回归与一条 `--region` 确实被转发到 `crop_region` 的回归；已确认这 4 条在旧实现下**会失败**。
+  Python 68 → **72**。
+
 ## v0.2.16
 
 **修复：`dsh plugin add` 升级/重装时报 `ERR_PNPM_EPERM`（pnpm 无法替换 `node_modules/vision`）**。

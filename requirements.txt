@@ -1,7 +1,21 @@
-Pillow>=12.0.0
-pyautogui>=0.9.54  # 用户级输入（鼠标/键盘）
-pyperclip>=1.8.2  # 跨平台文本剪贴板（Windows 优先原生 pywin32；macOS/Linux 用它）
-pywin32>=311; sys_platform == 'win32'
-pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'   # macOS 后端（Quartz / CGWindowList + screencapture）
-pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'    # macOS 读剪贴板图片（NSPasteboard）
-winsdk>=1.0.0b10; sys_platform == 'win32'  # Windows Graphics Capture 后端（可选；未装则回退 PrintWindow/桌面区域抓取）
+# Python 依赖清单（随包分发；`python -m pip install -r requirements.txt` 装一次）
+#
+# 锁定约定（由 `npm run check:deps` 机械校验，CI 每次都会跑）：
+#   - 每条依赖必须同时有**下界**与**上界**（`>=x,<y`），不允许只有下界的裸 `>=`；
+#   - 上界取**下一个可能破坏兼容的边界**：常规包 = 下一个主版本，0.x 包 = 下一个次版本，
+#     逐 build 计数的包（pywin32）= 下一个 build；
+#   - 支持 Python 3.10+（Pillow 12 的下限；插件只用 3.10 起可用的语法）。
+#
+# 为什么不写死精确版本：目标是「重装可复现 + 不会被静默拖进破坏性升级」，同时给出一段
+# 可用的安全更新窗口（安全补丁能在区间内自动装上）。发行时如需完全可复现，
+# 在生成的 wheel 上再加一层哈希锁（本文件不承担那件事）。
+
+Pillow>=12.0.0,<13  # 截图编解码/缩放（附件限额）
+pyautogui>=0.9.54,<0.10  # 用户级输入（鼠标/键盘）
+pyperclip>=1.8.2,<2  # 跨平台文本剪贴板（Windows 优先原生 pywin32；macOS/Linux 用它）
+pywin32>=311,<312; sys_platform == 'win32'  # Windows 原生 API（窗口枚举/PrintWindow/剪贴板）
+pyobjc-framework-Quartz>=12.0,<13; sys_platform == 'darwin'   # macOS 后端（Quartz / CGWindowList + screencapture）
+pyobjc-framework-Cocoa>=12.0,<13; sys_platform == 'darwin'    # macOS 读剪贴板图片（NSPasteboard）
+winsdk>=1.0.0b10,<1.0.0; sys_platform == 'win32'  # Windows Graphics Capture 后端（可选；未装则回退 PrintWindow/桌面区域抓取）
+# OCR 回退（可选，未装则只走 Windows.Media.Ocr；如要装，请同样锁定上界）：
+# pytesseract>=0.3.13,<0.4; sys_platform == 'win32'

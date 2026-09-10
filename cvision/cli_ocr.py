@@ -4,7 +4,13 @@
 
     python -m cvision.cli_ocr [--window 标题] [--maximize] [--region x,y,w,h] [--delay ms]
 
-不传 --window/--handle 时对整屏做 OCR；输出 ``{"text": ..., "lines": [...]}`` 到 stdout。
+不传 --window/--handle 时对整屏做 OCR；输出
+``{"ok": true, "text": ..., "lines": [...], "words": [{text,x,y,w,h}]}`` 到 stdout。
+
+``words`` 必须一并输出：宿主半边 `ocrJson` 的 CLI 回退分支正是从这里读词级边界框
+（常驻 server 不可用时走这条路）。此前只输出 ``text``/``lines``，导致回退路径下
+``ocr`` 工具的 ``words`` 恒为空——文档承诺过的「词框供精确定位点击」在回退时静默失效。
+输出与 `cli_server` 的 ``{"op":"ocr"}`` 响应保持同一形状，两条路径行为一致。
 """
 
 from __future__ import annotations
@@ -38,7 +44,15 @@ def main(argv: list[str] | None = None) -> int:
 
     result = ocr.ocr_image(img)
     sys.stdout.write(
-        json.dumps({"text": result.get("text", ""), "lines": result.get("lines", [])}, ensure_ascii=True)
+        json.dumps(
+            {
+                "ok": True,
+                "text": result.get("text", ""),
+                "lines": result.get("lines", []),
+                "words": result.get("words", []),
+            },
+            ensure_ascii=True,
+        )
     )
     return 0
 
