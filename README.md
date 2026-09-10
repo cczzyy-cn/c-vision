@@ -22,6 +22,14 @@
 
 > 维护约定：凡是改行为，就升 `package.json` 版本并在此追加一条（附提交号），避免版本与文档漂移。
 
+- **v0.2.9**：修复 **React #310（`Rendered more hooks than during the previous render`）** —— v0.2.8 把
+  `useEffect(() => ensureClipboardWatch())` 写在了组件的**提前 `return null` 之后**，于是
+  「能力查询在途（5 个 hook）→ 拿到可收图（6 个 hook）」直接触顶，槽位渲染崩溃
+  （`slot entry crashed in 'conversation.input.right'`）。现在 **hook 全部无条件调用**，条件判断放进
+  effect 内部（`if (visible) ensureClipboardWatch()`）。
+  > 教训：**假 React 桩不校验 hook 顺序，所以 45 条测试全绿也没抓到它**。本次给桩加了 hook 计数，
+  > 并新增回归用例「hook 数量跨渲染必须稳定」——已用错误写法实测它**确实会失败**（不是摆设）。
+  > 该修复只动客户端半边：**硬刷新即生效，不需要重启宿主**。
 - **v0.2.8**：截图按钮新增**剪贴板监视 + 长按插入**；剪贴板能力跨平台化。
   - 页面**每秒**轮询宿主 `GET /cvision/clipboard`（廉价：只查剪贴板格式 + token，**不解码图片**；
     优先走常驻 Python 进程，免得每秒冷启动解释器）。剪贴板里**出现新图片**（其它软件截图、微信/QQ、

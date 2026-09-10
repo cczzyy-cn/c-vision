@@ -16,14 +16,33 @@ import test, { mock } from 'node:test'
 
 const SOURCE = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
 
+/**
+ * 每次渲染期间的 hook 调用计数。
+ * 真 React 在 hook 数量变化时会报 #310（Rendered more hooks than during the previous render），
+ * 所以桩也必须能抓到「条件调用 hook」——v0.2.8 正是把 useEffect 放在 `return null` 之后才炸的，
+ * 而当时的桩无条件放过了它。
+ */
+const hookCounter = { value: 0 }
+
 /** 极简 React 桩：createElement 产出可断言的普通对象，uSES 直接读快照，effect 同步跑。 */
 const reactStub = {
   createElement: (type, props, ...children) => ({ type, props, children }),
   Fragment: Symbol('Fragment'),
-  useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
+  useSyncExternalStore: (_subscribe, getSnapshot) => {
+    hookCounter.value += 1
+    return getSnapshot()
+  },
   useEffect: (effect) => {
+    hookCounter.value += 1
     effect()
   },
+}
+
+/** 渲染一次并记录这次用了几个 hook（用于校验跨渲染稳定）。 */
+function renderWithHookCount(component, props) {
+  hookCounter.value = 0
+  const rendered = component(props)
+  return { rendered, hooks: hookCounter.value }
 }
 
 const documentStub = {
@@ -410,6 +429,26 @@ test('宿主声明图片输入时显示按钮——即使模型名字里没有 v
     assert.equal(rendered.type, 'button')
     assert.equal(rendered.props.className, 'cvision-screenshot-button')
     assert.equal(rendered.props['aria-label'], 'button.aria')
+  })
+})
+
+test('hook 数量跨渲染必须稳定（React #310：hook 不能条件调用）', async () => {
+  await withFetch(routeFetch({ capability: { source: 'declared', image: true } }), async () => {
+    const client = mountClient()
+    const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+    const props = propsFor(state, client.slot.inject('s'))
+    // 第一次渲染：能力查询在途 → 组件提前 return null（v0.2.8 曾在这里少调一个 useEffect）
+    const pending = renderWithHookCount(client.component, props)
+    assert.equal(pending.rendered, null)
+    await settle()
+    // 第二次渲染：拿到「可收图」→ 渲染出按钮。hook 数量必须和上一次一致。
+    const ready = renderWithHookCount(client.component, props)
+    assert.ok(ready.rendered, '能力允许时必须渲染出按钮')
+    assert.equal(
+      ready.hooks,
+      pending.hooks,
+      'hook 数量随渲染变化会让真 React 抛 #310（条件调用 hook）',
+    )
   })
 })
 

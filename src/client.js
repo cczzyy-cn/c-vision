@@ -643,11 +643,14 @@ window.__ModuleLoader__.load({
       const busy = react.useSyncExternalStore(subscribeSnip, readSnipPending)
       const clipboardReady = react.useSyncExternalStore(subscribeClipboard, readClipboardNew)
       const clipboardBusyNow = react.useSyncExternalStore(subscribeClipboard, readClipboardBusy)
-      if (verdict !== 'yes' && !(verdict === 'error' && nameSuggestsImage(state))) return null
-      // 按钮可见时才开监视（模型不支持图片时按钮不渲染，也就不白轮询宿主）。
+      const visible = verdict === 'yes' || (verdict === 'error' && nameSuggestsImage(state))
+      // ⚠️ hook 必须**无条件**调用。这里曾经把 useEffect 放在下面那句 `return null` 之后，于是
+      // 「能力查询在途（少一个 hook）→ 拿到可收图（多一个 hook）」直接触发 React #310
+      // （Rendered more hooks than during the previous render）。条件判断要放进 effect 里。
       react.useEffect(() => {
-        ensureClipboardWatch()
-      }, [])
+        if (visible) ensureClipboardWatch()
+      }, [visible])
+      if (!visible) return null
       const pending = busy || clipboardBusyNow
       const title = busy
         ? props.t('button.waiting')

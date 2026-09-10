@@ -1,6 +1,6 @@
 {
   "name": "vision",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Vision DSH bundle: give the agent screen/window vision — see tool captures via the bundled Python cvision and returns the image natively",
   "type": "module",
   "main": "./lib/index.js",
