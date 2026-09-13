@@ -226,6 +226,8 @@ window.__ModuleLoader__.load({
     const CLIPBOARD_CLASS = 'cvision-screenshot-button--clipboard'
     /** 按住（长按进行中）时加上的修饰类：底色变化 + 底部进度条走完即插入。 */
     const HOLD_CLASS = 'cvision-screenshot-button--holding'
+    /** DSH 正在占用鼠标/键盘（宿主侧输入类工具执行中）。 */
+    const HOST_BUSY_CLASS = 'cvision-screenshot-button--host-busy'
     const DOT_CLASS = 'cvision-screenshot-dot'
     const NOTICE_CLASS = 'cvision-screenshot-notice'
     const CSS =
@@ -247,6 +249,12 @@ window.__ModuleLoader__.load({
       '.' +
       HOLD_CLASS +
       '{background:color-mix(in srgb,var(--dsh-accent,#3b82f6) 20%,transparent)}' +
+      // DSH 正在操作鼠标/键盘：用**警示色**而不是主题蓝——蓝色在这个按钮上已经表示
+      // 「有剪贴板图片可插入」，两者含义完全不同，不能共用视觉语言。
+      '.' +
+      HOST_BUSY_CLASS +
+      '{color:var(--dsh-alias-state-warning-primary,#d46b08);background:color-mix(in srgb,var(--dsh-alias-state-warning-primary,#d46b08) 14%,transparent);animation:cvision-host-pulse 1s ease-in-out infinite alternate}' +
+      '@keyframes cvision-host-pulse{from{opacity:.65}to{opacity:1}}' +
       // 按住期间底部走一条进度条：时长与 JS 阈值一致，走完即插入（给用户「还在按」的确定反馈，
       // 也让慢点击的人一眼看出自己触发了另一种手势）。
       '.' +
@@ -283,6 +291,7 @@ window.__ModuleLoader__.load({
       'clipboard.hint': '剪贴板有新图片：长按按钮插入',
       'clipboard.hold': '继续按住，插入剪贴板图片',
       'clipboard.attach': '正在从剪贴板插入…',
+      'host.input': 'DSH 正在操作鼠标/键盘，请先不要动',
       'failure.capture': '截图失败',
       'failure.draft': '截图无法进入附件栏',
       'failure.busy': '输入框正忙，请稍后重试',
@@ -296,6 +305,7 @@ window.__ModuleLoader__.load({
       'clipboard.hint': 'New clipboard image: hold the button to insert',
       'clipboard.hold': 'Keep holding to insert the clipboard image',
       'clipboard.attach': 'Inserting from the clipboard…',
+      'host.input': 'DSH is driving the mouse/keyboard — please hold off',
       'failure.capture': 'Screenshot failed',
       'failure.draft': 'The screenshot could not enter the attachment rail',
       'failure.busy': 'The composer is busy; try again shortly',
@@ -375,6 +385,13 @@ window.__ModuleLoader__.load({
      */
     let clipboardNew = false
     let clipboardBusy = false
+    /**
+     * 宿主此刻是否正在驱动鼠标/键盘（输入类工具执行中）。
+     *
+     * 与 `clipboardBusy` **不是一回事**：后者是「本按钮自己的长按插入正在进行」，本变量是
+     * 「另一端（DSH 的 agent）正在占用物理输入设备」。两者都要显示，但不能合并。
+     */
+    let hostInputBusy = false
     const clipboardListeners = new Set()
     /** 已见过的图片 token：只有**变了**才算「新图片」（首次轮询只建基线，避免页面一加载就亮）。 */
     let clipboardSeenToken = null
@@ -411,6 +428,16 @@ window.__ModuleLoader__.load({
       for (const listener of Array.from(clipboardListeners)) listener()
     }
 
+    function readHostInputBusy() {
+      return hostInputBusy
+    }
+
+    function setHostInputBusy(next) {
+      if (hostInputBusy === next) return
+      hostInputBusy = next
+      for (const listener of Array.from(clipboardListeners)) listener()
+    }
+
     /** 停掉轮询（宿主不支持 / 连续失败时），只提示一次。 */
     function stopClipboardWatch(reason) {
       if (clipboardTimer !== null) {
@@ -436,6 +463,8 @@ window.__ModuleLoader__.load({
       }
       clipboardFailures = 0
       if (state === null || typeof state !== 'object') return
+      // 宿主是否正在操作输入设备——独立于剪贴板内容，所以在任何 return 之前先同步。
+      setHostInputBusy(state.busy === true)
       if (state.supported !== true) {
         stopClipboardWatch('宿主不支持读剪贴板图片（' + String(state.reason || '') + '）')
         return
@@ -709,6 +738,7 @@ window.__ModuleLoader__.load({
       const busy = react.useSyncExternalStore(subscribeSnip, readSnipPending)
       const clipboardReady = react.useSyncExternalStore(subscribeClipboard, readClipboardNew)
       const clipboardBusyNow = react.useSyncExternalStore(subscribeClipboard, readClipboardBusy)
+      const hostInputBusyNow = react.useSyncExternalStore(subscribeClipboard, readHostInputBusy)
       const holding = react.useSyncExternalStore(subscribePress, readPressing)
       const visible = verdict === 'yes' || (verdict === 'error' && nameSuggestsImage(state))
       // ⚠️ hook 必须**无条件**调用。这里曾经把 useEffect 放在下面那句 `return null` 之后，于是
@@ -721,15 +751,20 @@ window.__ModuleLoader__.load({
       const pending = busy || clipboardBusyNow
       const title = holding
         ? props.t('clipboard.hold')
-        : busy
-          ? props.t('button.waiting')
-          : clipboardBusyNow
-            ? props.t('clipboard.attach')
-            : clipboardReady
-              ? props.t('clipboard.hint')
-              : props.t('button.tooltip')
+        : hostInputBusyNow
+          ? // DSH 正在占用鼠标/键盘：物理上只有一套输入设备，所以这里如实提示「先别动」。
+            // 只是提示、**不禁用**按钮——禁用会让人以为坏了，而且用户本来就该能随时取消。
+            props.t('host.input')
+          : busy
+            ? props.t('button.waiting')
+            : clipboardBusyNow
+              ? props.t('clipboard.attach')
+              : clipboardReady
+                ? props.t('clipboard.hint')
+                : props.t('button.tooltip')
       let className = clipboardReady ? BUTTON_CLASS + ' ' + CLIPBOARD_CLASS : BUTTON_CLASS
       if (holding) className += ' ' + HOLD_CLASS
+      if (hostInputBusyNow) className += ' ' + HOST_BUSY_CLASS
       const button = react.createElement(
         'button',
         {

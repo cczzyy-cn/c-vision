@@ -26,7 +26,7 @@ from cvision import encoding, snip
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="系统级区域截图：拉起系统截图 UI 并取回框选结果")
     parser.add_argument("--timeout", type=float, default=60.0, help="等待用户框选的最长秒数")
-    parser.add_argument("--format", default="PNG", help="JPEG/PNG/WEBP/GIF，默认 PNG（与 see 工具一致）")
+    parser.add_argument("--format", default="PNG", help="PNG/JPEG/WEBP，默认 PNG（与 see 工具一致）")
     args = parser.parse_args(argv)
 
     def emit(payload: dict) -> None:

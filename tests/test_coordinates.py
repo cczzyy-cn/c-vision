@@ -1,0 +1,111 @@
+"""坐标换算测试（纯逻辑，跨平台、不碰桌面）。
+
+这是 computer-use 里最容易算错的一环：``ocr`` 给的是**图片像素**，``click`` 要的是**屏幕绝对坐标**。
+错一点点就会点偏，所以把每种偏移与缩放场景都钉死。
+"""
+
+import unittest
+
+from cvision import coordinates as co
+
+
+class TestResolveScale(unittest.TestCase):
+    def test_identity_when_process_is_dpi_aware(self):
+        """进程 DPI 感知时图片尺寸 == 显示器物理尺寸，即使系统缩放 150% 也不该再乘 scale。"""
+        screen = {"width": 1920, "height": 1080, "scale": 1.5}
+        self.assertEqual(co.resolve_scale(1920, 1080, screen), 1.0)
+
+    def test_uses_scale_when_image_is_logical_pixels(self):
+        """图片是逻辑像素（1920/1.5=1280）时才用 scale 校正。"""
+        screen = {"width": 1920, "height": 1080, "scale": 1.5}
+        self.assertEqual(co.resolve_scale(1280, 720, screen), 1.5)
+
+    def test_plain_100_percent(self):
+        screen = {"width": 2560, "height": 1440, "scale": 1}
+        self.assertEqual(co.resolve_scale(2560, 1440, screen), 1.0)
+
+    def test_no_screen_info(self):
+        self.assertEqual(co.resolve_scale(800, 600, None), 1.0)
+
+    def test_absurd_scale_is_rejected(self):
+        """探测到的 scale 离谱时退回 1.0，宁可 1:1 也不要按荒谬比例缩放。"""
+        for bad in (0, -1, 0.01, 99, "abc", None):
+            self.assertEqual(co.resolve_scale(1000, 800, {"width": 1000, "height": 800, "scale": bad}), 1.0)
+
+    def test_missing_size_falls_back_to_reported_scale(self):
+        self.assertEqual(co.resolve_scale(0, 0, {"scale": 2.0}), 2.0)
+
+
+class TestMakeMapper(unittest.TestCase):
+    def test_origin_only(self):
+        to_screen = co.make_mapper(1000, 800, None, (100, 50))
+        self.assertEqual(to_screen(0, 0), (100, 50))
+        self.assertEqual(to_screen(10, 20), (110, 70))
+
+    def test_negative_origin(self):
+        """副屏挂在主屏左侧时坐标可以是负数。"""
+        to_screen = co.make_mapper(1000, 800, None, (-1920, 0))
+        self.assertEqual(to_screen(0, 0), (-1920, 0))
+        self.assertEqual(to_screen(100, 100), (-1820, 100))
+
+    def test_scaled_image(self):
+        screen = {"width": 1920, "height": 1080, "scale": 1.5}
+        to_screen = co.make_mapper(1280, 720, screen, (0, 0))
+        # 图片是逻辑像素：乘 1.5 后回到物理坐标。
+        self.assertEqual(to_screen(100, 100), (150, 150))
+
+    def test_rounding_is_stable(self):
+        to_screen = co.make_mapper(100, 100, None, (0, 0))
+        self.assertEqual(to_screen(0.4, 0.6), (0, 1))
+        self.assertEqual(to_screen(1.5, 2.5), (2, 2))  # Python round 的 banker's rounding
+
+
+class TestCaptureOrigin(unittest.TestCase):
+    def test_full_screen_primary(self):
+        screens = [{"x": 0, "y": 0, "width": 2560, "height": 1440, "primary": True}]
+        self.assertEqual(co.capture_origin(None, None, screens), (0, 0))
+
+    def test_multi_screen_uses_virtual_desktop_origin(self):
+        """整屏捕获覆盖整个虚拟桌面，原点是所有屏的最小 (x, y)。"""
+        screens = [
+            {"x": 0, "y": 0, "width": 1920, "height": 1080, "primary": True},
+            {"x": -1280, "y": -200, "width": 1280, "height": 1024},
+        ]
+        self.assertEqual(co.capture_origin(None, None, screens), (-1280, -200))
+
+    def test_window_uses_window_position(self):
+        window = {"left": 300, "top": 150}
+        self.assertEqual(co.capture_origin(None, window, None), (300, 150))
+
+    def test_region_offsets_within_image(self):
+        screens = [{"x": 0, "y": 0, "width": 1000, "height": 800, "primary": True}]
+        self.assertEqual(co.capture_origin("100,50,200,100", None, screens), (100, 50))
+
+    def test_window_plus_region_accumulates(self):
+        """窗口 + region：region 是相对窗口图的，所以两个偏移要相加。"""
+        window = {"left": 300, "top": 150}
+        self.assertEqual(co.capture_origin("10,20,30,40", window, None), (310, 170))
+
+    def test_malformed_region_ignored(self):
+        self.assertEqual(co.capture_origin("abc", None, [{"x": 5, "y": 6}]), (5, 6))
+
+
+class TestScreenForImage(unittest.TestCase):
+    def test_picks_monitor_containing_origin(self):
+        screens = [
+            {"x": 0, "y": 0, "width": 1920, "height": 1080, "primary": True, "scale": 1.0},
+            {"x": -1280, "y": 0, "width": 1280, "height": 1024, "scale": 2.0},
+        ]
+        self.assertEqual(co.screen_for_image(100, 100, (-1280, 0), screens)["scale"], 2.0)
+        self.assertEqual(co.screen_for_image(100, 100, (0, 0), screens)["scale"], 1.0)
+
+    def test_falls_back_to_primary(self):
+        screens = [{"x": 0, "y": 0, "width": 10, "height": 10, "primary": True}]
+        self.assertEqual(co.screen_for_image(5000, 5000, (9999, 9999), screens)["primary"], True)
+
+    def test_no_screens(self):
+        self.assertIsNone(co.screen_for_image(10, 10, (0, 0), None))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -15,13 +15,16 @@ _MIME = {
     "WEBP": "image/webp",
 }
 
-_DEFAULT_FORMAT = "JPEG"
+_DEFAULT_FORMAT = "PNG"
 
 
 def image_to_base64(img: Image.Image, format: str = _DEFAULT_FORMAT) -> tuple[str, str]:
     """将 PIL 图片编码为 base64。
 
-    返回 ``(mime_type, base64_str)``。默认 JPEG；含透明通道时建议使用 PNG。
+    返回 ``(mime_type, base64_str)``。默认 PNG（无损，适合截图/文字；所有调用方 CLI 的默认也是 PNG）。
+
+    ⚠️ 多帧图（GIF/APNG/WEBP）走 :meth:`Image.Image.save` **只写第一帧**——本函数的 ``GIF`` 项只对
+    单帧有效。宿主半边已把 GIF 从可回传类型里移除，别指望它做动图。
     """
     fmt = (format or _DEFAULT_FORMAT).upper()
     mime = _MIME.get(fmt)

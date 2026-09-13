@@ -28,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--state", action="store_true", help="只查状态（有没有图 + token），不解码")
     group.add_argument("--image", action="store_true", help="取剪贴板图片（输出 data URL）")
-    parser.add_argument("--format", default="PNG", help="JPEG/PNG/WEBP/GIF，默认 PNG")
+    parser.add_argument("--format", default="PNG", help="PNG/JPEG/WEBP，默认 PNG")
     args = parser.parse_args(argv)
 
     def emit(payload: dict) -> None:

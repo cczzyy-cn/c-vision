@@ -68,6 +68,33 @@ jobs:
       - name: Run python unit tests (pure logic)
         run: python -m unittest discover -s tests -v
 
+  # Windows 专属冒烟：验证「依赖能在 Windows 上真的装上 + 探针说 ok」。
+  # 已有的 test-py 只跑 ubuntu/macOS 且只装 Pillow，于是 Windows 后端的关键代码路径
+  # （WGC / PrintWindow / 窗口枚举）在 CI 上**从不执行**。这里不跑单测（无桌面），只做
+  # 安装 + 探针断言，至少保证「用户按 README 在 Windows 上装完不会立刻报缺依赖」。
+  smoke-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install bundled Python dependencies (requirements.txt)
+        run: python -m pip install -r requirements.txt
+
+      - name: Probe runtime and assert Windows backend is ready
+        shell: pwsh
+        run: |
+          $raw = python -m cvision.cli_capture --status | Out-String
+          $s = $raw | ConvertFrom-Json
+          if ($s.backend -ne 'windows') { throw "backend=$($s.backend), expected windows" }
+          if (-not $s.backend_implemented) { throw 'windows backend not implemented' }
+          if ($s.platform_support -ne 'supported') { throw "platform_support=$($s.platform_support)" }
+          if (-not $s.ok) { throw "status.ok is false: $raw" }
+          Write-Host "Windows runtime probe OK: ocr=$($s.ocr_engine) python=$($s.python) deps=$($s.deps | ConvertTo-Json -Compress)"
+
   # 打 v* tag（如 v0.1.0）时发布：构建+测试通过后 npm pack 出 tgz 并创建 GitHub Release。
   release:
     runs-on: ubuntu-latest

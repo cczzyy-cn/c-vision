@@ -30,6 +30,21 @@ def _backend() -> str:
         return "unknown"
 
 
+def _platform_support(backend: str, backend_implemented: bool) -> str:
+    """把「本平台到底能不能用」变成**机器可读**的三态，而不是让人去读文档。
+
+    - ``supported``：已在本平台实测（Windows）。
+    - ``unverified``：代码写完了但**没在真机验证过**（macOS）——用起来可能踩边界，但确实有实现。
+    - ``unsupported``：明确未实现（Linux Phase 2），调用会得到清晰报错。
+
+    为什么要单列：README 只能写给人看，而模型在决定「要不要尝试 computer-use」时需要的是
+    一个明确字段，不该靠「backend_implemented 是 true 还是 false」去反推可信度。
+    """
+    if not backend_implemented:
+        return "unsupported"
+    return "supported" if backend == "windows" else "unverified"
+
+
 def _ocr_engine() -> str:
     # Windows.Media.Ocr(winsdk) 优先，其次 pytesseract。
     ok_win, _ = _module_ok("winsdk.windows.media.ocr")
@@ -74,16 +89,20 @@ def status() -> dict:
         "linux": False,
     }.get(backend, False)
 
+    # 包根目录。**不能用 os.getcwd()**：插件侧为了让 Windows 能替换安装目录，已把子进程 cwd 改成
+    # 系统临时目录（见 src/index.ts 的 PY_CWD），那里的 cwd 不再代表 cvision 的位置。
+    package_root = os.environ.get("CVISION_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return {
         "platform": sys.platform,
         "python": sys.version.split()[0],
-        # 键名是历史拼写（`cvison_dir`，少个 i），保留以兼容既有消费方；值 = **包根目录**。
-        # 不能用 os.getcwd()：插件侧为了让 Windows 能替换安装目录，已把子进程 cwd 改成系统临时目录
-        # （见 src/index.ts 的 PY_CWD），那里的 cwd 不再代表 cvision 的位置。
-        "cvison_dir": os.environ.get("CVISION_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        # ⚠️ `cvison_dir` 是历史拼写错误（少个 i），**必须保留**：既有消费方按它取值。
+        # 同时提供拼写正确的 `cvision_dir`（新代码请用它），将来大版本再删旧键。
+        "cvison_dir": package_root,
+        "cvision_dir": package_root,
         "backend": backend,
         "backend_known": backend_known,
         "backend_implemented": backend_implemented,
+        "platform_support": _platform_support(backend, backend_implemented),
         "ocr_engine": _ocr_engine(),
         "input_capabilities": input_caps,
         "deps": deps_status,

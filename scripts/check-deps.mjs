@@ -118,3 +118,16 @@ if (failed.length > 0) {
   console.error(`\nPython 依赖未按约定锁定：\n${failed.map((result) => `  - ${result.label}`).join('\n')}`)
   process.exit(1)
 }
+
+// `--list` 打印当前锁定区间，供**定期人工审查**（README 的约定：每季度一次）。
+// 为什么不把它做成 CI 断言「区间是否陈旧」：那要联网查 PyPI 最新版本，而本脚本刻意不联网；
+// 而且「该不该跟进一个破坏性升级」是判断，不是能机械判定的事。
+if (process.argv.includes('--list')) {
+  console.log('\n当前锁定区间（审查点：上游是否已发新主版本 / 是否因上界过紧导致安全修复进不来）：')
+  for (const req of requirements) {
+    const lower = req.specifiers.find((part) => part.startsWith('>=')) ?? ''
+    const upper = req.specifiers.find((part) => part.startsWith('<')) ?? ''
+    const marker = req.marker === '' ? '' : `  [${req.marker}]`
+    console.log(`  ${req.name.padEnd(28)} ${lower} ${upper}${marker}`)
+  }
+}

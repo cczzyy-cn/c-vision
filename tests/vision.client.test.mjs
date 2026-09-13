@@ -1176,3 +1176,58 @@ test('浏览器抓屏被拒（用户取消授权）保持静默（不该刷提�
     for (const restore of env.restores.reverse()) restore()
   }
 })
+
+// ── 宿主占用输入设备（v0.2.19） ────────────────────────────────────────────────
+/**
+ * 物理上只有一套鼠标键盘：DSH 在点/打字时，用户也在动就会互相干扰。这里不去抢互斥锁
+ * （锁没释放会把插件卡死），而是把「占用中」如实显示出来。这几条钉住渲染、回落与「不禁用」。
+ */
+test('宿主正在操作鼠标/键盘 → 按钮显示占用提示并带警示类名', async () => {
+  await withClipboardTest(
+    { states: [{ supported: true, image: false, token: null, busy: true }] },
+    async () => {
+      const client = mountClient()
+      const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+      const props = propsFor(state, client.slot.inject('s'))
+      await renderVisibleButton(client, props)
+      const button = buttonOf(client.component(props))
+      assert.match(button.props.className, /--host-busy/, '要带上占用中的类名')
+      assert.equal(button.props.disabled, false, '只是提示，不能禁用——禁用会让人以为坏了')
+    },
+  )
+})
+
+test('宿主占用结束后 → 警示类名消失（状态必须能回落）', async () => {
+  await withClipboardTest(
+    {
+      states: [
+        { supported: true, image: false, token: null, busy: true },
+        { supported: true, image: false, token: null, busy: false },
+      ],
+    },
+    async () => {
+      const client = mountClient()
+      const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+      const props = propsFor(state, client.slot.inject('s'))
+      await renderVisibleButton(client, props)
+      assert.match(buttonOf(client.component(props)).props.className, /--host-busy/)
+      mock.timers.tick(1000) // 下一次轮询：宿主不再占用
+      await settle()
+      const after = buttonOf(client.component(props)).props.className
+      assert.doesNotMatch(after, /--host-busy/, '占用结束后必须回落，否则会一直亮着')
+    },
+  )
+})
+
+test('宿主未报告 busy（旧版宿主）→ 不显示占用提示（按未占用处理）', async () => {
+  await withClipboardTest(
+    { states: [{ supported: true, image: false, token: null }] },
+    async () => {
+      const client = mountClient()
+      const state = directoryState('deepseek-official', 'deepseek-v4.1-flash-expires-on-0910', 'deepseek-v4.1')
+      const props = propsFor(state, client.slot.inject('s'))
+      await renderVisibleButton(client, props)
+      assert.doesNotMatch(buttonOf(client.component(props)).props.className, /--host-busy/)
+    },
+  )
+})

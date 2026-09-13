@@ -433,6 +433,23 @@ test('剪贴板取图：非 POST（405）与跨站（403）都拒绝，且不触
   )
 })
 
+// ── 宿主占用输入设备（v0.2.19） ──────────────────────────────────────────────
+test('剪贴板状态路由带 busy 字段（客户端据此显示「DSH 正在操作鼠标/键盘」）', async () => {
+  const { route } = mountHost()
+  await withClipboardProbe(
+    { state: async () => ({ supported: true, image: false, token: '7', reason: '' }) },
+    async () => {
+      const res = await invoke(route(CLIPBOARD), fakeRequest({ method: 'GET', url: CLIPBOARD }))
+      assert.equal(res.statusCode, 200)
+      const payload = JSON.parse(res.body)
+      // 空闲时也要**显式给出** false，而不是省略字段：缺字段虽然行为等价，但消费方无法
+      // 从响应看出「这条协议存在」，排查时容易误判成路由没升级。
+      assert.equal(typeof payload.busy, 'boolean')
+      assert.equal(payload.busy, false, '没有输入操作进行时 busy 应为 false')
+    },
+  )
+})
+
 // ── 运行时体检门（v0.2.18） ──────────────────────────────────────────────────
 /**
  * 依赖没装时，`see`/`ocr` 原本会抛裸的 `ModuleNotFoundError`，用户看不出该做什么。
@@ -491,14 +508,32 @@ test('体检：已有其它阻塞项时，缺 pyautogui 要作为附加说明列
 
 test('体检：后端未实现（如 Linux）→ 说清 platform 与 backend，而不是假装依赖问题', () => {
   const problem = describeRuntimeProblem(
-    statusOf({ platform: 'linux', backend: 'linux', backend_implemented: false }),
+    statusOf({ platform: 'linux', backend: 'linux', backend_implemented: false, platform_support: 'unsupported' }),
     null,
   )
   assert.ok(problem, '后端未实现必须拦下')
   assert.match(problem, /linux/)
   assert.match(problem, /后端未实现/)
-  // 平台不支持不是 `pip install` 能解决的，不该误导用户去装包。
+  // 平台不支持不是 `pip install` 能解决的，不该误导用户去装包，也不该让他去「复查依赖」。
   assert.ok(!problem.includes('pip install'), '后端未实现时不要给安装命令')
+  assert.ok(!problem.includes('cvision_status()'), '后端未实现时不要给依赖复查指引')
+})
+
+test('体检：未验证平台（macOS）→ 不拦，但必须如实提示未验证', () => {
+  // 这条曾经把 `unverified` 写在 `backend_implemented !== true` 的 else-if 里，
+  // 于是**永远不可达**——macOS 上既不报错、也拿不到任何提示。现在它是一条独立警告。
+  const problem = describeRuntimeProblem(
+    statusOf({ platform: 'darwin', backend: 'macos', platform_support: 'unverified' }),
+    null,
+  )
+  assert.ok(problem, '未验证平台必须给出提示，不能静默放行')
+  assert.match(problem, /未在真机验证/)
+  assert.match(problem, /unverified/)
+  assert.ok(!problem.includes('pip install'), '依赖齐全时不该出现安装命令')
+})
+
+test('体检：deps 齐全且 platform_support=supported → 不返回任何提示', () => {
+  assert.equal(describeRuntimeProblem(statusOf(), null), null)
 })
 
 test('体检：探针本身跑不起来 → 提示先查解释器/路径，并附 CVISION_PYTHON 线索', () => {

@@ -46,6 +46,12 @@ class TestStatus(unittest.TestCase):
         self.assertTrue(os.path.isdir(root), root)
         self.assertTrue(os.path.isdir(os.path.join(root, "cvision")), root)
 
+    def test_correctly_spelled_alias_matches(self):
+        """`cvison_dir` 是历史拼写错误（保留兼容）；`cvision_dir` 是正确拼写，两者必须一致。"""
+        s = status.status()
+        self.assertIn("cvision_dir", s, "应提供拼写正确的别名")
+        self.assertEqual(s["cvision_dir"], s["cvison_dir"])
+
 
 if __name__ == "__main__":
     unittest.main()

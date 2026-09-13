@@ -10,7 +10,7 @@ Python 版 cvision** 截屏/OCR/输入 → 写入 Harness 附件服务（`ctx.at
 
 同一个包还带一个**浏览器半边**：输入框工具栏的「截图」按钮（人工一键抓屏，或把剪贴板里的图片作为附件）。
 
-**版本**：`0.2.18` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
+**版本**：`0.2.19` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
 **许可**：BSD-3-Clause · 变更历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 目录
@@ -74,12 +74,30 @@ python -m pip install -r <插件安装目录>\requirements.txt
 
 | 工具 | 说明 |
 | --- | --- |
-| `see(handle?, window?, region?, delay?, maximize?, format?, ocr?)` | 截屏/窗口 → **图片**返回（模型原生看）。`handle`（来自 `list_windows`）比 `window` 标题**更精确、标题变化时更稳**，二者二选一且**优先 `handle`**；`region="x,y,w,h"` 只取一块（省 token）；`delay=毫秒` 等渲染；`maximize` 默认关；`format` 可选 PNG/JPEG/WEBP/GIF；`ocr=true` 同时返回 OCR 文本/词框 |
+| `see(handle?, window?, region?, delay?, maximize?, format?, ocr?, text?, max_elements?)` | 截屏/窗口 → **图片**返回（模型原生看）。`handle`（来自 `list_windows`）比 `window` 标题**更精确、标题变化时更稳**，二者二选一且**优先 `handle`**；`region="x,y,w,h"` 只取一块（省 token）；`delay=毫秒` 等渲染；`maximize` 默认关；`format` 可选 PNG/JPEG/WEBP；`ocr=true` 同时返回 OCR 文本/词框；**`text=true` 同时返回可点击元素**（见下） |
 | `ocr(handle?, window?, region?, delay?)` | 截屏后 **OCR** → **文本 + 词级边界框 `words`**（`{text,x,y,w,h}`，供精确定位点击点）；同样 **`handle` 优先于 `window`** |
 | `list_windows()` | 列出可见窗口（标题 + 句柄 + 尺寸） |
 | `screen_info()` | 列出显示器/DPI 布局（`x/y/width/height/primary/scale`），高 DPI 折算坐标用 |
-| `cvision_status()` | 运行环境健康探针（Python 版本、平台后端、OCR 引擎、依赖/后端是否可用、本平台能力清单） |
+| `cvision_status()` | 运行环境健康探针（Python 版本、平台后端、OCR 引擎、依赖/后端是否可用、`platform_support` 三态、本平台能力清单） |
 | `wait_for_window(title?, timeout?)` | 轮询等某个窗口出现（默认 500ms/次，10s 超时） |
+| `wait_until_changed(window?, handle?, region?, interval?, timeout?, threshold?, format?)` | 轮询截图，**直到画面真的变了**才把那一帧返回（等进度条/等弹窗）。返回 `changed`/`diff_ratio`/`diff_bbox`；默认阈值 0.01 |
+
+### 点击定位：`see(text=true)`
+
+给模型**可直接点击的坐标**，不必自己从截图里估算像素：
+
+```text
+see(text=true)  →  图片 + elements: [{ text, screen_center:{x,y}, screen_box, box, center, word_count }]
+                                          ↑ 直接喂给 click(x, y)
+```
+
+为什么需要它：`ocr` 给的是**词框**且坐标相对**那张图片**，而 `click` 吃的是**屏幕绝对坐标**——
+两者之间差了三件事，模型很容易算错：**裁剪偏移**（`region`）、**窗口/多屏偏移**、**DPI 缩放**。
+`see(text=true)` 把这三层换算固定成代码（`cvision/coordinates.py`），并顺手把同一行的相邻词
+**合并成一个控件**（`cvision/ui_elements.py`）、四周外扩一点 padding，让中心点更稳地落在控件内部。
+
+> `max_elements` 默认 40（按从上到下、从左到右取前 N 个），防止一屏几百个元素刷爆上下文。
+
 
 ### 操作（模拟用户级输入）
 
@@ -206,6 +224,16 @@ focus_window("Google Chrome") → press_key("ctrl+l") → type_text("https://…
 
 > ⚠️ **只有 Windows 这条链路经过实测**。在 macOS/Linux 上反馈问题时请附平台、Python 版本与完整报错。
 
+这套「实测 / 未验证 / 未实现」的区分不只在文档里——`cvision_status()` 会把它作为**机器可读**字段给出，
+模型据此判断该不该尝试 computer-use、以及出问题时该不该怀疑插件：
+
+| `platform_support` | 含义 | 当前平台 |
+| --- | --- | --- |
+| `supported` | 代码完整且**已实测** | Windows |
+| `unverified` | 代码完整但**未在真机验证**，行为可能与文档有出入 | macOS |
+| `unsupported` | 明确未实现，调用会得到清晰报错（不是静默失败） | Linux |
+
+
 ## 升级后必须做什么
 
 本包是双面的，**两半的生效方式不同**——升级后没变化，先看这里：
@@ -262,7 +290,7 @@ npm run check:deps   # Python 依赖锁定自检（8 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
-当前规模：**JS 62 条 + Python 73 条**。
+当前规模：**JS 68 条 + Python 163 条**。
 
 ### 文档约定（自动校验）
 
@@ -287,7 +315,24 @@ python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pill
 - `npm ci && npm run build`，并校验 **`lib/` 与源码编译产物一致**（改了 `src` 却忘编译会失败）；
 - `npm run check:dsh`（30 项契约）+ `npm run check:docs`（14 项文档一致性）+ `npm run check:deps`（8 项依赖锁定）；
 - `npm run test:js`（客户端半边 + 宿主路由）；
-- Python 单测跑在 **ubuntu + macOS** 矩阵（仅装 Pillow，不需要桌面）。
+- Python 单测跑在 **ubuntu + macOS** 矩阵（仅装 Pillow，不需要桌面）；
+- **windows-latest 冒烟**：按 `requirements.txt` 真装依赖，再断言 `backend=windows`、
+  `platform_support=supported`、`ok=true`。加它的原因：上面两个平台**装不了 pywin32/winsdk**，于是
+  Windows 后端的关键路径（WGC / PrintWindow / 窗口枚举）在 CI 上从不执行——这一条至少保证
+  「用户照 README 在 Windows 上装完不会立刻报缺依赖」。
+
+### Python 依赖的定期审查
+
+`requirements.txt` 每条都是双向锁定（见 [STORE 契约](#dsh-store-上架契约)），上界取「下一个可能破坏兼容的
+边界」。代价是**上界不会自己变**，所以约定：**每季度审查一次**——
+
+```bash
+npm run check:deps -- --list   # 打印当前每条依赖的锁定区间
+```
+
+审查点两条：上游是否已发新主版本（该不该跟进）；上界是否过紧导致**安全修复进不来**。
+`pywin32` 尤其注意：官方明确建议固定（任意一次 build 号增加都可能有接口破坏），所以它锁到下一个 build，
+每次官方发版都得显式决定要不要跟。
 
 **发布**：推一个 `v*` tag → 构建+测试通过后自动 `npm pack` 出 `vision-<version>.tgz` 并创建 GitHub Release：
 
@@ -309,15 +354,24 @@ git push origin v0.2.14          # ⚠️ 一次只推一个 tag，见下
 
 | 入口 | 参数 | 结果 |
 | --- | --- | --- |
-| `cvision.cli_capture` | `--list` / `--window` / `--handle` / `--region` / `--delay` / `--format` | `{ok:true,data_url,width,height}` |
+| `cvision.cli_capture` | `--list` / `--screen-info` / `--status` / `--window` / `--handle` / `--region` / `--delay` / `--format` / **`--text`** / **`--wait-changed`** | 截图时是**裸 data URL 字符串**（不是 JSON）；`--list`/`--screen-info`/`--status` 是各自的 JSON；`--text` → `{ok:true,kind:"capture_text",data_url,width,height,elements:[{text,box,center,screen_box,screen_center,word_count}]}`；`--wait-changed` → `{ok:true,kind:"wait_changed",data_url,changed,samples,elapsed_ms,diff_ratio,mean_diff,diff_bbox}` |
 | `cvision.cli_ocr` | `--window` / `--handle` / `--region` / `--delay` | `{ok:true,text,lines,words:[{text,x,y,w,h}]}` |
-| `cvision.cli_input` | `--click/--double/--move/--scroll/--drag/--type/--keys/--focus/--get-clipboard/--set-clipboard` | `{ok:true}` |
-| `cvision.cli_snip` | `--timeout 60` | `{ok:true,data_url}`（退出 0）/ `{ok:false,reason:"cancelled"}`（2）/ `"unsupported"`（3）/ `"error"`（1） |
+| `cvision.cli_input` | `--click/--double/--move/--scroll/--scroll-h/--drag/--type/--keys/--focus/--focus-handle/--get-clipboard/--set-clipboard` | 动作类 `{ok:true}`；`--get-clipboard` → `{text}` |
+| `cvision.cli_snip` | `--timeout 60` / `--format` | `{ok:true,data_url}`（退出 0）/ `{ok:false,reason:"cancelled"}`（2）/ `"unsupported"`（3）/ `"error"`（1） |
 | `cvision.cli_clipboard` | `--state` / `--image` | `{ok:true,supported,image,token,reason}` / `{ok:true,data_url}`、`{ok:false,reason:"empty"\|"unsupported"\|"error"}` |
 
+> `cli_capture` 这一行以前写错过：它被写成返回 `{ok:true,data_url,width,height}`，实际截图路径输出的是
+> **裸 data URL**（宿主 `runCliCapture` 就当整串是 data URL）。现在表格以**代码实际行为**为准，并由
+> `test_cli_server.py` / `test_cli_ocr.py` / `test_cli_input.py` 三份契约测试盯住——`cli_server` 的
+> JSON-line 协议此前**一行测试都没有**，而它是宿主唯一的常驻通道。
+
 另有**常驻进程** `cvision.cli_server`：stdin 逐行收 JSON 请求、stdout 逐行回响应，复用 WGC 的 D3D 设备与
-编码器（避免每次工具调用冷启动解释器）。op：`ping` / `capture` / `ocr` / `list` / `screen_info` / `status` /
-`clipboard_state` / `quit`。宿主优先走它，失败自动回退到上面的 CLI。
+编码器（避免每次工具调用冷启动解释器）。op：`ping` / `capture`（`text:true` 时返回可点击元素）/
+**`wait_changed`** / `ocr` / `list` / `screen_info` / `status` / `clipboard_state` / `quit`。
+宿主优先走它，失败自动回退到上面的 CLI。
+
+> ⚠️ 宿主的请求超时是 **45s**（v0.2.19 从 30s 提高）：`wait_changed` 会在 Python 侧**阻塞**到画面变化或
+> 超时，这个上限必须大于它，否则常驻进程会被自己的超时回收，白等一场还回退到 CLI。
 
 ## 目录结构
 
@@ -346,6 +400,9 @@ vision/                      # 仓库根 = 插件本体
       macos.py           #     macOS 后端（Quartz 枚举 + screencapture -l）
       linux.py           #     Linux 后端（Phase 2 占位）
     detect.py            #   纯逻辑判定（GPU 类/空白帧），不依赖 win32，可跨平台单测
+    coordinates.py       #   图片像素 → 屏幕绝对坐标（裁剪/窗口/多屏/DPI 四层换算）
+    ui_elements.py       #   词框合并成可点击元素（同行相邻词合并 + padding + 屏幕坐标）
+    diff.py              #   帧间差异度量（灰度缩略图 + 变化占比 + 变化区域），供 wait_until_changed
     encoding.py          #   PIL -> data URL；crop_region；fit_for_attachment（附件缩图）
     screen.py            #   显示器/DPI 布局（Windows/macOS；Linux 回退 PIL 单屏）
     status.py            #   运行环境探针（平台后端/OCR/依赖/能力清单）
@@ -358,6 +415,12 @@ vision/                      # 仓库根 = 插件本体
     test_detect.py test_encoding.py test_ocr_words.py test_pick_window.py test_screen.py test_status.py
     test_input.py         #   置前语义（假 win32：最大化绝不被降级）+ 能力清单按平台
     test_cli_ocr.py       #   cli_ocr stdout 契约（词框透传/字段形状/缺字段兜底/--region 转发）
+    test_cli_server.py    #   **常驻 server 的 JSON-line 协议**（响应形状 + 真 spawn 进程往返）
+    test_cli_input.py     #   cli_input 参数层（13 个子命令 → input 函数的逐条映射）
+    test_coordinates.py   #   坐标换算（DPI/裁剪/窗口/多屏/负坐标）
+    test_ui_elements.py   #   词框合并成可点击元素（同行相邻合并/间距切分/坐标换算）
+    test_diff.py          #   帧间差异（相同/微变/实变/尺寸变化 + 阈值边界）
+    test_clipboard_race.py #  剪贴板竞态回归（用户占用期间复制的内容绝不被覆盖）
     test_snip.py          #   系统截图 CLI 的 JSON 契约
     test_snip_windows.py  #   取消识别（假时钟/覆盖层/剪贴板：取消立即返回、晚到图片不算本次）
     test_clipboard.py     #   剪贴板模块与 CLI 契约（平台分支 / empty / unsupported / error）

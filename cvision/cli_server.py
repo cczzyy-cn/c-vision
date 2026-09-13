@@ -12,7 +12,7 @@
 请求::
 
     {"op":"ping"}
-    {"op":"capture","window":str?,"handle":int?,"maximize":bool,"region":"x,y,w,h"?,"delay":ms,"format":"PNG"}
+    {"op":"capture","window":str?,"handle":int?,"maximize":bool,"region":"x,y,w,h"?,"delay":ms,"format":"PNG","text":bool?}
     {"op":"ocr","window":str?,"handle":int?,"maximize":bool,"region":"x,y,w,h"?,"delay":ms}
     {"op":"list"}
     {"op":"screen_info"}
@@ -22,6 +22,7 @@
 响应::
 
     {"ok":true,"kind":"capture","data_url":"data:...","width":int,"height":int}
+    {"ok":true,"kind":"capture_text","data_url":"data:...","width":int,"height":int,"elements":[{...}]}
     {"ok":true,"kind":"ocr","text":str,"lines":[str],"words":[{...}]}
     {"ok":true,"kind":"list","windows":[{...}]}
     {"ok":true,"kind":"screen_info","displays":[{...}]}
@@ -58,7 +59,27 @@ def _capture_image(args: dict):
 
 
 def _capture(args: dict):
-    from cvision import encoding
+    from cvision import capturer, encoding
+
+    if args.get("text"):
+        # 与 `cli_capture --text` **同形状**：一次返回图 + 可点击元素。
+        # 宿主 see(text=true) 两条路径（常驻 server / CLI 回退）读的是同一套字段。
+        img, elements = capturer.capture_with_text(
+            handle=args.get("handle"),
+            title_substr=args.get("window"),
+            maximize=bool(args.get("maximize")),
+            region=args.get("region"),
+            delay=args.get("delay") or 0,
+            format=args.get("format", "PNG"),
+        )
+        return {
+            "ok": True,
+            "kind": "capture_text",
+            "data_url": encoding.image_to_data_url(img, format=args.get("format", "PNG")),
+            "width": img.width,
+            "height": img.height,
+            "elements": elements,
+        }
 
     img = _capture_image(args)
     data_url = encoding.image_to_data_url(img, format=args.get("format", "PNG"))
@@ -108,12 +129,43 @@ def _clipboard_state():
     return {"ok": True, "kind": "clipboard_state", **clipboard.state()}
 
 
+def _wait_changed(args: dict):
+    """轮询直到画面变化（供 wait_until_changed 工具）。
+
+    ⚠️ 这个 op 会**阻塞** server 直到有变化或超时，期间不再处理其它请求（宿主侧是单请求队列，
+    本来也不会并发发）。所以：**内部超时必须小于宿主的请求超时**，由调用方保证（宿主的
+    request timeout 已从 30s 提到 45s，见 src/index.ts）。
+    """
+    from cvision import capturer, encoding
+
+    img, metrics = capturer.wait_until_changed(
+        handle=args.get("handle"),
+        title_substr=args.get("window"),
+        maximize=bool(args.get("maximize")),
+        region=args.get("region"),
+        format=args.get("format", "PNG"),
+        interval_ms=args.get("interval") or 500,
+        timeout_ms=args.get("timeout") or 10000,
+        threshold=args.get("threshold") if args.get("threshold") is not None else 0.01,
+    )
+    return {
+        "ok": True,
+        "kind": "wait_changed",
+        "data_url": encoding.image_to_data_url(img, format=args.get("format", "PNG")),
+        "width": img.width,
+        "height": img.height,
+        **metrics,
+    }
+
+
 def handle(req: dict) -> dict:
     op = req.get("op")
     if op == "ping":
         return {"ok": True, "kind": "pong"}
     if op == "capture":
         return _capture(req)
+    if op == "wait_changed":
+        return _wait_changed(req)
     if op == "ocr":
         return _ocr(req)
     if op == "list":

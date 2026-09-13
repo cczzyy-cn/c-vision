@@ -10,6 +10,56 @@
 > - `v0.1.0` ~ `v0.1.9` 的说明只在 [GitHub Releases](https://github.com/cczzyy-cn/c-vision/releases) 里
 >   （那时还没有本文件）。
 
+## v0.2.19
+
+**给模型「可直接点击的坐标」+ 等到画面变化才截图 + 补上两处零覆盖的协议测试 + 修剪贴板破坏性竞态。**
+
+- **`see(text=true)`：一次调用返回图片 + 可点击元素（含屏幕绝对坐标）**。这是本版最有价值的一项：
+  过去要精确点击得先 `ocr` 拿词框，再由模型自己把「图片坐标」折成「屏幕坐标」——中间差了三层
+  （`region` 裁剪偏移、窗口/多屏偏移、DPI 缩放），错一点就点偏。现在三层换算固定成代码：
+  新增 `cvision/coordinates.py`（`resolve_scale`/`make_mapper`/`capture_origin`/`screen_for_image`）与
+  `cvision/ui_elements.py`（同行相邻词**合并成控件**、四周外扩 padding、换算屏幕坐标），
+  `see` 的 `text=true` 返回 `elements:[{text,box,center,screen_box,screen_center,word_count}]`，
+  **`screen_center` 可直接喂给 `click`**。`max_elements` 默认 40 防止刷屏。
+  两条通道形状一致：常驻 server 的 `{op:'capture',text:true}` 与 CLI 的 `--text`；
+  一次调用同时拿图与坐标，也避免「先截图再 OCR」之间画面已变导致的错位。
+- **`wait_until_changed`：轮询到画面真的变化才返回那一帧**（等进度条/等弹窗）。新增
+  `cvision/diff.py`（灰度缩略图 + 变化像素占比 + 变化区域 bbox）与 `cvision/capturer.wait_until_changed`。
+  比「连拍 N 张图都塞给模型」省得多：模型不必看相似图，只需知道变没变、变在哪。
+  **默认阈值 0.01 是实测调出来的**：先在真机上量到光标/文本插入符闪烁约占 0.5% 像素，所以阈值
+  0.002 会让工具**第一次轮询就返回「变了」**（等于毫无用处）；窗口出现这类真实变化通常 ≥5%，留了余量。
+  返回 `changed`/`samples`/`elapsed_ms`/`diff_ratio`/`mean_diff`/`diff_bbox`。
+  宿主的常驻请求超时相应从 30s 提到 **45s**——该 op 会在 Python 侧阻塞，超时必须大于它，
+  否则常驻进程会被自己的超时回收，白等一场还回退到 CLI。
+- **修剪贴板破坏性竞态**（本插件唯一会破坏用户数据的路径）：`input._paste_clipboard` 为了输入非 ASCII
+  文本会临时占用剪贴板，打完再把旧内容写回——原实现**无条件**恢复，于是**用户在此期间复制的内容会被
+  旧备份覆盖**。现在恢复前比对：只有剪贴板仍是「我们写进去的那份」才恢复，被改动过就尊重用户的新内容。
+  新增 `tests/test_clipboard_race.py`，并**反向验证**过：用旧实现跑该测试会失败
+  （`'agent 的旧备份' != '用户刚复制的内容'`），不是装饰性测试。
+- **补 `cli_server` 的 JSON-line 协议契约测试**（此前**一行都没有**）。它是宿主与 Python 之间唯一的
+  常驻通道（`see`/`ocr`/`list_windows`/`screen_info`/剪贴板轮询全走它），宿主严格按「一行请求一行响应」
+  配对。新增 `tests/test_cli_server.py`（16 条）：响应形状、未知 op、异常边界、`capture_text`/`wait_changed`
+  形状，**并真的 spawn 一个进程**跑 stdin/stdout 往返（含坏 JSON 后必须继续服务、空行不产生响应、EOF 干净退出）。
+- **补 `cli_input` 参数层测试**（13 个子命令，此前引用数为 0）：`tests/test_cli_input.py`（21 条）逐条断言
+  「命令行参数 → `cvision.input` 函数参数」的映射，包括最容易犯的 `--scroll-h` 走 dx 且 dy=0、
+  `--drag` 四个坐标的顺序、`--double` 必须带 `double=True`、dispatch 优先级与各类参数错误。
+- **`GIF` 不再假装支持**：宿主 `MEDIA_TYPES` 移除了它——`encoding` 用 `img.save(format='GIF')` 保存多帧图
+  **只写第一帧**，所以「支持 GIF」是假的（`see(format='GIF')` 曾能选到却静默丢帧）。同时把
+  `encoding` 的默认格式从 JPEG 改成 **PNG**（与所有 CLI 的 `--format` 默认一致），3 处 CLI 帮助文案去掉 GIF。
+- **平台支持度变成机器可读**：`cvision_status()` 新增 `platform_support`，三态
+  `supported`（Windows，已实测）/ `unverified`（macOS，代码写了但没真机验证）/ `unsupported`（Linux）。
+  宿主体检提示据此区分「未实现」与「未验证」，不再让模型把「有实现」当成「已验证」。
+- **`cvison_dir` 补正确拼写别名**：新增 `cvision_dir`（值相同）。旧键是历史拼写错误，保留兼容。
+- **占用输入设备时如实提示**：新增 `busy` 字段挂在页面本来就在轮询的 `/cvision/clipboard` 上（不额外加
+  路由）。输入类工具执行期间，截图按钮显示警示色 + 脉冲动画 + 「DSH 正在操作鼠标/键盘，请先不要动」。
+  **只提示、不禁用**（禁用会让人以为坏了，用户本来就该能随时取消）。这是「用户与 agent 同时操作电脑」
+  的轻量解法：物理上只有一套鼠标键盘，抢互斥锁一旦没释放会把插件卡死，如实暴露状态更安全。
+- 测试：JS 62 → **68**（占用提示的渲染/回落/旧版宿主兼容、路由带 `busy`、体检的未验证/未实现/正常三分支）；
+  Python 73 → **163**（坐标 19 + 元素合并 14 + 差异 15 + 剪贴板竞态 4 + cli_server 16 + cli_input 21 + 既有增量）。
+- CI：新增 **windows-latest 冒烟 job**（此前 Windows 后端的关键路径在 CI 上从不执行）——
+  按 `requirements.txt` 真装依赖，再断言 `backend=windows`、`backend_implemented`、
+  `platform_support=supported`、`ok=true`。
+
 ## v0.2.18
 
 **首次调用前的运行时体检：依赖没装时给出「装什么、怎么装」，而不是一句裸 Python 报错。**

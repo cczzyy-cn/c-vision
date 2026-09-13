@@ -197,35 +197,57 @@ def set_clipboard(text: str) -> None:
         )
 
 
-def _paste_clipboard(text: str) -> None:
-    """用剪贴板 + Ctrl+V 输入非 ASCII 文本（pyautogui.write 打不进中文等）。"""
+def _read_clipboard_text(win32clipboard, win32con) -> str | None:
+    """读剪贴板文本；没有文本格式或读不到（被别的进程占用）时返回 None。"""
     try:
-        import win32clipboard
-        import win32con
-    except ImportError as e:  # pragma: no cover - 仅当未装 pywin32
-        raise RuntimeError("输入非 ASCII 文本需要 pywin32（Windows）：pip install pywin32") from e
-    old = None
-    try:  # 备份旧剪贴板文本
         win32clipboard.OpenClipboard()
-        if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
-            old = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
-        win32clipboard.CloseClipboard()
     except Exception:
-        old = None
+        return None
+    try:
+        if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
+            return win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            win32clipboard.CloseClipboard()
+        except Exception:
+            pass
+
+
+def _write_clipboard_text(win32clipboard, win32con, text: str) -> None:
+    """把文本写进剪贴板（清空后写入）；被占用时抛异常，由调用方决定怎么处理。"""
     win32clipboard.OpenClipboard()
     try:
         win32clipboard.EmptyClipboard()
         win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
     finally:
         win32clipboard.CloseClipboard()
+
+
+def _paste_clipboard(text: str) -> None:
+    """用剪贴板 + Ctrl+V 输入非 ASCII 文本（pyautogui.write 打不进中文等）。
+
+    ⚠️ **不能盲目恢复剪贴板**。这里有个真实的竞态：本函数为了打字临时占用剪贴板，打完再把
+    旧内容写回去——但如果**用户在我们占用期间复制了别的东西**，那个「恢复」会把用户刚复制的
+    内容直接覆盖掉（这是本插件里唯一会破坏用户数据的路径）。所以恢复前要比对：只有当剪贴板
+    **仍是我们写进去的那份**时才恢复；一旦发现被改动，就尊重用户的新内容，不动它。
+    """
+    try:
+        import win32clipboard
+        import win32con
+    except ImportError as e:  # pragma: no cover - 仅当未装 pywin32
+        raise RuntimeError("输入非 ASCII 文本需要 pywin32（Windows）：pip install pywin32") from e
+    old = _read_clipboard_text(win32clipboard, win32con)
+    _write_clipboard_text(win32clipboard, win32con, text)
     time.sleep(0.05)
     _require_pyautogui().hotkey("ctrl", "v")
-    if old is not None:  # 尽力恢复剪贴板
+    # 只有剪贴板仍是我们写进去的 `text` 才恢复旧内容；否则说明用户在这期间复制了东西，
+    # 那份新内容远比「恢复我们的旧备份」重要，必须原样留着。
+    if old is not None and _read_clipboard_text(win32clipboard, win32con) == text:
         try:
-            win32clipboard.OpenClipboard()
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, old)
-            win32clipboard.CloseClipboard()
+            _write_clipboard_text(win32clipboard, win32con, old)
         except Exception:
             pass
 

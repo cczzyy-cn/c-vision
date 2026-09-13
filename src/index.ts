@@ -32,7 +32,15 @@ const execFileAsync = promisify(execFile)
 export const name = 'Vision'
 export const inject = ['tools', 'attachments']
 
-const MEDIA_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'] as const
+/**
+ * 允许回传的图片类型。
+ *
+ * 刻意**不含 GIF**：`encoding.image_to_base64` 用 `img.save(format='GIF')` 保存多帧图时只会写出
+ * 第一帧，所以「支持 GIF」是假的——`see(format='GIF')` 曾能选到它，但拿到的是静默退化的单帧。
+ * 与其留一个看着支持、实际丢帧的选项，不如在这里拒掉（`parseDataUrl` 会给出明确报错）。
+ * 注：Pillow 对多帧有 `save_all=True` + `append_images`，真要做动图得走那条路。
+ */
+const MEDIA_TYPES = ['image/jpeg', 'image/png', 'image/webp'] as const
 type MediaType = (typeof MEDIA_TYPES)[number]
 
 type Json = Record<string, unknown>
@@ -152,12 +160,22 @@ export function describeRuntimeProblem(status: Row | null, probeError: string | 
   }
   const missing: string[] = []
   if (!depOk(status, 'Pillow')) missing.push('Pillow')
-  // 除下面两类硬问题外，环境算是可用的 —— 返回 null 表示不拦。
-  if (missing.length === 0 && status.backend_implemented === true) return null
+  const backendMissing = status.backend_implemented !== true
+  // macOS 这类「有实现但没真机验证」：不是错误，但**必须**说出来——否则模型会把「有实现」
+  // 当成「已验证」，出问题时误判成插件 bug 而不是平台差异。
+  const unverified = !backendMissing && status.platform_support === 'unverified'
+
+  // 真正会**挡住**工具的才算错误：缺依赖、平台后端未实现。两者都没有就不拦。
+  if (missing.length === 0 && !backendMissing) {
+    return unverified
+      ? `提示：本平台后端（${String(status.backend ?? '未知')}）**未在真机验证过**（platform_support=unverified），` +
+          `行为可能与文档有出入，遇到问题请当作平台差异排查。`
+      : null
+  }
 
   const lines: string[] = []
   if (missing.length > 0) lines.push(`Python 环境不完整：缺少 ${missing.join('、')}。`)
-  if (status.backend_implemented !== true) {
+  if (backendMissing) {
     lines.push(
       `本平台后端未实现（platform=${String(status.platform ?? '未知')}、backend=${String(status.backend ?? '未知')}）——` +
         `截屏/OCR 在该平台尚不可用（详见 README 的平台矩阵）。`,
@@ -168,9 +186,11 @@ export function describeRuntimeProblem(status: Row | null, probeError: string | 
   )
   // 输入类工具另有 pyautogui 这一支依赖；它不阻止 see/ocr，但缺了就该说清后果。
   if (!depOk(status, 'pyautogui')) lines.push(`另外：pyautogui 缺失，输入类工具不可用。`)
-  // 只有在「确实缺依赖」时才给安装命令：平台后端未实现不是装包能解决的。
-  if (missing.length > 0) lines.push(`装一次依赖即可（清单随包分发）：${PIP_HINT}`)
-  lines.push(`装完可调 cvision_status() 复查；依赖装在哪个解释器里，就要让 CVISION_PYTHON 指向它。`)
+  // 只有在**确实缺依赖**时才给安装命令与复查指引：平台后端未实现不是装包能解决的。
+  if (missing.length > 0) {
+    lines.push(`装一次依赖即可（清单随包分发）：${PIP_HINT}`)
+    lines.push(`装完可调 cvision_status() 复查；依赖装在哪个解释器里，就要让 CVISION_PYTHON 指向它。`)
+  }
   return lines.join('\n')
 }
 
@@ -198,6 +218,40 @@ export async function ensureRuntime(exec: { signal: AbortSignal }): Promise<void
   await probeRuntime(exec)
   const problem = describeRuntimeProblem(runtimeStatus, runtimeProbeError)
   if (problem !== null) throw new Error(problem)
+}
+
+/**
+ * 当前是否有**输入类操作**正在进行（点击/拖拽/输入/按键/聚焦）。
+ *
+ * 为什么需要：电脑只有一套鼠标键盘，DSH 与用户会互相干扰——agent 移动鼠标时用户也在动，
+ * 或者用户正在打字时 agent 抢走前台。这里不去抢互斥锁（那会带来卡死风险），而是把「占用中」
+ * **如实暴露**给浏览器半边，让界面显示出来，把「别碰鼠标键盘」从口头约定变成看得见的状态。
+ *
+ * 刻意**只统计输入类操作**：截图/OCR 不改用户状态，把它们也算成「占用」会频繁误报，反而没人信。
+ */
+let inputBusyCount = 0
+
+/** 跑一个输入类操作，期间把「占用中」置为真（用 try/finally 保证异常时也会复位）。 */
+async function withInputBusy<T>(fn: () => Promise<T>): Promise<T> {
+  inputBusyCount += 1
+  try {
+    return await fn()
+  } finally {
+    inputBusyCount = Math.max(0, inputBusyCount - 1)
+  }
+}
+
+/** 把输入类 CLI 调用包进「占用中」窗口。 */
+function runCliInputTracked(args: string[], exec: { signal: AbortSignal }): Promise<void> {
+  return withInputBusy(() => runCliInput(args, exec))
+}
+
+/**
+ * 浏览器半边查询「宿主是否正在驱动输入设备」的路由。
+ * 复用现有的剪贴板状态路由（页面本来就在每秒轮询它），不额外加一条要轮询的路由。
+ */
+function inputBusy(): boolean {
+  return inputBusyCount > 0
 }
 
 /** 运行一次用户级输入（python -m cvision.cli_input <args>）。 */
@@ -524,6 +578,8 @@ type ClipboardState = {
   reason: string
   /** 这张图是不是我们自己刚（单击系统截图时）交给页面的——客户端据此不把它当「新图片」。 */
   served?: boolean
+  /** 宿主此刻是否正在驱动鼠标/键盘（输入类工具执行中）。客户端据此显示「别碰」提示。 */
+  busy?: boolean
 }
 
 /** 一次剪贴板取图的结果。 */
@@ -616,7 +672,9 @@ export const clipboardProbe: {
 }
 
 export function apply(ctx: Context): void {
-  const server = new CvisionServer(30000)
+  // 45s：`wait_changed` 会在 Python 侧阻塞轮询（默认 10s、上限由调用方的 timeout 决定），
+  // 这个上限必须**大于**它，否则常驻 server 会被自己的超时回收，白等一场还回退到 CLI。
+  const server = new CvisionServer(45000)
   // 剪贴板状态轮询优先复用这个常驻进程（每秒一次，冷启动一个解释器太贵）。
   activeServer = server
   ctx.effect(() => () => {
@@ -730,6 +788,9 @@ export function apply(ctx: Context): void {
               ...state,
               // `served`：这张图是不是我们自己刚（单击系统截图时）交给页面的？客户端据此不提示。
               served: state.token !== null && (ours || state.token === snipServedToken),
+              // `busy`：宿主正在操作鼠标/键盘。物理上只有一套输入设备，所以要如实告诉用户
+              // 「现在别碰」——这比试图抢互斥锁安全（锁一旦没释放会把插件卡死）。
+              busy: inputBusy(),
             })
           } catch (error) {
             sendJson(res, 500, { message: errorMessage(error) })
@@ -785,20 +846,47 @@ export function apply(ctx: Context): void {
   // ① server 优先，失败回退 CLI 的采集类辅助（每个返回统一形态）。
   //    这些是**所有 Python 依赖工具的唯一收口**（16 个工具里除 cvision_status 外都经这里，
   //    输入类与剪贴板类各有一处），所以体检门只需加在这 5 个函数上，不必逐个工具去改。
-  async function captureDataUrl(args: Json, exec: { signal: AbortSignal }): Promise<string> {
+  /**
+   * 抓一张图；`args.text` 为真时**顺带**返回可点击元素（一次调用拿两样东西）。
+   *
+   * 两条路径形状一致：常驻 server 的 `{op:'capture',text:true}` 与 CLI 的 `--text` 都返回
+   * `{ok,kind,data_url,width,height,elements}`。**不这么做的话**，`see(text=true)` 就得先
+   * 截一次图、再 OCR 一次，两次截屏之间画面可能已经变了，坐标与图片就对不上了。
+   */
+  async function captureDataUrl(args: Json, exec: { signal: AbortSignal }): Promise<{ dataUrl: string; elements: Row[] }> {
     await ensureRuntime(exec)
+    if (args.text) {
+      try {
+        const resp = await server.request({ op: 'capture', ...args }, exec)
+        return {
+          dataUrl: String(resp.data_url ?? ''),
+          elements: Array.isArray(resp.elements) ? (resp.elements as Row[]) : [],
+        }
+      } catch {
+        const cli = buildCaptureCli(args)
+        cli.push('--text')
+        const out = await runCliCapture(cli, exec)
+        const info = JSON.parse(out) as { data_url?: string; elements?: Row[] }
+        return { dataUrl: String(info.data_url ?? ''), elements: Array.isArray(info.elements) ? info.elements : [] }
+      }
+    }
     try {
       const resp = await server.request({ op: 'capture', ...args }, exec)
-      return String(resp.data_url ?? '')
+      return { dataUrl: String(resp.data_url ?? ''), elements: [] }
     } catch {
-      const cli = ['--format', String(args.format ?? 'PNG')]
-      if (args.handle != null) cli.push('--handle', String(args.handle))
-      if (args.window) cli.push('--window', String(args.window))
-      if (args.maximize) cli.push('--maximize')
-      if (args.region) cli.push('--region', String(args.region))
-      if (args.delay) cli.push('--delay', String(args.delay))
-      return runCliCapture(cli, exec)
+      return { dataUrl: await runCliCapture(buildCaptureCli(args), exec), elements: [] }
     }
+  }
+
+  /** 把 see/ocr 的公共参数拼成 cli_capture 的参数表（两条分支共用，避免漂移）。 */
+  function buildCaptureCli(args: Json): string[] {
+    const cli = ['--format', String(args.format ?? 'PNG')]
+    if (args.handle != null) cli.push('--handle', String(args.handle))
+    if (args.window) cli.push('--window', String(args.window))
+    if (args.maximize) cli.push('--maximize')
+    if (args.region) cli.push('--region', String(args.region))
+    if (args.delay) cli.push('--delay', String(args.delay))
+    return cli
   }
 
   async function ocrJson(args: Json, exec: { signal: AbortSignal }): Promise<{ text: string; lines: string[]; words: Row[] }> {
@@ -850,6 +938,35 @@ export function apply(ctx: Context): void {
     }
   }
 
+  /**
+   * 轮询直到画面变化（供 `wait_until_changed`）。server 优先，失败回退一次性 CLI。
+   * server 侧这个 op 会阻塞等待，所以上面 `new CvisionServer(45000)` 的超时必须更大。
+   */
+  async function waitChangedJson(args: Json, exec: { signal: AbortSignal }): Promise<{ dataUrl: string; meta: Row }> {
+    await ensureRuntime(exec)
+    try {
+      const resp = await server.request({ op: 'wait_changed', ...args }, exec)
+      const meta: Row = {}
+      for (const key of ['changed', 'samples', 'elapsed_ms', 'diff_ratio', 'mean_diff', 'diff_bbox', 'width', 'height']) {
+        if (resp[key] !== undefined) meta[key] = resp[key] as JsonValue
+      }
+      return { dataUrl: String(resp.data_url ?? ''), meta }
+    } catch {
+      const cli = buildCaptureCli(args)
+      cli.push('--wait-changed')
+      if (args.interval) cli.push('--interval', String(args.interval))
+      if (args.timeout) cli.push('--timeout', String(args.timeout))
+      if (args.threshold != null) cli.push('--threshold', String(args.threshold))
+      const out = await runCliCapture(cli, exec)
+      const info = JSON.parse(out) as Row
+      const meta: Row = {}
+      for (const key of ['changed', 'samples', 'elapsed_ms', 'diff_ratio', 'mean_diff', 'diff_bbox', 'width', 'height']) {
+        if (info[key] !== undefined) meta[key] = info[key] as JsonValue
+      }
+      return { dataUrl: String(info.data_url ?? ''), meta }
+    }
+  }
+
   async function statusJson(exec: { signal: AbortSignal }): Promise<Row> {
     // ⚠️ 刻意**不**过体检门：cvision_status 是体检/排错工具，环境不完整时它正是
     // 「唯一还能用」的那条路（cli_capture --status 本身不需要 Pillow）。gate 了它，
@@ -872,7 +989,9 @@ export function apply(ctx: Context): void {
         '用 window 指定窗口标题子串（如 "Visual Studio Code"），或用 handle 传入 list_windows 给出的精确句柄（更可靠，避免标题撞车）；留空则截全屏。' +
         '默认尽量别传 maximize=true：非最小化窗口会直接抓到其真实内容，且不切换前台、不抢焦点。' +
         '仅当窗口已最小化/太小/被遮挡看不清时才用 maximize=true（截图后会自动还原原状态）。' +
-        '传 ocr=true 可在返回图片的同时附带 OCR 文本/词框（省去一次 ocr 调用）。',
+        '传 ocr=true 可在返回图片的同时附带 OCR 文本/词框（省去一次 ocr 调用）。' +
+        '传 text=true 会额外返回「可点击元素」列表（每个带 text + screen_center 屏幕绝对坐标，可直接传给 click）——' +
+        '要点击界面上某个按钮/输入框时用这个，**不要**自己从截图里估算像素：截图内坐标与屏幕坐标之间存在裁剪、窗口位置、多屏与 DPI 缩放差异，已由本工具换算好。',
       parameters: {
         window: { type: 'string', description: '窗口标题子串（忽略大小写）；留空则截整屏' },
         handle: { type: 'integer', description: '窗口句柄（来自 list_windows），比 window 更精确；与 window 二选一，优先 handle' },
@@ -884,6 +1003,15 @@ export function apply(ctx: Context): void {
         delay: { type: 'number', description: '抓取前等待毫秒（给需要渲染的内容），可选' },
         format: { type: 'string', description: 'PNG/JPEG/WEBP/GIF，默认 PNG' },
         ocr: { type: 'boolean', description: '可选：同一截图额外做 OCR 并返回 text/lines/words' },
+        text: {
+          type: 'boolean',
+          description:
+            '可选：返回可点击元素（每个含 text 与屏幕绝对坐标 screen_center，可直接喂给 click）。与 ocr 的区别：ocr 给词框（图片坐标），text 给合并后的控件与屏幕坐标',
+        },
+        max_elements: {
+          type: 'integer',
+          description: 'text=true 时最多返回多少个元素（默认 40，防止刷屏；按从上到下、从左到右取前 N 个）',
+        },
       },
       output: {
         schema: {
@@ -893,6 +1021,8 @@ export function apply(ctx: Context): void {
             text: { type: 'string' },
             lines: { type: 'array', items: { type: 'string' } },
             words: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            elements: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            element_total: { type: 'integer' },
           },
           additionalProperties: false,
         },
@@ -906,7 +1036,110 @@ export function apply(ctx: Context): void {
           if (words.length) {
             blocks.push({ type: 'text', text: '\nword_boxes (x,y,w,h):\n' + JSON.stringify(words, null, 2) })
           }
+          const elements = Array.isArray((value as any).elements) ? ((value as any).elements as Row[]) : []
+          if (elements.length) {
+            // 只给模型真正要用的：点哪个、点哪里。图片坐标 box 在这里没用（click 吃屏幕坐标），
+            // 全塞进去只会白占 context。
+            const rows = elements.map((element) => {
+              const point = ((element as any).screen_center ?? {}) as { x?: number; y?: number }
+              return `  ${String((element as any).text ?? '')}  → click(${String(point.x ?? '?')}, ${String(point.y ?? '?')})`
+            })
+            const total = Number((value as any).element_total ?? elements.length)
+            const head =
+              total > elements.length
+                ? `\nclickable elements（${elements.length}/${total}，已截断）:`
+                : `\nclickable elements（${elements.length}）:`
+            blocks.push({ type: 'text', text: head + '\n' + rows.join('\n') })
+          }
           return blocks as any
+        },
+      },
+      timeoutMs: 90000,
+      async execute(args, exec) {
+        assertCvisionPresent()
+        const req: Json = { format: (args.format ?? 'PNG').toUpperCase() }
+        if (args.handle != null) req.handle = args.handle
+        if (args.window) req.window = String(args.window)
+        if (args.maximize) req.maximize = true
+        if (args.region) req.region = String(args.region)
+        if (args.delay) req.delay = Number(args.delay)
+        if (args.text) req.text = true
+        const { dataUrl, elements } = await captureDataUrl(req, exec)
+        const { data, mediaType, ext } = parseDataUrl(dataUrl)
+        const ref = await ctx.attachments.saveImage({ data, mediaType, name: `vision-capture.${ext}` })
+        const out: {
+          ref: Record<string, JsonValue>
+          text?: string
+          lines?: string[]
+          words?: Row[]
+          elements?: Row[]
+          element_total?: number
+        } = {
+          ref: ref as unknown as Record<string, JsonValue>,
+        }
+        if (args.ocr) {
+          const o = await ocrJson(req, exec)
+          out.text = o.text
+          out.lines = o.lines
+          out.words = o.words
+        }
+        if (args.text) {
+          // 元素已按 (y, x) 排序，取前 N 个即「从上到下、从左到右」，正好是最可能先被点的区域。
+          const limit = Math.max(1, Number(args.max_elements ?? 40))
+          out.elements = elements.slice(0, limit)
+          out.element_total = elements.length
+        }
+        return out
+      },
+    }),
+  )
+
+  // ── wait_until_changed（轮询到变化才返回，省 token） ────────────────────────
+  ctx.tools.register(
+    defineTool({
+      name: 'wait_until_changed',
+      description:
+        '轮询截图，直到画面**真的变了**才把那一帧作为图片返回（等进度条跑完、等弹窗出现、等加载完成）。' +
+        '比连着截好几张图都塞给模型省得多：你不需要看 N 张相似图，只需要知道「变没变、变在哪」。' +
+        '返回 changed（是否等到变化）/ diff_ratio（变化像素占比）/ diff_bbox（变化区域，原图坐标）。' +
+        '默认阈值 0.01 是实测调出来的：光标与文本插入符闪烁约占 0.5%，阈值必须高于它，否则第一次轮询就会返回「变了」。' +
+        '要更灵敏就调低 threshold，但请同时用 region 把会闪烁的区域排除掉。超时未变化也会返回当前画面（changed=false）。',
+      parameters: {
+        window: { type: 'string', description: '窗口标题子串；留空则监视整屏' },
+        handle: { type: 'integer', description: '窗口句柄（来自 list_windows），优先于 window' },
+        maximize: { type: 'boolean', description: '是否先最大化目标窗口（抓后还原）' },
+        region: { type: 'string', description: '只监视这一块 x,y,w,h（强烈建议：既省算力又能避开闪烁区域）' },
+        interval: { type: 'number', description: '采样间隔毫秒，默认 500' },
+        timeout: { type: 'number', description: '总超时毫秒，默认 10000（到这里即使没变也返回当前画面）' },
+        threshold: { type: 'number', description: '变化像素占比阈值，默认 0.01（1%）；调低更灵敏但更容易被闪烁误触发' },
+        format: { type: 'string', description: 'PNG/JPEG/WEBP，默认 PNG' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            ref: { type: 'object', additionalProperties: true },
+            changed: { type: 'boolean' },
+            samples: { type: 'integer' },
+            elapsed_ms: { type: 'integer' },
+            diff_ratio: { type: 'number' },
+            mean_diff: { type: 'number' },
+            diff_bbox: { type: 'object', additionalProperties: true },
+          },
+          additionalProperties: false,
+        },
+        render: (_args, value) => {
+          const changed = (value as any).changed === true
+          const ratio = Number((value as any).diff_ratio ?? 0)
+          const head = changed
+            ? `画面已变化（差异 ${(ratio * 100).toFixed(2)}% 像素，用了 ${String((value as any).elapsed_ms ?? '?')}ms / ${String((value as any).samples ?? '?')} 次采样）`
+            : `超时且画面未变化（最大差异 ${(ratio * 100).toFixed(2)}% 像素，${String((value as any).elapsed_ms ?? '?')}ms / ${String((value as any).samples ?? '?')} 次采样）`
+          const box = (value as any).diff_bbox
+          const detail = box ? `\n变化区域（原图坐标）: x=${box.x} y=${box.y} w=${box.w} h=${box.h}` : ''
+          return [
+            { type: 'image', attachment: (value as any).ref as ImageAttachmentRef },
+            { type: 'text', text: head + detail },
+          ] as any
         },
       },
       timeoutMs: 60000,
@@ -917,20 +1150,13 @@ export function apply(ctx: Context): void {
         if (args.window) req.window = String(args.window)
         if (args.maximize) req.maximize = true
         if (args.region) req.region = String(args.region)
-        if (args.delay) req.delay = Number(args.delay)
-        const dataUrl = await captureDataUrl(req, exec)
+        if (args.interval) req.interval = Number(args.interval)
+        if (args.timeout) req.timeout = Number(args.timeout)
+        if (args.threshold != null) req.threshold = Number(args.threshold)
+        const { dataUrl, meta } = await waitChangedJson(req, exec)
         const { data, mediaType, ext } = parseDataUrl(dataUrl)
-        const ref = await ctx.attachments.saveImage({ data, mediaType, name: `vision-capture.${ext}` })
-        const out: { ref: Record<string, JsonValue>; text?: string; lines?: string[]; words?: Row[] } = {
-          ref: ref as unknown as Record<string, JsonValue>,
-        }
-        if (args.ocr) {
-          const o = await ocrJson(req, exec)
-          out.text = o.text
-          out.lines = o.lines
-          out.words = o.words
-        }
-        return out
+        const ref = await ctx.attachments.saveImage({ data, mediaType, name: `vision-wait.${ext}` })
+        return { ref: ref as unknown as Record<string, JsonValue>, ...meta }
       },
     }),
   )
@@ -1118,7 +1344,7 @@ export function apply(ctx: Context): void {
       async execute(args, exec) {
         const cmd = ['--click', String(args.x), String(args.y)]
         if (args.button && args.button !== 'left') cmd.push('--button', String(args.button))
-        await runCliInput(cmd, exec)
+        await runCliInputTracked(cmd, exec)
         return { ok: true }
       },
     }),
@@ -1132,7 +1358,7 @@ export function apply(ctx: Context): void {
       output: inputOut,
       timeoutMs: 30000,
       async execute(args, exec) {
-        await runCliInput(['--double', String(args.x), String(args.y)], exec)
+        await runCliInputTracked(['--double', String(args.x), String(args.y)], exec)
         return { ok: true }
       },
     }),
@@ -1146,7 +1372,7 @@ export function apply(ctx: Context): void {
       output: inputOut,
       timeoutMs: 30000,
       async execute(args, exec) {
-        await runCliInput(['--move', String(args.x), String(args.y)], exec)
+        await runCliInputTracked(['--move', String(args.x), String(args.y)], exec)
         return { ok: true }
       },
     }),
@@ -1166,9 +1392,9 @@ export function apply(ctx: Context): void {
       timeoutMs: 30000,
       async execute(args, exec) {
         if (args.dx) {
-          await runCliInput(['--scroll-h', String(args.x), String(args.y), String(args.dx)], exec)
+          await runCliInputTracked(['--scroll-h', String(args.x), String(args.y), String(args.dx)], exec)
         } else {
-          await runCliInput(['--scroll', String(args.x), String(args.y), String(args.dy ?? 0)], exec)
+          await runCliInputTracked(['--scroll', String(args.x), String(args.y), String(args.dy ?? 0)], exec)
         }
         return { ok: true }
       },
@@ -1191,7 +1417,7 @@ export function apply(ctx: Context): void {
       async execute(args, exec) {
         const cmd = ['--drag', String(args.x1), String(args.y1), String(args.x2), String(args.y2)]
         if (args.button && args.button !== 'left') cmd.push('--button', String(args.button))
-        await runCliInput(cmd, exec)
+        await runCliInputTracked(cmd, exec)
         return { ok: true }
       },
     }),
@@ -1205,7 +1431,7 @@ export function apply(ctx: Context): void {
       output: inputOut,
       timeoutMs: 30000,
       async execute(args, exec) {
-        await runCliInput(['--type', String(args.text)], exec)
+        await runCliInputTracked(['--type', String(args.text)], exec)
         return { ok: true }
       },
     }),
@@ -1219,7 +1445,7 @@ export function apply(ctx: Context): void {
       output: inputOut,
       timeoutMs: 30000,
       async execute(args, exec) {
-        await runCliInput(['--keys', String(args.keys)], exec)
+        await runCliInputTracked(['--keys', String(args.keys)], exec)
         return { ok: true }
       },
     }),
@@ -1264,7 +1490,7 @@ export function apply(ctx: Context): void {
       output: clipboardOut,
       timeoutMs: 30000,
       async execute(args, exec) {
-        await runCliInput(['--set-clipboard', String(args.text)], exec)
+        await runCliInputTracked(['--set-clipboard', String(args.text)], exec)
         return { ok: true, text: String(args.text) }
       },
     }),
@@ -1285,7 +1511,7 @@ export function apply(ctx: Context): void {
           throw new Error('focus_window 需要提供 handle（窗口句柄）或 title（窗口标题）之一')
         }
         const cmd = args.handle != null ? ['--focus-handle', String(args.handle)] : ['--focus', String(args.title)]
-        await runCliInput(cmd, exec)
+        await runCliInputTracked(cmd, exec)
         return { ok: true }
       },
     }),
