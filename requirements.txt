@@ -3,7 +3,12 @@
 # 锁定约定（由 `npm run check:deps` 机械校验，CI 每次都会跑）：
 #   - 每条依赖必须同时有**下界**与**上界**（`>=x,<y`），不允许只有下界的裸 `>=`；
 #   - 上界取**下一个可能破坏兼容的边界**：常规包 = 下一个主版本，0.x 包 = 下一个次版本，
-#     逐 build 计数的包（pywin32）= 下一个 build；
+#     逐 build 计数的包（pywin32）= 下一个 build，**预发布包（beta/rc）= 下一个预发布号**；
+#   - ⚠️ **预发布包的上界不能写成它的正式版本**：`winsdk>=1.0.0b10,<1.0.0` 会让 pip 报
+#     「No matching distribution found」——PEP 440 下 `<1.0.0` 这类区间会**排除预发布版**，
+#     于是上界把唯一可用的 1.0.0b10 也一起排除了。必须写成下一个预发布号（`<1.0.0b11`）。
+#     这个坑真实踩过：v0.2.17 起 Windows 上 `pip install -r requirements.txt` 直接装不上，
+#     直到 v0.2.19 加了 windows-latest 冒烟 job 才在 CI 上暴露出来。
 #   - 支持 Python 3.10+（Pillow 12 的下限；插件只用 3.10 起可用的语法）。
 #
 # 为什么不写死精确版本：目标是「重装可复现 + 不会被静默拖进破坏性升级」，同时给出一段
@@ -16,6 +21,6 @@ pyperclip>=1.8.2,<2  # 跨平台文本剪贴板（Windows 优先原生 pywin32�
 pywin32>=311,<312; sys_platform == 'win32'  # Windows 原生 API（窗口枚举/PrintWindow/剪贴板）
 pyobjc-framework-Quartz>=12.0,<13; sys_platform == 'darwin'   # macOS 后端（Quartz / CGWindowList + screencapture）
 pyobjc-framework-Cocoa>=12.0,<13; sys_platform == 'darwin'    # macOS 读剪贴板图片（NSPasteboard）
-winsdk>=1.0.0b10,<1.0.0; sys_platform == 'win32'  # Windows Graphics Capture 后端（可选；未装则回退 PrintWindow/桌面区域抓取）
+winsdk>=1.0.0b10,<1.0.0b11; sys_platform == 'win32'  # Windows Graphics Capture 后端（可选；未装则回退 PrintWindow/桌面区域抓取）
 # OCR 回退（可选，未装则只走 Windows.Media.Ocr；如要装，请同样锁定上界）：
 # pytesseract>=0.3.13,<0.4; sys_platform == 'win32'

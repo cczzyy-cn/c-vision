@@ -89,7 +89,34 @@ check(
   notConcrete.length === 0 ? '全部为具体版本' : `可疑：${notConcrete.join(', ')}`,
 )
 
-// ── 4. 包名不重复 ───────────────────────────────────────────────────────────
+// ── 4. 预发布包的上下界必须同为预发布 ───────────────────────────────────────
+/**
+ * 抓 v0.2.17 真实踩过的坑：`winsdk>=1.0.0b10,<1.0.0` 在语义上「看着没问题」，实际**装不上**——
+ * PEP 440 下 `<1.0.0` 这类区间会**排除预发布版**，于是上界把唯一可用的 `1.0.0b10` 也排除了，
+ * pip 直接报 "No matching distribution found"。后果是 Windows 上从 v0.2.17 起
+ * `pip install -r requirements.txt` 一直是坏的，直到加了 windows-latest 冒烟 job 才暴露。
+ *
+ * 规则：下界带预发布标识（a/b/rc/dev/post）时，上界也必须带（写成下一个预发布号）。
+ */
+const isPrerelease = (version) => /(?:^|[.\-_]?)(a|b|rc|dev|post)\d+$/i.test(version)
+const prereleaseMismatch = []
+for (const req of requirements) {
+  const lower = req.specifiers.find((part) => part.startsWith('>='))
+  const upper = req.specifiers.find((part) => part.startsWith('<'))
+  if (lower === undefined || upper === undefined) continue
+  const lowerVersion = lower.slice(2)
+  const upperVersion = upper.slice(1)
+  if (isPrerelease(lowerVersion) && !isPrerelease(upperVersion)) {
+    prereleaseMismatch.push(`${req.name}: ${lower},${upper}`)
+  }
+}
+check(
+  '预发布依赖的上界也是预发布（否则范围内无版本可装）',
+  prereleaseMismatch.length === 0,
+  prereleaseMismatch.length === 0 ? '全部合规' : `会装不上：${prereleaseMismatch.join('; ')}`,
+)
+
+// ── 5. 包名不重复 ───────────────────────────────────────────────────────────
 const seen = new Set()
 const duplicates = []
 for (const req of requirements) {

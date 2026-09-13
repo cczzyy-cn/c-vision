@@ -286,7 +286,7 @@ npm run build        # tsc -p tsconfig.json && node scripts/copy-client.mjs
 npm run test:js      # node --test：客户端半边 + 宿主四条路由
 npm run check:dsh    # DSH 组合包/客户端契约自检（30 项）
 npm run check:docs   # 文档一致性自检（14 项）
-npm run check:deps   # Python 依赖锁定自检（8 项）
+npm run check:deps   # Python 依赖锁定自检（9 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
@@ -313,7 +313,7 @@ python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pill
 `.github/workflows/ci.yml` 在每次 `push` / `pull_request` 时：
 
 - `npm ci && npm run build`，并校验 **`lib/` 与源码编译产物一致**（改了 `src` 却忘编译会失败）；
-- `npm run check:dsh`（30 项契约）+ `npm run check:docs`（14 项文档一致性）+ `npm run check:deps`（8 项依赖锁定）；
+- `npm run check:dsh`（30 项契约）+ `npm run check:docs`（14 项文档一致性）+ `npm run check:deps`（9 项依赖锁定）；
 - `npm run test:js`（客户端半边 + 宿主路由）；
 - Python 单测跑在 **ubuntu + macOS** 矩阵（仅装 Pillow，不需要桌面）；
 - **windows-latest 冒烟**：按 `requirements.txt` 真装依赖，再断言 `backend=windows`、
@@ -333,6 +333,11 @@ npm run check:deps -- --list   # 打印当前每条依赖的锁定区间
 审查点两条：上游是否已发新主版本（该不该跟进）；上界是否过紧导致**安全修复进不来**。
 `pywin32` 尤其注意：官方明确建议固定（任意一次 build 号增加都可能有接口破坏），所以它锁到下一个 build，
 每次官方发版都得显式决定要不要跟。
+
+> ⚠️ **预发布包的上界必须写「下一个预发布号」，不能写它的正式版本。** `winsdk>=1.0.0b10,<1.0.0` 看着合理，
+> 实际**装不上**：PEP 440 下 `<1.0.0` 会排除预发布版，于是把唯一可用的 `1.0.0b10` 也排除了。这个坑
+> 在 v0.2.17 真实踩过（Windows 上 `pip install` 直接失败，直到 v0.2.19 的 windows 冒烟 job 才发现）。
+> 现在 `check:deps` 有一项断言专门盯它。
 
 **发布**：推一个 `v*` tag → 构建+测试通过后自动 `npm pack` 出 `vision-<version>.tgz` 并创建 GitHub Release：
 
@@ -385,7 +390,7 @@ vision/                      # 仓库根 = 插件本体
     copy-client.mjs      #   把 src/client.js 拷到 lib/
     check-dsh-contract.mjs #  DSH 组合包/客户端契约自检（30 项，CI 跑）
     check-docs.mjs       #   文档一致性自检（14 项：版本号/阈值/目录/工具/路由/测试数/锚点，CI 跑）
-    check-deps.mjs       #   Python 依赖锁定自检（8 项：上下界/具体版本/重复/marker，CI 跑）
+    check-deps.mjs       #   Python 依赖锁定自检（9 项：上下界/具体版本/预发布上界/重复/marker，CI 跑）
   tsconfig.json          # TS 配置
   package.json           # 声明 dsh.bundle + dsh.client，files 含 lib/cvision/requirements.txt/CHANGELOG
   cordis.patch.yml       # bundle 的配置层，按包名引用

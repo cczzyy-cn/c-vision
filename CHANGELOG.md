@@ -14,6 +14,17 @@
 
 **给模型「可直接点击的坐标」+ 等到画面变化才截图 + 补上两处零覆盖的协议测试 + 修剪贴板破坏性竞态。**
 
+> 🐞 **修掉本版之前引入的一个真实回归**（`v0.2.17` 起，Windows 上装不上依赖）：
+> 那时我把 `winsdk` 从 `>=1.0.0b10` 收敛成 `>=1.0.0b10,<1.0.0`，写下「它是 beta 通道，上游已转向 winrt
+> 分包」——**上界本身是错的**。PEP 440 下 `<1.0.0` 这类区间会**排除预发布版**，于是上界把唯一可用的
+> `1.0.0b10` 也排除了，pip 直接报 `No matching distribution found for winsdk<1.0.0,>=1.0.0b10`。
+> 后果：**从 v0.2.17 到 v0.2.18，Windows 上 `python -m pip install -r requirements.txt` 一直是坏的**——
+> 而这条命令正是 v0.2.18 新加的体检提示让用户去跑的，等于指了一条走不通的路。
+> 修法：上界写成下一个预发布号 `>=1.0.0b10,<1.0.0b11`。已在隔离 venv 里真装验证（含 `winsdk-1.0.0b10`、
+> 探针 `ok:true`）。**发现它的正是本版新加的 windows-latest 冒烟 job——第一次跑就抓到了**；
+> 同时给 `check:deps` 加了第 9 项断言：预发布依赖的上界也必须带预发布标识（反向验证过会失败）。
+> 教训写进了 `requirements.txt` 的约定注释与 README，避免同一个坑再踩。
+
 - **`see(text=true)`：一次调用返回图片 + 可点击元素（含屏幕绝对坐标）**。这是本版最有价值的一项：
   过去要精确点击得先 `ocr` 拿词框，再由模型自己把「图片坐标」折成「屏幕坐标」——中间差了三层
   （`region` 裁剪偏移、窗口/多屏偏移、DPI 缩放），错一点就点偏。现在三层换算固定成代码：
@@ -58,7 +69,9 @@
   Python 73 → **163**（坐标 19 + 元素合并 14 + 差异 15 + 剪贴板竞态 4 + cli_server 16 + cli_input 21 + 既有增量）。
 - CI：新增 **windows-latest 冒烟 job**（此前 Windows 后端的关键路径在 CI 上从不执行）——
   按 `requirements.txt` 真装依赖，再断言 `backend=windows`、`backend_implemented`、
-  `platform_support=supported`、`ok=true`。
+  `platform_support=supported`、`ok=true`。**这个 job 第一次运行就抓到了上面那个 winsdk 回归**，
+  证明它值得存在：ubuntu/macOS 装不了 `pywin32`/`winsdk`，所以这类「只有 Windows 才暴露」的问题
+  以前没有任何自动化手段能发现。
 
 ## v0.2.18
 
