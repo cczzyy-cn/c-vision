@@ -100,6 +100,61 @@ class TestPrepareWindowForCapture(unittest.TestCase):
             win_backend._prepare_window_for_capture(1234, maximize=False)  # 不抛即为通过
 
 
+@unittest.skipIf(win_backend is None, f"仅 Windows 可跑：{_IMPORT_ERROR}")
+class TestShouldRestorePlacement(unittest.TestCase):
+    """**分屏被破坏**的根因回归测试（v0.2.23 修）。
+
+    真实缺陷：Windows 吸附（Snap）态下 `GetWindowPlacement` 的 `rcNormalPosition` 是**吸附之前**
+    的位置，而 `rect` 是吸附后的位置。旧代码在每次抓取后**无条件** `SetWindowPlacement`，于是把
+    吸附撤销 —— 用户的分屏被破坏。实测证据（监视器 0.2s 采样）：
+
+        see({"handle": 1117166}) 时
+        1117166: rect  [-7,0,1287,1399] -> [-12,63,1282,1462]
+                 rcNormal [-12,63,1282,1462]   ← 搬去的正是这个值
+
+    所以判据是：**只有我们真的改过窗口状态时才还原**。
+    """
+
+    def test_normal_window_is_not_restored(self):
+        """普通窗口：全程没碰状态 → 绝不能写回 placement（否则撤销用户的吸附/分屏）。"""
+        self.assertFalse(win_backend.should_restore_placement(maximize=False, was_iconic=False))
+
+    def test_maximize_is_restored(self):
+        """maximize=True：我们调过 SW_MAXIMIZE → 必须还原。"""
+        self.assertTrue(win_backend.should_restore_placement(maximize=True, was_iconic=False))
+
+    def test_iconic_is_restored(self):
+        """抓之前是最小化：我们调过 SW_RESTORE → 必须还原回最小化。"""
+        self.assertTrue(win_backend.should_restore_placement(maximize=False, was_iconic=True))
+
+    def test_iconic_and_maximize_is_restored(self):
+        self.assertTrue(win_backend.should_restore_placement(maximize=True, was_iconic=True))
+
+    def test_accepts_truthy_non_bool(self):
+        """win32 返回的是 int（BOOL），判据不能依赖严格 bool 类型。"""
+        self.assertTrue(win_backend.should_restore_placement(maximize=1, was_iconic=0))
+        self.assertFalse(win_backend.should_restore_placement(maximize=0, was_iconic=0))
+
+    def test_capture_window_does_not_save_placement_for_normal_window(self):
+        """端到端语义：普通窗口抓取时 `saved_placement` 必须是 None（=不会调用 SetWindowPlacement）。"""
+        from unittest import mock
+
+        with mock.patch.object(win_backend.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(win_backend, "_safe_get_placement") as get_placement, \
+             mock.patch.object(win_backend, "_restore_placement") as restore, \
+             mock.patch.object(win_backend, "_prepare_window_for_capture"), \
+             mock.patch.object(win_backend, "_wgc_backend_available", return_value=False), \
+             mock.patch.object(win_backend, "_is_gpu_composited_window", return_value=True), \
+             mock.patch.object(win_backend, "_ensure_foreground"), \
+             mock.patch.object(win_backend, "_safe_get_window_rect", return_value=(0, 0, 10, 10)), \
+             mock.patch.object(win_backend, "_grab_rect", return_value="IMG"):
+            win_backend.capture_window(handle=4321)
+
+        get_placement.assert_not_called()
+        restore.assert_called_once()
+        self.assertIsNone(restore.call_args[0][1], "普通窗口不该保存/写回 placement")
+
+
 # 说明：以上是**逻辑层**断言（假 win32）。「真机上最小化窗口确实会抢走前台」是**实测结论**，写进了
 # README 的「给 AI 智能体的使用提示」——它需要真窗口与真桌面，且会改变跑测试者当前的前台窗口，
 # 不适合放进 unittest 套件，所以这里刻意不留一个永远 skip 的占位用例冒充覆盖。

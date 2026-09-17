@@ -107,8 +107,31 @@ def _grab_rect(left: int, top: int, right: int, bottom: int) -> Image.Image:
     return ImageGrab.grab(bbox=(left, top, right, bottom))
 
 
+def should_restore_placement(maximize: bool, was_iconic: bool) -> bool:
+    """**只有我们真的改过窗口状态时**才需要写回 placement —— 纯函数，便于单测。
+
+    为什么必须加这道判断（真实缺陷，v0.2.23 修）：
+
+    Windows **吸附（Snap）** 态下，``GetWindowPlacement`` 返回的 ``rcNormalPosition`` 是
+    **吸附之前**的位置，而 ``rect`` 是吸附后的位置。于是：
+
+        rect      = (-7, 0, 1287, 1399)      ← 吸附后（贴左半屏）
+        rcNormal  = (-12, 63, 1282, 1462)    ← 吸附【之前】的位置
+
+    ``SetWindowPlacement(那份 placement)`` 会让 Windows 把窗口放回 ``rcNormalPosition``
+    ——**等于把吸附撤销、分屏被破坏**。而旧代码在每次抓取后都无条件调用它，即使我们
+    从头到尾没碰过窗口状态（普通窗口抓取是纯只读的）。
+
+    判据：
+      - ``maximize=True``：我们调过 ``ShowWindow(SW_MAXIMIZE)`` → 必须还原；
+      - ``was_iconic``（抓之前最小化）：我们调过 ``SW_RESTORE`` → 必须还原回最小化；
+      - 其余情况（普通窗口）：**什么都没碰，不要写回 placement**，否则会撤销用户的吸附。
+    """
+    return bool(maximize or was_iconic)
+
+
 def _safe_get_placement(hwnd: int):
-    """安全获取窗口的 WINDOWPLACEMENT（用于截图后还原）；失败返回 None。"""
+    """安全获取窗口的 WINDOWPLACEMENT（仅在需要还原时使用）；失败返回 None。"""
     try:
         return win32gui.GetWindowPlacement(hwnd)
     except Exception:
@@ -116,7 +139,11 @@ def _safe_get_placement(hwnd: int):
 
 
 def _restore_placement(hwnd: int, placement) -> None:
-    """把窗口恢复为截图前的放置状态（位置/尺寸/showCmd）。"""
+    """把窗口恢复为截图前的放置状态（位置/尺寸/showCmd）。
+
+    ⚠️ 调用方必须先经 :func:`should_restore_placement` 判断——对**没被我们改过状态**的窗口
+    写回 placement，会把 Windows 的吸附态一并撤销（见该函数文档）。
+    """
     if placement is None:
         return
     try:
@@ -377,7 +404,14 @@ def capture_window(
             raise LookupError(f"未找到标题含 {title_substr!r} 的窗口")
         handle = win.handle
 
-    saved_placement = _safe_get_placement(handle)
+    # 先记录「我们是否将要改动窗口状态」：只有这两种情况才需要事后还原。
+    # ⚠️ 普通窗口抓取是纯只读的，**绝不能**无条件写回 placement —— 那会撤销用户的吸附/分屏
+    # （Windows 吸附态下 rcNormalPosition 是吸附前的位置，写回它等于取消吸附）。
+    try:
+        was_iconic = bool(win32gui.IsIconic(handle))
+    except Exception:
+        was_iconic = False
+    saved_placement = _safe_get_placement(handle) if should_restore_placement(maximize, was_iconic) else None
 
     # 跟踪：在任何可能改动窗口的内部动作**之前**先取一次快照，随后按阶段对比。
     # 未开启跟踪时 snapshot() 直接返回 None，这里退化为零开销。
@@ -425,6 +459,8 @@ def capture_window(
         _tr_outcome = "exception"
         raise
     finally:
+        # saved_placement 只在「我们确实改过窗口状态」时才非 None（见 should_restore_placement）：
+        # 普通窗口抓取时它是 None，_restore_placement 直接返回 —— 不会去撤销用户的吸附/分屏。
         _restore_placement(handle, saved_placement)
         if _tr is not None:
             _trace_capture(handle, _tr_backend, _tr_outcome, _tr, _trace_snapshot(handle))

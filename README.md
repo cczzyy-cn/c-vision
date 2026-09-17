@@ -10,7 +10,7 @@ Python 版 cvision** 截屏/OCR/输入 → 写入 Harness 附件服务（`ctx.at
 
 同一个包还带一个**浏览器半边**：输入框工具栏的「截图」按钮（人工一键抓屏，或把剪贴板里的图片作为附件）。
 
-**版本**：`0.2.22` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
+**版本**：`0.2.23` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
 **许可**：BSD-3-Clause · 变更历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 目录
@@ -301,7 +301,7 @@ npm run check:deps   # Python 依赖锁定自检（9 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
-当前规模：**JS 68 条 + Python 182 条**。
+当前规模：**JS 68 条 + Python 188 条**。
 
 ### 文档约定（自动校验）
 

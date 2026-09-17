@@ -10,6 +10,47 @@
 > - `v0.1.0` ~ `v0.1.9` 的说明只在 [GitHub Releases](https://github.com/cczzyy-cn/c-vision/releases) 里
 >   （那时还没有本文件）。
 
+## v0.2.23
+
+**修一个真实缺陷：抓图会撤销 Windows 的吸附（Snap），把用户的分屏搞坏。**
+
+现象（用户报告）：把两个 Chrome 标签左右分屏后，调用 `see({"handle": …})` 会**同时改变窗口大小和位置**，分屏被破坏。
+
+根因（用监视器以 0.2 秒采样抓到确证）：
+
+```
+Windows 吸附态下 —— GetWindowPlacement 返回的是：
+    rect      = (-7, 0, 1287, 1399)      ← 吸附【之后】的位置（贴左半屏）
+    rcNormal  = (-12, 63, 1282, 1462)    ← 吸附【之前】的位置
+
+capture_window 的 finally 里无条件 _restore_placement()
+  → SetWindowPlacement(那份 placement)
+  → Windows 把窗口放回 rcNormalPosition
+  → 【吸附被撤销，分屏破坏】
+```
+
+监视器抓到的现场：`see({"handle": 1117166})` 那一刻，
+`rect [-7,0,1287,1399] -> [-12,63,1282,1462]` —— **搬去的位置恰好等于调用前保存的 `rcNormal`**。
+
+- 修法：新增纯函数 `should_restore_placement(maximize, was_iconic)`，**只有我们真的改过窗口状态时才还原**：
+  `maximize=True`（调过 `SW_MAXIMIZE`）或抓之前是最小化（调过 `SW_RESTORE`）。
+  **普通窗口抓取是纯只读的，不再写回 placement** —— 因而不会撤销用户的吸附/分屏。
+  `saved_placement` 在不必要时直接为 `None`，`_restore_placement` 空转返回。
+- 实测验证（真实吸附态、必须带错配 `rect != rcNormal`）：
+  修复**前** → 窗口被搬到 `rcNormal`、吸附丢失；修复**后** → `rect` 与 `rcNormal` 逐字未变、吸附保住。
+- 新增 `tests/test_capture_foreground.py` 6 条：`normal 不还原 / maximize 还原 / iconic 还原 /
+  truthy int（win32 返回 BOOL）/ 端到端不调用 SetWindowPlacement`。Python 182 → **188**。
+
+**排查过程中两个必须记录的坑（都不是代码问题，却让我长时间误判）：**
+
+1. **常驻 `cli_server` 会缓存旧代码**。宿主复用一个长驻 Python 进程，它把 `windows.py` 加载进内存后
+   **不会重读文件**。我改完代码后连续多轮"重测"，实际跑的一直是**修复前的模块**——所以修复看起来
+   "无效"，而我在文件里插的探针也从不触发。**杀掉那个陈旧进程**、让宿主拉起新 server 之后，修复立即生效。
+   这一条值得写进开发文档：**改了 Python 侧代码后，必须重启宿主（或杀掉 cli_server）才生效。**
+2. **测量必须在同一个瞬间**。我此前的"前后测量"是两个不同进程、隔着工具往返时间做的事——而窗口
+   早已在 `finally` 里被还原过了，所以我一直看到"未变"。只有把采样放进插件内部 / 用 0.2 秒的外部
+   监视器，才抓到那一刻。
+
 ## v0.2.22
 
 **新增窗口跟踪诊断：用插件内部的证据回答「抓图到底有没有挪动窗口」，取代外部反复试探。**
