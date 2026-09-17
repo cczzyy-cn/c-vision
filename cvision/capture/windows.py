@@ -23,6 +23,10 @@ from cvision.detect import (
     is_blank_image as _is_blank_image,
     looks_like_gpu_class as _looks_like_gpu_class,
 )
+# 窗口跟踪诊断（默认关闭、零开销；开启后能确定「哪一步动了窗口」，见 cvision/diagnose.py）
+from cvision.diagnose import snapshot as _trace_snapshot
+from cvision.diagnose import trace_capture as _trace_capture
+from cvision.diagnose import trace_step as _trace_step
 
 # PrintWindow 的 PW_RENDERFULLCONTENT（Win 8.1+），可捕获前台之外窗口内容
 _PW_RENDERFULLCONTENT = 2
@@ -375,6 +379,12 @@ def capture_window(
 
     saved_placement = _safe_get_placement(handle)
 
+    # 跟踪：在任何可能改动窗口的内部动作**之前**先取一次快照，随后按阶段对比。
+    # 未开启跟踪时 snapshot() 直接返回 None，这里退化为零开销。
+    _tr = _trace_snapshot(handle)
+    _tr_backend = "none"
+    _tr_outcome = "exception"
+
     def _grab_region() -> Image.Image:
         _ensure_foreground(handle)
         rect = _safe_get_window_rect(handle)
@@ -384,24 +394,40 @@ def capture_window(
 
     try:
         _prepare_window_for_capture(handle, maximize=maximize)
+        if _tr is not None:
+            _tr = _trace_step(handle, "prepare(maximize=%s)" % maximize, _tr) or _tr
 
         if _wgc_backend_available():
             wgc_img = capture_window_wgc(handle)
+            if _tr is not None:
+                _tr = _trace_step(handle, "wgc", _tr) or _tr
             # WGC 对某些合成/工具窗口会返回"纯黑空帧"（如微信的 Qt 工具窗），
             # 不能仅凭非 None 就信任；空白帧要回退到 PrintWindow/桌面区域抓取。
             if wgc_img is not None and not _is_blank_image(wgc_img):
+                _tr_backend, _tr_outcome = "wgc", "ok"
                 return wgc_img
+            _tr_backend = "wgc-blank"
 
         if _is_gpu_composited_window(handle):
+            _tr_backend, _tr_outcome = "grab_region(gpu)", "ok"
             return _grab_region()
 
         img = _print_window(handle)
+        if _tr is not None:
+            _tr = _trace_step(handle, "printwindow", _tr) or _tr
         if img is not None and not _is_blank_image(img):
+            _tr_backend, _tr_outcome = "printwindow", "ok"
             return img
 
+        _tr_backend, _tr_outcome = "grab_region(fallback)", "ok"
         return _grab_region()
+    except BaseException:
+        _tr_outcome = "exception"
+        raise
     finally:
         _restore_placement(handle, saved_placement)
+        if _tr is not None:
+            _trace_capture(handle, _tr_backend, _tr_outcome, _tr, _trace_snapshot(handle))
 
 
 def capture_screen() -> Image.Image:

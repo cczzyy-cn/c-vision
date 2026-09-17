@@ -10,7 +10,7 @@ Python 版 cvision** 截屏/OCR/输入 → 写入 Harness 附件服务（`ctx.at
 
 同一个包还带一个**浏览器半边**：输入框工具栏的「截图」按钮（人工一键抓屏，或把剪贴板里的图片作为附件）。
 
-**版本**：`0.2.21` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
+**版本**：`0.2.22` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
 **许可**：BSD-3-Clause · 变更历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 目录
@@ -301,7 +301,7 @@ npm run check:deps   # Python 依赖锁定自检（9 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
-当前规模：**JS 68 条 + Python 168 条**。
+当前规模：**JS 68 条 + Python 182 条**。
 
 ### 文档约定（自动校验）
 
@@ -419,6 +419,7 @@ vision/                      # 仓库根 = 插件本体
     coordinates.py       #   图片像素 → 屏幕绝对坐标（裁剪/窗口/多屏/DPI 四层换算）
     ui_elements.py       #   词框合并成可点击元素（同行相邻词合并 + padding + 屏幕坐标）
     diff.py              #   帧间差异度量（灰度缩略图 + 变化占比 + 变化区域），供 wait_until_changed
+    diagnose.py          #   窗口跟踪诊断（默认关闭、零开销）：定位「抓图是否挪动了窗口」
     encoding.py          #   PIL -> data URL；crop_region；fit_for_attachment（附件缩图）
     screen.py            #   显示器/DPI 布局（Windows/macOS；Linux 回退 PIL 单屏）
     status.py            #   运行环境探针（平台后端/OCR/依赖/能力清单）
@@ -438,6 +439,7 @@ vision/                      # 仓库根 = 插件本体
     test_diff.py          #   帧间差异（相同/微变/实变/尺寸变化 + 阈值边界）
     test_clipboard_race.py #  剪贴板竞态回归（用户占用期间复制的内容绝不被覆盖）
     test_capture_foreground.py #  抓图前的窗口准备：普通窗口不碰前台/最小化窗口会被置前
+    test_diagnose.py      #   窗口跟踪诊断（改动字段判定 / 开关 / 关闭时不写文件 / 写失败不抛）
     test_snip.py          #   系统截图 CLI 的 JSON 契约
     test_snip_windows.py  #   取消识别（假时钟/覆盖层/剪贴板：取消立即返回、晚到图片不算本次）
     test_clipboard.py     #   剪贴板模块与 CLI 契约（平台分支 / empty / unsupported / error）
@@ -460,6 +462,7 @@ vision/                      # 仓库根 = 插件本体
 | 取消了截图，之后别的截图却进了附件栏 | v0.2.13 起修复（覆盖层判据）；若先前的旧版本仍在跑，重启宿主 |
 | 工具报 `python` 找不到 / 依赖缺失 | 装 Python 3.10+ 与 `python -m pip install -r requirements.txt`；**v0.2.18 起首次调用会直接给出带绝对路径的安装命令**；`cvision_status()` 会列出缺哪个模块 |
 | 抓窗口是黑图/空白 | 未装 `winsdk` 时 WGC 不可用，会回退 `PrintWindow`／桌面区域；装 `winsdk` 后最准（微信等 Qt 窗口属已知空白帧场景） |
+| **抓图后窗口位置/大小变了**（如分屏被破坏） | 用内置**窗口跟踪诊断**取证，别猜：`$env:CVISION_TRACE_WINDOWS='1'; $env:CVISION_TRACE_FILE='C:\Temp\cv-trace.jsonl'` → 复现一次 → `python -m cvision.diagnose`。日志按阶段（`prepare`/`wgc`/`printwindow`/`grab_region`）记录 `rect`/`showCmd`/`zoomed`/`iconic`/`foreground` 的前后值，能区分「抓取过程中动的」与「抓取前后被别的因素动的」。默认关闭、零开销 |
 | 中文窗口标题匹配不上 | v0.2.2 起所有 Python 子进程强制 UTF-8；若自行调用 Python，请一并设 `PYTHONUTF8=1` |
 | 升级后行为没变 | 见[升级后必须做什么](#升级后必须做什么)：客户端半边要**硬刷新**，宿主半边要**重启** |
 | `plugin add` 报 `ERR_PNPM_EPERM … rename '…vision_tmp_…' -> '…vision'` | 安装目录被占用（≤0.2.15 的插件 Python 子进程以它为 cwd）。**先关 DSH** 再装；0.2.16 起不会再有此问题（cwd 已改为系统临时目录） |
