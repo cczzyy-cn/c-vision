@@ -6,7 +6,8 @@
  * 附件服务（`ctx.attachments.saveImage`）并以 `image` ContentBlock 返回。
  *
  * v0.2.0 增强：
- *   - OCR 返回词级边界框（`words`，用于 computer-use 精确定位点击点）。
+ *   - OCR 返回词级边界框（`words`）——**供读取词级文字**；定位点击请用 `see(text=true)` 的
+ *     `screen_center`（屏幕绝对坐标），不要拿 `words` 的图片坐标自己折算（v0.2.19 起）。
  *   - 新增 `screen_info`（显示器/DPI 布局）与 `cvision_status`（运行环境健康）。
  *   - computer-use 补全：`drag`、`scroll` 支持水平、`get_clipboard`/`set_clipboard`、
  *     `see(ocr:true)` 一次返回图片+文本、`wait_for_window`。
@@ -988,10 +989,15 @@ export function apply(ctx: Context): void {
         '截取整个屏幕或某个窗口，并把截图以图片形式返回，让模型直接查看画面内容（描述、识别截图文字、读取图表/文档）。' +
         '用 window 指定窗口标题子串（如 "Visual Studio Code"），或用 handle 传入 list_windows 给出的精确句柄（更可靠，避免标题撞车）；留空则截全屏。' +
         '默认尽量别传 maximize=true：非最小化窗口会直接抓到其真实内容，且不切换前台、不抢焦点。' +
+        '⚠️ 但「不抢前台」只对**普通窗口**成立：目标**处于最小化**时，抓取会先把它还原、因而**会抢走前台**' +
+        '（抓完几何会还原成最小化，但前台已经变了）；兜底抓取路径（WGC 与 PrintWindow 都失败、改读合成桌面区域）' +
+        '同样会置前。所以不要假设抓完前台没变——尤其在用户正在别处打字时。' +
         '仅当窗口已最小化/太小/被遮挡看不清时才用 maximize=true（截图后会自动还原原状态）。' +
         '传 ocr=true 可在返回图片的同时附带 OCR 文本/词框（省去一次 ocr 调用）。' +
         '传 text=true 会额外返回「可点击元素」列表（每个带 text + screen_center 屏幕绝对坐标，可直接传给 click）——' +
-        '要点击界面上某个按钮/输入框时用这个，**不要**自己从截图里估算像素：截图内坐标与屏幕坐标之间存在裁剪、窗口位置、多屏与 DPI 缩放差异，已由本工具换算好。',
+        '要点击界面上某个按钮/输入框时用这个，**不要**自己从截图里估算像素：截图内坐标与屏幕坐标之间存在裁剪、窗口位置、多屏与 DPI 缩放差异，已由本工具换算好。' +
+        '⚠️ 还有一点：坐标本身是对的，但点击按屏幕坐标下发、只会命中**前台窗口**——若目标窗口不在前台，' +
+        '或与别的窗口**重叠**，请先 focus_window 把它置前再点，否则会点到压在上面的那个窗口上。',
       parameters: {
         window: { type: 'string', description: '窗口标题子串（忽略大小写）；留空则截整屏' },
         handle: { type: 'integer', description: '窗口句柄（来自 list_windows），比 window 更精确；与 window 二选一，优先 handle' },
@@ -1166,7 +1172,10 @@ export function apply(ctx: Context): void {
     defineTool({
       name: 'ocr',
       description:
-        '截取屏幕/窗口（可 region/delay），用 OCR 识别其中的文字并**返回文本**（含词级边界框 words，供 computer-use 精确定位点击）。' +
+        '截取屏幕/窗口（可 region/delay），用 OCR 识别其中的文字并**返回文本**（含词级边界框 words）。' +
+        '⚠️ `words` 是**图片坐标**，**不要**用它来算点击位置——那需要叠加裁剪/窗口/多屏/DPI 四层偏移，极易算错；' +
+        '要点击请用 `see(text=true)`，它给的 `screen_center` 已经是屏幕绝对坐标、且把同行相邻词合并成了控件。' +
+        '`ocr` 的用途是**取文字**（读内容、取词级粒度），不是定位。' +
         '参数同 see（window/title/maximize/region/delay）。',
       parameters: {
         window: { type: 'string', description: '窗口标题子串；留空则对整屏 OCR' },
