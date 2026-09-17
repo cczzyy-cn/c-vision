@@ -10,7 +10,7 @@ Python 版 cvision** 截屏/OCR/输入 → 写入 Harness 附件服务（`ctx.at
 
 同一个包还带一个**浏览器半边**：输入框工具栏的「截图」按钮（人工一键抓屏，或把剪贴板里的图片作为附件）。
 
-**版本**：`0.2.19` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
+**版本**：`0.2.20` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
 **许可**：BSD-3-Clause · 变更历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 目录
@@ -189,18 +189,28 @@ GET /cvision/model-capability?provider=<id>&model=<id>
 
 - **默认不要传 `maximize=true`**：WGC 抓的是窗口**自身的合成内容**，跟是否前台、是否被遮挡**无关**。
 - **不要为了截图去激活/切换前台窗口**：WGC 路径**不抢焦点、不切走你正在用的窗口**。
+- ⚠️ **但「不抢前台」只对普通窗口成立**。实测（Windows，非最小化）：目标无论在前台还是**背景**，
+  抓取都**不改几何、不抢前台**；而目标**处于最小化**时，「先还原再抓」那条路径**会把它置前、抢走前台**
+  （抓完几何会还原回最小化，但前台已经变了）。**所以不要假设抓完前台没变**——尤其在用户正在别处打字时。
+  兜底路径（WGC 与 PrintWindow 都失败、改用读合成桌面区域）同样会置前。
 - **什么情况才用 `maximize=true`**：仅当窗口已**最小化**、或**太小**、或被完全挡住且内容读不出来时。插件
   抓完会**自动还原**窗口原状态（`GetWindowPlacement` / `SetWindowPlacement` 成对使用）。
 - **`focus_window` 只置前**：它不会改窗口尺寸/最大化状态（v0.2.7 起）。只有真的需要键盘焦点时才调用。
 - **推荐流程**：先 `list_windows()` → 直接 `see(handle=<句柄>)`（标题会变时优先 `handle`）；整屏用 `see()`。
+- **要点击就用 `see(text=true)`**：它返回的 `screen_center` 是**屏幕绝对坐标**，可直接喂给 `click`。
+  **不要自己从截图估算像素**——裁剪、窗口位置、多屏、DPI 四层差异都由插件换算好了。
+- ⚠️ **被遮挡的窗口点不到**：`screen_center` 是按屏幕坐标算的，但点击会被**前台窗口**接住。若目标窗口
+  不是前台（或多窗口**重叠**），先 `focus_window` 把它置前再点，否则会点到压在上面的那个窗口上。
 
 ## 电脑使用（computer-use）推荐流程
 
 把「看 → 操作 → 看」写成可复用的循环：
 
-1. **观察**：`list_windows()` 找目标窗口；或 `see(window="<标题>")` 看清内容。
-2. **定位**：从截图（或 `ocr` 的词框）读出目标的**屏幕绝对坐标 (x, y)**。
-3. **操作**：`focus_window`（仅需要键盘焦点时）→ `click(x,y)` / `double_click` / `type_text` / `press_key` / `scroll`。
+1. **观察**：`list_windows()` 找目标窗口；或 `see(window="<标题>")` / `see(handle=<句柄>)` 看清内容。
+2. **定位**：用 **`see(text=true)`** 拿到可点击元素的 `screen_center`（屏幕绝对坐标），直接用于点击。
+   > 两步旧做法（`ocr` 取词框 → 自己把图片坐标折算成屏幕坐标）已不推荐：那段换算正是最容易错的地方，
+   > 现已由插件承担。只有需要**词级**粒度（而非合并后的控件）时才用 `ocr`。
+3. **操作**：`focus_window`（仅需要键盘焦点、或要点被遮挡窗口时）→ `click(x,y)` / `double_click` / `type_text` / `press_key` / `scroll`。
 4. **确认**：再 `see` 看结果；不对就回到 2/3 重试，直到目标达成。
 
 ```text
@@ -208,6 +218,7 @@ focus_window("Google Chrome") → press_key("ctrl+l") → type_text("https://…
 ```
 
 > ⚠️ 操作会**真实移动/点击/输入**到你的鼠标键盘；务必先 `see` 确认坐标再操作，避免误触。
+> 坐标是「抓取那一刻」的快照——拿到后请**尽快点击**，中间别插其它会改变画面的操作。
 
 ## 多平台支持
 
@@ -290,7 +301,7 @@ npm run check:deps   # Python 依赖锁定自检（9 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
-当前规模：**JS 68 条 + Python 163 条**。
+当前规模：**JS 68 条 + Python 168 条**。
 
 ### 文档约定（自动校验）
 
@@ -426,6 +437,7 @@ vision/                      # 仓库根 = 插件本体
     test_ui_elements.py   #   词框合并成可点击元素（同行相邻合并/间距切分/坐标换算）
     test_diff.py          #   帧间差异（相同/微变/实变/尺寸变化 + 阈值边界）
     test_clipboard_race.py #  剪贴板竞态回归（用户占用期间复制的内容绝不被覆盖）
+    test_capture_foreground.py #  抓图前的窗口准备：普通窗口不碰前台/最小化窗口会被置前
     test_snip.py          #   系统截图 CLI 的 JSON 契约
     test_snip_windows.py  #   取消识别（假时钟/覆盖层/剪贴板：取消立即返回、晚到图片不算本次）
     test_clipboard.py     #   剪贴板模块与 CLI 契约（平台分支 / empty / unsupported / error）
@@ -511,6 +523,11 @@ vision/                      # 仓库根 = 插件本体
 
 - 包内 Python `cvision` 缺失或 `requirements.txt` 依赖未安装 → `see`/`ocr`/`click` 等工具报错或禁用。
 - 系统级屏幕捕获/权限被拒、被遮挡窗口、无窗口 → 对应工具返回失败（不影响宿主主流程）。
+- **抓取最小化窗口会置前并抢走前台**（几何抓完会还原回最小化，但前台已经被它拿走）；兜底路径
+  （WGC 与 PrintWindow 都失败、改读合成桌面区域）同样会置前。普通窗口（前台或背景）则不改几何、
+  不抢前台。口径与实测值见[给 AI 智能体的使用提示](#给-ai-智能体的使用提示重要)。
+- **被遮挡/重叠窗口的控件点不到**：`see(text=true)` 给的 `screen_center` 坐标本身正确，但点击按屏幕
+  坐标下发、只会命中前台窗口。需先 `focus_window` 让目标在前。
 - 系统截图被用户取消 → 返回 204，客户端静默、不插入任何附件（v0.2.13 起不再把晚到的剪贴板图片当成本次结果）。
 - 剪贴板图片在未支持平台（Linux Phase 2）→ 返回 501，客户端按钮不监视也不提示（功能不报错）。
 - 跨平台支持不完整（macOS/Linux 为 Phase 1/2），在未支持平台上报错的边界由各工具显式给出。
