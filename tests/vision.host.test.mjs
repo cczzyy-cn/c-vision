@@ -14,14 +14,13 @@ import test, { mock } from 'node:test'
 /** 让出一个宏任务：用于推进被 await 的处理器（如「截图进行中」的时序用例）。 */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
 
-const { apply, snipExecutor, clipboardProbe, describeRuntimeProblem, PIP_HINT, ensureRuntime } = await import(
-  '../lib/index.js'
-)
+const { apply, snipExecutor, clipboardProbe, describeRuntimeProblem, PIP_HINT, ensureRuntime, waitChangedMeta } =
+  await import('../lib/index.js')
 
-/** 捕获 apply 注册的路由与工具的数。 */
+/** 捕获 apply 注册的路由与工具定义。 */
 function mountHost(resolveModelInfo = async () => ({ inputModalities: ['text'] })) {
   const routes = []
-  let tools = 0
+  const definitions = []
   const webServer = { register: (route) => { routes.push(route); return () => {} } }
   const hostScope = {
     effect: (factory) => {
@@ -34,14 +33,20 @@ function mountHost(resolveModelInfo = async () => ({ inputModalities: ['text'] }
     effect: (factory) => {
       factory()
     },
-    tools: { register: () => { tools += 1 } },
+    tools: { register: (definition) => { definitions.push(definition) } },
     inject: (deps, callback) => {
       // 两条路由的依赖都从同一个 webServer 作用域来：能力路由要 webServer+llm，截图路由只要 webServer。
       if (deps.includes('webServer')) callback(hostScope)
     },
   }
   apply(ctx)
-  return { routes, tools, route: (path) => routes.find((entry) => entry.path === path) }
+  return {
+    routes,
+    definitions,
+    tool: (name) => definitions.find((definition) => definition.name === name),
+    tools: definitions.length,
+    route: (path) => routes.find((entry) => entry.path === path),
+  }
 }
 
 /** 最小 ServerResponse 替身。 */
@@ -558,5 +563,61 @@ test('体检门：真实环境下 ensureRuntime 放行（本机依赖齐全）',
     await ensureRuntime({ signal: AbortSignal.timeout(20000) })
   } catch (error) {
     assert.match(String(error.message), /pip install|cvision_status|Python 3\.10\+/)
+  }
+})
+
+// ── wait_until_changed：返回值必须能通过它自己声明的 output.schema ────────────
+//
+// 背景（v0.2.23 的真实故障）：DSH 会拿工具声明的 `output.schema` 校验返回值，而这份 schema 写的是
+// `additionalProperties: false`。Python 侧每次都多给 `width`/`height`，于是**每一次**
+// `wait_until_changed` 都以 `tool "wait_until_changed" returned invalid output` 失败；
+// 当时的用例只驱动 HTTP 路由，没人把「真正返回的键」和「声明过的键」放在一起比过。
+//
+// 所以下面两条不测「功能」，只钉死这条不变量：**返回值 ⊆ 声明的键，且不为 null**。
+
+/** Python 侧 `wait_changed` 的真实返回形状（`cli_server` 与 `cli_capture` 两条路径一致）。 */
+const WAIT_CHANGED_PAYLOAD = {
+  ok: true,
+  kind: 'wait_changed',
+  data_url: PNG_DATA_URL,
+  width: 900,
+  height: 220,
+  changed: true,
+  samples: 3,
+  elapsed_ms: 812,
+  diff_ratio: 0.031,
+  mean_diff: 12.5,
+  diff_bbox: { x: 10, y: 20, w: 30, h: 40 },
+}
+
+/** `wait_until_changed` 声明的可返回键（`ref` 由 execute 另加，不由整形函数产出）。 */
+function declaredWaitChangedKeys() {
+  const tool = mountHost().tool('wait_until_changed')
+  assert.ok(tool, 'wait_until_changed 必须注册')
+  assert.equal(tool.output.schema.additionalProperties, false, '这条不变量只在 additionalProperties:false 下才有意义')
+  return Object.keys(tool.output.schema.properties).filter((key) => key !== 'ref').sort()
+}
+
+test('wait_until_changed：返回值就是 schema 声明的那套键（多一个键 = 整次调用失败）', () => {
+  const declared = declaredWaitChangedKeys()
+  const meta = waitChangedMeta({ ...WAIT_CHANGED_PAYLOAD })
+  assert.deepEqual(Object.keys(meta).sort(), declared)
+  // `additionalProperties: false` 下多键会致命：这里单独再钉一次，失败信息才看得懂。
+  for (const key of Object.keys(meta)) {
+    assert.ok(declared.includes(key), `返回了 schema 未声明的键 ${key} —— DSH 会判定 invalid output`)
+  }
+  // width/height 是 Python 侧**每次都给**的，正是 v0.2.23 漏声明的那两个。
+  assert.equal(meta.width, 900)
+  assert.equal(meta.height, 220)
+})
+
+test('wait_until_changed：未变化时 diff_bbox=null 必须被丢掉（schema 声明的是 object）', () => {
+  const declared = declaredWaitChangedKeys()
+  const meta = waitChangedMeta({ ...WAIT_CHANGED_PAYLOAD, changed: false, diff_ratio: 0, mean_diff: 0, diff_bbox: null })
+  assert.ok(!('diff_bbox' in meta), 'null 不能原样进返回值：schema 写的是 type: object')
+  assert.equal(meta.changed, false)
+  for (const [key, value] of Object.entries(meta)) {
+    assert.notEqual(value, null, `${key} 不应为 null`)
+    assert.ok(declared.includes(key), `${key} 必须在 schema 里声明`)
   }
 })

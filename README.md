@@ -10,7 +10,7 @@ Python 版 cvision** 截屏/OCR/输入 → 写入 Harness 附件服务（`ctx.at
 
 同一个包还带一个**浏览器半边**：输入框工具栏的「截图」按钮（人工一键抓屏，或把剪贴板里的图片作为附件）。
 
-**版本**：`0.2.23` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
+**版本**：`0.2.24` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
 **许可**：BSD-3-Clause · 变更历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 目录
@@ -80,7 +80,7 @@ python -m pip install -r <插件安装目录>\requirements.txt
 | `screen_info()` | 列出显示器/DPI 布局（`x/y/width/height/primary/scale`），高 DPI 折算坐标用 |
 | `cvision_status()` | 运行环境健康探针（Python 版本、平台后端、OCR 引擎、依赖/后端是否可用、`platform_support` 三态、本平台能力清单） |
 | `wait_for_window(title?, timeout?)` | 轮询等某个窗口出现（默认 500ms/次，10s 超时） |
-| `wait_until_changed(window?, handle?, region?, interval?, timeout?, threshold?, format?)` | 轮询截图，**直到画面真的变了**才把那一帧返回（等进度条/等弹窗）。返回 `changed`/`diff_ratio`/`diff_bbox`；默认阈值 0.01 |
+| `wait_until_changed(window?, handle?, region?, interval?, timeout?, threshold?, format?)` | 轮询截图，**直到画面真的变了**才把那一帧返回（等进度条/等弹窗）。返回 `changed`/`diff_ratio`/`diff_bbox`/`width`/`height`（未变化时没有 `diff_bbox`）；默认阈值 0.01 |
 
 ### 点击定位：`see(text=true)`
 
@@ -301,7 +301,7 @@ npm run check:deps   # Python 依赖锁定自检（9 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
-当前规模：**JS 68 条 + Python 188 条**。
+当前规模：**JS 70 条 + Python 188 条**。
 
 ### 文档约定（自动校验）
 

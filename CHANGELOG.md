@@ -10,6 +10,35 @@
 > - `v0.1.0` ~ `v0.1.9` 的说明只在 [GitHub Releases](https://github.com/cczzyy-cn/c-vision/releases) 里
 >   （那时还没有本文件）。
 
+## v0.2.24
+
+**修一个真实缺陷：`wait_until_changed` 每一次调用都必然失败——返回值里带着 schema 没声明的键。**
+
+现象：调用 `wait_until_changed` 直接被宿主判为非法输出。
+
+```text
+tool "wait_until_changed" returned invalid output: "value.diff_bbox" must be an object;
+"value.width" is not a declared property (additionalProperties: false);
+"value.height" is not a declared property (additionalProperties: false)
+```
+
+根因：DSH 会拿工具自己声明的 `output.schema` **校验返回值**，而这份 schema 写的是
+`additionalProperties: false`——多一个没声明的键不会「被忽略」，而是让整次调用失败：
+
+- Python 侧（`cli_capture --wait-changed` 与 `cli_server` 的 `wait_changed`）**每次都**返回
+  `width`/`height`，宿主 schema 里却没声明它们；
+- 未变化时 Python 给 `diff_bbox: None`，而 schema 声明的是 `type: 'object'`，null 同样非法。
+
+所以这个工具不是「偶尔失败」，而是**从来没能成功过一次**。旧版 DSH 不校验工具输出，因此一直没暴露；
+升级到会校验的版本（本机 0.1.7-alpha.1）后立刻显形。
+
+- 修法：新增纯函数 `waitChangedMeta(payload)` 做显式整形（只保留 `WAIT_CHANGED_KEYS` 声明过的键 +
+  丢掉 null），server 与 CLI 两条路径共用；schema 补上 `width`/`height`。`render` 本来就把缺失的
+  box 当作「没有变化区域」，丢掉 null 语义不变。
+- 新增 JS 回归 2 条（68 → **70**）：**返回键必须与声明的 schema 逐字一致**、**null 必须被丢掉**。
+  它们钉的是不变量而不是功能：原有 68 条用例只驱动 HTTP 路由，没人把「真正返回的键」和「声明过的键」
+  放在一起比过，所以 CI 全绿也没拦住这个「必然失败」。
+
 ## v0.2.23
 
 **修一个真实缺陷：抓图会撤销 Windows 的吸附（Snap），把用户的分屏搞坏。**
