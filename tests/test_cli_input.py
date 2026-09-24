@@ -215,14 +215,21 @@ class TestFrontGuard(unittest.TestCase):
     def test_ensure_front_passes_coordinates_through(self):
         rec = Recorder(returns={"ensure_front": dict(self.MATCHING)})
         code, out = run_cli(["--ensure-front", "4242", "--at", "10", "20"], rec)
-        self.assertEqual(rec.calls[0], ("ensure_front", (4242, (10, 20)), {}))
+        self.assertEqual(rec.calls[0], ("ensure_front", (4242, (10, 20)), {"unblock": False}))
         self.assertTrue(json.loads(out)["ok"])
+        self.assertEqual(code, 0)
+
+    def test_ensure_front_can_request_unblock(self):
+        """``--unblock`` 要能一路传到 input 层——它是「目标被盖住时点标题栏把它带到最前」的开关。"""
+        rec = Recorder(returns={"ensure_front": dict(self.MATCHING)})
+        code, out = run_cli(["--ensure-front", "4242", "--at", "10", "20", "--unblock"], rec)
+        self.assertEqual(rec.calls[0], ("ensure_front", (4242, (10, 20)), {"unblock": True}))
         self.assertEqual(code, 0)
 
     def test_ensure_front_without_at_checks_front_only(self):
         rec = Recorder(returns={"ensure_front": {"handle": 7, "stale": False, "focused": True, "match": False}})
         code, out = run_cli(["--ensure-front", "7"], rec)
-        self.assertEqual(rec.calls[0], ("ensure_front", (7, None), {}))
+        self.assertEqual(rec.calls[0], ("ensure_front", (7, None), {"unblock": False}))
         self.assertTrue(json.loads(out)["ok"], "没给坐标时只看是否置前成功")
         self.assertEqual(code, 0)
 
@@ -257,6 +264,60 @@ class TestFrontGuard(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertNotEqual(code, 0)
         self.assertIn("前台锁定", payload["error"])
+
+
+class TestFrontError(unittest.TestCase):
+    """失败原因的**分类**：说清到底是「没激活」「坐标不在窗口内」还是「被谁挡住了」。
+
+    为什么值得单独钉：旧实现把所有情况都写成「置前未生效」，而实测目标被盖住时**置前其实成功了**
+    （前台确实切换了），做不到的是提升层叠顺序。那句措辞会把调用方引向重试 ``focus_window``——
+    一条同样无效的路。分类正确才谈得上「给出可执行的下一步」。
+    """
+
+    def _msg(self, info, at=(10, 20)):
+        return cli_input._front_error(info, list(at) if at else None)
+
+    def test_stale_window(self):
+        self.assertIn("已不存在", self._msg({"handle": 9, "stale": True}))
+
+    def test_coordinate_outside_target_points_at_resee(self):
+        """坐标压根不在窗口矩形内 = 窗口被移动过，该让调用方重新 see，而不是去折腾前台。"""
+        msg = self._msg({"handle": 0x100, "inside": False, "focused": True, "blocker": 1})
+        self.assertIn("不在目标窗口", msg)
+        self.assertIn("重新 see", msg)
+
+    def test_blocked_window_names_the_blocker(self):
+        """被挡住时必须点名**是谁挡的**（带上标题），否则调用方无从判断该挪开哪个窗口。"""
+        msg = self._msg({
+            "handle": 0x100, "inside": True, "focused": True, "match": False,
+            "blocker": 0x200, "blocker_title": "记事本", "unblock_point": None, "point_after": 0x200,
+        })
+        self.assertIn("0x200", msg)
+        self.assertIn("记事本", msg)
+        self.assertIn("已阻止这次点击", msg)
+        self.assertNotIn("置前未生效", msg, "旧措辞与实测不符，不得再出现")
+
+    def test_unblock_attempt_is_reported(self):
+        """尝试过「点标题栏激活」就该如实说，否则调用方不知道插件已经努力过。"""
+        msg = self._msg({
+            "handle": 0x100, "inside": True, "focused": True,
+            "blocker": 0x200, "blocker_title": "", "unblock_point": [5, 6],
+        })
+        self.assertIn("已尝试点一下", msg)
+        self.assertIn("已阻止这次点击", msg)
+
+    def test_focus_failure_is_distinguished_from_being_covered(self):
+        """「没激活成功」和「激活了但被盖住」是两回事，不能混为一谈。"""
+        msg = self._msg({
+            "handle": 0x100, "inside": True, "focused": False, "front_after": 0x300,
+            "blocker": 0x200, "blocker_title": "", "unblock_point": None,
+        })
+        self.assertIn("未能激活", msg)
+        self.assertIn(f"0x{0x300:x}", msg)
+
+    def test_front_only_failure_does_not_mention_coordinates(self):
+        msg = self._msg({"handle": 0x100, "focused": False, "front_after": 0x300}, at=None)
+        self.assertIn("未能激活", msg)
 
 
 if __name__ == "__main__":

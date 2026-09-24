@@ -39,19 +39,42 @@ def _emit(payload: dict) -> None:
 
 
 def _front_error(info: dict, at: list[int] | None) -> str:
-    """把 ensure_front 的结果转成一句人能读懂的失败原因。"""
-    handle = info.get("handle")
+    """把 ensure_front 的结果转成一句人话——**按真实原因分类**，而不是一律说「置前未生效」。
+
+    这个区分是实测逼出来的：目标被别的窗口盖住时，「置前」其实**成功了**（前台确实切换了），
+    做不到的是**提升层叠顺序**（Windows 不给后台进程这个权限）。若继续告诉调用方「置前未生效」，
+    它会去重试 ``focus_window``——而那条路同样无效，白费一轮。
+    """
+    handle = int(info.get("handle") or 0)
     if info.get("stale"):
-        return f"窗口 0x{int(handle or 0):x} 已不存在"
-    if at:
-        point = info.get("point_after") or 0
+        return f"窗口 0x{handle:x} 已不存在"
+
+    if not at:
+        return f"窗口 0x{handle:x} 未能激活（前台仍是 0x{int(info.get('front_after') or 0):x}）"
+
+    x, y = at
+    if info.get("inside") is False:
+        return f"坐标 ({x}, {y}) 不在目标窗口 0x{handle:x} 的矩形内——窗口可能被移动过，请重新 see"
+
+    blocker = int(info.get("blocker") or info.get("point_after") or 0)
+    title = str(info.get("blocker_title") or "").strip()
+    covered = f"「{title}」" if title else ""
+
+    if info.get("unblock_point") is not None:
         return (
-            f"坐标 ({at[0]}, {at[1]}) 处的顶层窗口是 0x{int(point):x}，"
-            f"而不是目标窗口 0x{int(handle or 0):x}；置前未生效，已阻止这次点击以免点错窗口"
+            f"已尝试点一下目标窗口 0x{handle:x} 把它带到最前，但坐标 ({x}, {y}) 仍属于 "
+            f"0x{blocker:x}{covered}；已阻止这次点击以免点错窗口"
+            "（请先手动把目标窗口切到前面，或改点它露出来的部分）"
+        )
+    if not info.get("focused"):
+        return (
+            f"窗口 0x{handle:x} 未能激活（前台仍是 0x{int(info.get('front_after') or 0):x}），"
+            f"且坐标 ({x}, {y}) 处最顶层的是 0x{blocker:x}{covered}；已阻止这次点击以免点错窗口"
         )
     return (
-        f"窗口 0x{int(handle or 0):x} 未能置前"
-        f"（前台仍是 0x{int(info.get('front_after') or 0):x}）"
+        f"坐标 ({x}, {y}) 处最顶层的窗口是 0x{blocker:x}{covered}，而不是目标窗口 0x{handle:x}："
+        "目标被完全挡住、连标题栏都露不出来，无法把它带到最前；已阻止这次点击以免点错窗口"
+        "（请先手动把目标窗口切到前面）"
     )
 
 
@@ -63,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="输出屏幕坐标 (X,Y) 处最顶层窗口的句柄（用于点击前校验归属）")
     p.add_argument("--ensure-front", type=int, default=None, metavar="HANDLE",
                    help="确保该窗口在前台（点击类动作的前置条件）；配 --at 时并校验坐标归属")
+    p.add_argument("--unblock", action="store_true",
+                   help="配合 --ensure-front：目标被别的窗口盖住时，点一下它的标题栏把它带到最前再复核")
     p.add_argument("--at", nargs=2, type=int, metavar=("X", "Y"), help="配合 --ensure-front：要校验归属的屏幕坐标")
     p.add_argument("--click", nargs=2, type=int, metavar=("X", "Y"), help="鼠标单击屏幕坐标(绝对像素)")
     p.add_argument("--button", default="left", choices=["left", "right", "middle"])
@@ -89,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.ensure_front is not None:
         at = list(args.at) if args.at else None
         try:
-            info = inp.ensure_front(args.ensure_front, tuple(at) if at else None) or {}
+            info = inp.ensure_front(args.ensure_front, tuple(at) if at else None, unblock=bool(args.unblock)) or {}
         except Exception as e:  # noqa: BLE001
             _emit({"ok": False, "error": str(e)})
             return 1

@@ -192,15 +192,89 @@ def window_at(x: int, y: int) -> int:
     return int(root or hwnd)
 
 
-def ensure_front(handle: int, at: tuple[int, int] | None = None) -> dict:
+def window_title(handle: int) -> str:
+    """窗口标题（拿不到就返回空串）。报错时用它点明「究竟是谁挡住了目标」。"""
+    try:
+        import win32gui
+
+        return str(win32gui.GetWindowText(int(handle)) or "")
+    except Exception:
+        return ""
+
+
+def window_rect(handle: int) -> tuple[int, int, int, int] | None:
+    """窗口的屏幕矩形 ``(left, top, right, bottom)``；拿不到返回 None。"""
+    try:
+        import win32gui
+
+        left, top, right, bottom = win32gui.GetWindowRect(int(handle))
+    except Exception:
+        return None
+    if right <= left or bottom <= top:
+        return None
+    return (int(left), int(top), int(right), int(bottom))
+
+
+def _caption_height() -> int:
+    """标题栏高度（像素）；取不到系统度量时按 30 估。"""
+    try:
+        import win32api
+        import win32con
+
+        return int(win32api.GetSystemMetrics(win32con.SM_CYCAPTION)) or 30
+    except Exception:
+        return 30
+
+
+def activation_probes(rect: tuple[int, int, int, int]) -> list[tuple[int, int]]:
+    """可用于「点击激活」的候选点，按**安全程度**从高到低排列（纯函数，便于单测）。
+
+    首选**标题栏中央**：那里单击只激活窗口，不会碰到最小化/最大化/关闭按钮，也不会触发标签页
+    切换。其余候选依次向左右两侧、以及客户区上沿退让，供没有标准标题栏的窗口兜底。
+    """
+    left, top, right, bottom = rect
+    width = max(1, right - left)
+    caption = _caption_height()
+    y = top + max(4, caption // 2)
+    return [
+        (left + width // 2, y),
+        (left + width // 4, y),
+        (left + width * 3 // 4, y),
+        (left + width // 2, top + caption + 6),
+    ]
+
+
+def _visible_probe(target: int, rect: tuple[int, int, int, int]) -> tuple[int, int] | None:
+    """在窗口矩形里找一个**当前确实属于它**的候选点；一个都没有 = 它被完全盖住了。"""
+    for point in activation_probes(rect):
+        if window_at(point[0], point[1]) == target:
+            return point
+    return None
+
+
+def ensure_front(
+    handle: int,
+    at: tuple[int, int] | None = None,
+    *,
+    unblock: bool = False,
+) -> dict:
     """确保 ``handle`` 在前台（点击类动作的前置条件），可选校验坐标归属。
 
-    屏幕坐标点击只会命中**前台**窗口；目标不在前台时，点下去会打在压着它的窗口上，或者直接
-    落空。所以点击前先把它置前，并用 :func:`window_at` 复核 ``at=(x, y)`` 处的窗口就是它——
-    两条都成立才放行。
+    屏幕坐标点击命中的是该点**最顶层**的窗口——不只是「前台」那么简单。所以这里做两件事：
+    先激活目标，再用 :func:`window_at` 复核 ``at=(x, y)`` 确实属于它。
 
-    :returns: ``{"handle","stale","focused","match","front_before","front_after",
-        "point_before","point_after"}``。``stale=True`` 表示窗口已不存在（调用方应丢弃它）。
+    :param unblock: 目标被**别的窗口盖住**时，是否用「点击激活」把它带到最前。
+        **为什么需要它**：程序化提升 z 序在 Windows 上并不成立——实测 ``SetWindowPos(HWND_TOP)``、
+        ``BringWindowToTop``、``SwitchToThisWindow`` 都**返回成功却不改变层叠顺序**（后台进程的权限
+        所限），只有 ``SetForegroundWindow`` 能改「前台」但改不了「谁盖在谁上面」。而**真实的鼠标
+        输入**会触发系统重排层叠——所以模拟人类「先点一下窗口标题栏，再点目标」才是真正的解法。
+        代价是**会真的移动并点击一次鼠标**（只点标题栏中央，不碰任何按钮）。
+
+    :returns: ``{"handle","stale","focused","match","inside","front_before","front_after",
+        "point_before","point_after","blocker","blocker_title","unblock_point"}``。
+        ``stale=True``：窗口已不存在（调用方应丢弃记录）；
+        ``inside=False``：给的坐标压根不在目标窗口矩形内（窗口可能被移动过，应重新 ``see``）；
+        ``blocker``/``blocker_title``：挡住了该点的那个窗口是谁。
     """
     if not _is_windows():
         raise RuntimeError("ensure_front 仅在 Windows 上支持")
@@ -208,7 +282,12 @@ def ensure_front(handle: int, at: tuple[int, int] | None = None) -> dict:
 
     target = int(handle)
     if not win32gui.IsWindow(target):
-        return {"handle": target, "stale": True, "focused": False, "match": False}
+        return {"handle": target, "stale": True, "focused": False, "match": False, "inside": False}
+
+    rect = window_rect(target)
+    inside = True
+    if at and rect:
+        inside = rect[0] <= int(at[0]) < rect[2] and rect[1] <= int(at[1]) < rect[3]
 
     front_before = int(win32gui.GetForegroundWindow() or 0)
     point_before = window_at(*at) if at else 0
@@ -217,15 +296,37 @@ def ensure_front(handle: int, at: tuple[int, int] | None = None) -> dict:
         focused = _force_foreground_native(target)
     front_after = int(win32gui.GetForegroundWindow() or 0)
     point_after = window_at(*at) if at else 0
+
+    blocker = 0
+    unblock_point: tuple[int, int] | None = None
+    if at and point_after != target:
+        blocker = point_after
+        if unblock and rect is not None:
+            probe = _visible_probe(target, rect)
+            if probe is not None:
+                # 真的点一下：只有真实用户输入才会让系统重排层叠顺序。
+                move(probe[0], probe[1])
+                time.sleep(0.05)
+                click(probe[0], probe[1])
+                time.sleep(0.25)
+                point_after = window_at(*at)
+                unblock_point = probe
+                front_after = int(win32gui.GetForegroundWindow() or 0)
+
+    match = (point_after == target) if at else bool(focused)
     return {
         "handle": target,
         "stale": False,
         "focused": bool(focused),
-        "match": (point_after == target) if at else bool(focused),
+        "match": bool(match),
+        "inside": bool(inside),
         "front_before": front_before,
         "front_after": front_after,
         "point_before": point_before,
         "point_after": point_after,
+        "blocker": blocker,
+        "blocker_title": window_title(blocker) if blocker else "",
+        "unblock_point": list(unblock_point) if unblock_point else None,
     }
 
 

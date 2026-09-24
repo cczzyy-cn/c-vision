@@ -7,9 +7,10 @@
 
 import sys
 import unittest
+from unittest import mock
 
 from cvision import input as input_module
-from cvision.input import attach_thread_for, bring_to_front, show_command_for
+from cvision.input import activation_probes, attach_thread_for, bring_to_front, show_command_for
 
 SW_RESTORE = 9
 SW_MAXIMIZE = 3
@@ -128,6 +129,129 @@ class TestAttachThreadFor(unittest.TestCase):
 
     def test_no_attach_without_a_foreground_window(self):
         self.assertIsNone(attach_thread_for(100, 0, 300))
+
+
+class TestActivationProbes(unittest.TestCase):
+    """「点击激活」的候选点 —— 这是「目标被盖住时怎么把它带到最前」的操作策略。
+
+    背景：程序化提升层叠顺序在 Windows 上不成立（实测 ``SetWindowPos(HWND_TOP)``、
+    ``BringWindowToTop``、``SwitchToThisWindow`` 都返回成功却**不改变层叠**）。只有**真实的鼠标
+    输入**才会让系统重排，于是策略改成模拟人的做法：先点一下目标窗口的**标题栏中央**把它带到最前，
+    再点真正想点的位置。点错标题栏代价很大（可能误触关闭/最小化），所以顺序必须钉死。
+    """
+
+    def test_first_probe_is_the_caption_center(self):
+        """首选必须是标题栏**中央**：那里单击只激活窗口，碰不到任何按钮，也不会切标签页。"""
+        left, top, right, bottom = 100, 200, 900, 700
+        probes = activation_probes((left, top, right, bottom))
+        self.assertTrue(probes, "至少要给出一个候选点")
+        x, y = probes[0]
+        self.assertEqual(x, (left + right) // 2, "第一个候选点必须是水平中央")
+        self.assertGreater(y, top, "必须落在窗口内（标题栏里）")
+        self.assertLess(y, top + 60, "必须落在标题栏那一带，而不是客户区深处")
+
+    def test_every_probe_stays_inside_the_window(self):
+        rect = (100, 200, 900, 700)
+        for x, y in activation_probes(rect):
+            self.assertGreaterEqual(x, rect[0])
+            self.assertLessEqual(x, rect[2])
+            self.assertGreaterEqual(y, rect[1])
+            self.assertLessEqual(y, rect[3])
+
+    def test_probes_are_ordered_center_first_then_sides(self):
+        """两侧候选点是「中央恰好被挡住」时的退路，按安全程度排序。"""
+        probes = activation_probes((0, 0, 800, 600))
+        self.assertEqual(probes[0][0], 400)
+        self.assertEqual(probes[1][0], 200)
+        self.assertEqual(probes[2][0], 600)
+
+    def test_degenerate_window_does_not_crash(self):
+        """极窄窗口会让候选点重合——不能崩，也不能给出窗口外的点。"""
+        probes = activation_probes((0, 0, 4, 100))
+        self.assertTrue(probes)
+        for x, y in probes:
+            self.assertTrue(0 <= x <= 4)
+            self.assertTrue(0 <= y <= 100)
+
+
+@unittest.skipUnless(sys.platform.startswith("win"), "需要 pywin32 的窗口 API")
+class TestEnsureFrontUnblock(unittest.TestCase):
+    """目标被盖住时的兜底策略：**先点它自己的标题栏**把它带到最前，再复核目标点。
+
+    为什么必须是「真点一下」：程序化提升层叠顺序在 Windows 上不可靠（实测
+    ``SetWindowPos(HWND_TOP)`` / ``BringWindowToTop`` / ``SwitchToThisWindow`` 都可能返回成功却
+    不改变层叠）。真实鼠标输入才会让系统重排——这正是人遇到这种情况的做法。
+    这里把三种分支都钉死：能点就点、不该点就不点、完全被盖住时不许乱点。
+    """
+
+    RECT = (100, 200, 900, 700)
+    TARGET = 0x100
+    BLOCKER = 0x200
+
+    def _run(self, *, unblock, probe_visible=True, focus_ok=True):
+        """跑一次 ensure_front，返回 (info, 实际发生的点击列表)。"""
+        import win32gui
+
+        caption = activation_probes(self.RECT)[0]
+        state = {"unblocked": False}
+        clicks: list[tuple[int, int]] = []
+
+        def fake_window_at(x, y):
+            if probe_visible and (x, y) == caption:
+                return self.TARGET  # 标题栏露着 → 可点
+            return self.TARGET if state["unblocked"] else self.BLOCKER
+
+        def fake_click(x, y, button="left", double=False):
+            clicks.append((x, y))
+            if (x, y) == caption:
+                state["unblocked"] = True  # 真实点击会让系统把窗口带到最前
+
+        with mock.patch.object(win32gui, "IsWindow", return_value=True), \
+             mock.patch.object(win32gui, "GetWindowRect", return_value=self.RECT), \
+             mock.patch.object(win32gui, "GetWindowText", return_value="记事本"), \
+             mock.patch.object(win32gui, "GetForegroundWindow",
+                               return_value=self.TARGET if focus_ok else self.BLOCKER), \
+             mock.patch.object(input_module, "_force_foreground_native", return_value=focus_ok), \
+             mock.patch.object(input_module, "window_at", side_effect=fake_window_at), \
+             mock.patch.object(input_module, "move", lambda x, y: None), \
+             mock.patch.object(input_module, "click", side_effect=fake_click), \
+             mock.patch.object(input_module.time, "sleep", lambda *_: None):
+            info = input_module.ensure_front(self.TARGET, (400, 600), unblock=unblock)
+        return info, clicks, caption
+
+    def test_unblock_clicks_the_caption_and_then_matches(self):
+        info, clicks, caption = self._run(unblock=True)
+        self.assertTrue(info["match"], "点过标题栏之后，目标点应归还目标窗口")
+        self.assertEqual(info["unblock_point"], list(caption))
+        self.assertEqual(clicks, [caption], "只允许点标题栏那一个候选点")
+        self.assertEqual(info["blocker"], self.BLOCKER, "要记下当初是谁挡着的")
+
+    def test_without_unblock_nothing_is_clicked(self):
+        """没开开关时不许自作主张动鼠标——点击是真实副作用。"""
+        info, clicks, _ = self._run(unblock=False)
+        self.assertFalse(info["match"])
+        self.assertEqual(clicks, [])
+        self.assertIsNone(info["unblock_point"])
+
+    def test_fully_covered_target_is_never_clicked(self):
+        """连标题栏都露不出来时**不能乱点**（点下去只会命中遮挡者），应如实失败。"""
+        info, clicks, _ = self._run(unblock=True, probe_visible=False)
+        self.assertFalse(info["match"])
+        self.assertEqual(clicks, [], "没有可见的候选点就一个都不许点")
+        self.assertIsNone(info["unblock_point"])
+        self.assertEqual(info["blocker"], self.BLOCKER)
+
+    def test_reports_coordinate_outside_target_rect(self):
+        """坐标压根不在窗口里（窗口被移动过）时要说清楚，别让调用方去折腾前台。"""
+        import win32gui
+
+        with mock.patch.object(win32gui, "IsWindow", return_value=True), \
+             mock.patch.object(win32gui, "GetWindowRect", return_value=self.RECT), \
+             mock.patch.object(win32gui, "GetWindowText", return_value=""), \
+             mock.patch.object(win32gui, "GetForegroundWindow", return_value=self.TARGET), \
+             mock.patch.object(input_module, "window_at", return_value=self.BLOCKER):
+            info = input_module.ensure_front(self.TARGET, (5, 5), unblock=True)
+        self.assertFalse(info["inside"])
 
 
 if __name__ == "__main__":
