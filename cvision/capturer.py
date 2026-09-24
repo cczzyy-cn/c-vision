@@ -25,6 +25,7 @@ __all__ = [
     "pick_window",
     "capture_with_text",
     "resolve_window",
+    "wait_until_stable",
 ]
 
 
@@ -167,6 +168,25 @@ def capture_with_text(
     return img, elements
 
 
+def _make_shooter(handle: int | None, title_substr: str | None, maximize: bool, region: str | None):
+    """构造「抓一帧」的闭包（窗口或整屏 + 可选裁剪）。
+
+    两个轮询工具（``wait_until_changed`` / ``wait_until_stable``）共用同一份取帧逻辑——
+    各写一份迟早会漂移，而它们的差异只该在**判定规则**上。
+    """
+
+    def shoot():
+        if handle is not None or title_substr:
+            frame = capture_window(handle=handle, title_substr=title_substr, maximize=maximize)
+        else:
+            frame = capture_screen()
+        if region:
+            frame = encoding.crop_region(frame, region)
+        return frame
+
+    return shoot
+
+
 def wait_until_changed(
     *,
     handle: int | None = None,
@@ -198,15 +218,7 @@ def wait_until_changed(
 
     interval = max(0.0, float(interval_ms) / 1000.0)
     deadline = time.monotonic() + max(0.0, float(timeout_ms) / 1000.0)
-
-    def shoot():
-        if handle is not None or title_substr:
-            frame = capture_window(handle=handle, title_substr=title_substr, maximize=maximize)
-        else:
-            frame = capture_screen()
-        if region:
-            frame = encoding.crop_region(frame, region)
-        return frame
+    shoot = _make_shooter(handle, title_substr, maximize, region)
 
     started = time.monotonic()
     baseline = shoot()
@@ -240,3 +252,91 @@ def wait_until_changed(
         "mean_diff": round(metrics["mean_diff"], 3),
         "diff_bbox": None,
     }
+
+
+def _poll_until_stable(
+    shoot,
+    *,
+    interval: float,
+    stable_samples: int,
+    timeout: float,
+    threshold: float,
+    pixel_delta: int,
+) -> tuple[object, dict]:
+    """「连续 N 次采样都没变」的判定循环；``shoot`` 可注入，便于单测（不碰真实桌面）。
+
+    判据是**连续**不变，而不是「总共变了几次」：加载中的画面会一直动，动一次就重新计数，只有它
+    安静下来足够久才认为结束。这正是「等加载完成」与「等它开始动」的区别。
+    """
+    from cvision import diff as diff_mod
+
+    started = time.monotonic()
+    deadline = started + max(0.0, timeout)
+    frame = shoot()
+    previous_thumb = diff_mod.thumbnail(frame)
+    samples = 1
+    quiet = 0
+    last_ratio = 0.0
+    max_ratio = 0.0
+
+    while quiet < stable_samples and time.monotonic() < deadline:
+        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+        frame = shoot()
+        samples += 1
+        metrics = diff_mod.diff_metrics(previous_thumb, diff_mod.thumbnail(frame), pixel_delta)
+        last_ratio = float(metrics["diff_ratio"])
+        max_ratio = max(max_ratio, last_ratio)
+        quiet = 0 if last_ratio >= threshold else quiet + 1
+        previous_thumb = diff_mod.thumbnail(frame)
+
+    return frame, {
+        "stable": quiet >= stable_samples,
+        "samples": samples,
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+        "diff_ratio": round(last_ratio, 6),
+        "max_diff_ratio": round(max_ratio, 6),
+        "stable_for": quiet,
+    }
+
+
+def wait_until_stable(
+    *,
+    handle: int | None = None,
+    title_substr: str | None = None,
+    maximize: bool = False,
+    region: str | None = None,
+    format: str = "PNG",
+    interval_ms: float = 300,
+    stable_samples: int = 3,
+    timeout_ms: float = 15000,
+    threshold: float = 0.01,
+    pixel_delta: int = 13,
+) -> tuple[object, dict]:
+    """反复截图，直到画面**连续若干次不再变化**（等加载完成 / 动画结束）。
+
+    与 :func:`wait_until_changed` 是一对，语义正好相反：
+
+    - ``wait_until_changed`` 等「**开始**变」——等弹窗出现、等进度条动起来；
+    - ``wait_until_stable`` 等「**变完**」——等页面加载结束、等列表渲染完、等动画停下。
+
+    为什么需要后者：知道「变过一次」并不等于「变完了」。以前要判断加载是否结束，只能
+    ``wait_until_changed`` → ``see`` → 发现还没完 → 再等，白烧好几轮。这里用「连续 N 次采样都在
+    阈值以下」直接给结论；配合 ``region`` 只盯结果区，就能忽略别处的闪烁。
+
+    :param stable_samples: 连续多少次「没变」才算稳定。默认 3（配 ``interval_ms=300`` 约 0.9 秒安静期）。
+    :param interval_ms: 采样间隔。默认 300ms，比 ``wait_until_changed`` 更密——这里判定的是「安静」，
+        采样太稀会把中间的变化整个漏掉。
+    :param timeout_ms: 总超时；仍未稳定就返回 ``stable=False`` 和当前帧（让调用方看到卡在什么状态）。
+    :returns: ``(PIL.Image, metrics)``，``metrics`` 含 ``stable`` / ``samples`` / ``elapsed_ms`` /
+        ``diff_ratio``（最后一对采样的差异）/ ``max_diff_ratio``（过程最大差异）/
+        ``stable_for``（最终连续安静了几次）。
+    """
+    frame, metrics = _poll_until_stable(
+        _make_shooter(handle, title_substr, maximize, region),
+        interval=max(0.0, float(interval_ms) / 1000.0),
+        stable_samples=max(1, int(stable_samples)),
+        timeout=max(0.0, float(timeout_ms) / 1000.0),
+        threshold=float(threshold),
+        pixel_delta=int(pixel_delta),
+    )
+    return encoding.fit_for_attachment(frame, format=format), metrics

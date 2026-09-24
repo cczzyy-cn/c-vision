@@ -13,6 +13,8 @@
 
     {"op":"ping"}
     {"op":"capture","window":str?,"handle":int?,"maximize":bool,"region":"x,y,w,h"?,"delay":ms,"format":"PNG","text":bool?}
+    {"op":"wait_changed","window":str?,"handle":int?,"region":"x,y,w,h"?,"interval":ms,"timeout":ms,"threshold":float}
+    {"op":"wait_stable","window":str?,"handle":int?,"region":"x,y,w,h"?,"interval":ms,"stable_samples":int,"timeout":ms,"threshold":float}
     {"op":"ocr","window":str?,"handle":int?,"maximize":bool,"region":"x,y,w,h"?,"delay":ms}
     {"op":"list"}
     {"op":"screen_info"}
@@ -24,6 +26,8 @@
     {"ok":true,"kind":"capture","data_url":"data:...","width":int,"height":int}
     {"ok":true,"kind":"capture_text","data_url":"data:...","width":int,"height":int,"elements":[{...}]}
     {"ok":true,"kind":"ocr","text":str,"lines":[str],"words":[{...}]}
+    {"ok":true,"kind":"wait_changed","data_url":"data:...","width":int,"height":int,"changed":bool,"diff_ratio":float,...}
+    {"ok":true,"kind":"wait_stable","data_url":"data:...","width":int,"height":int,"stable":bool,"max_diff_ratio":float,...}
     {"ok":true,"kind":"list","windows":[{...}]}
     {"ok":true,"kind":"screen_info","displays":[{...}]}
     {"ok":true,"kind":"status","status":{...}}
@@ -181,6 +185,35 @@ def _wait_changed(args: dict):
     }
 
 
+def _wait_stable(args: dict):
+    """轮询直到画面**连续若干次不再变化**（供 wait_until_stable 工具）。
+
+    ⚠️ 与 ``wait_changed`` 一样会**阻塞** server 直到稳定或超时，所以内部超时必须小于宿主的
+    请求超时（宿主 request timeout 45s）。
+    """
+    from cvision import capturer, encoding
+
+    img, metrics = capturer.wait_until_stable(
+        handle=args.get("handle"),
+        title_substr=args.get("window"),
+        maximize=bool(args.get("maximize")),
+        region=args.get("region"),
+        format=args.get("format", "PNG"),
+        interval_ms=args.get("interval") or 300,
+        stable_samples=args.get("stable_samples") or 3,
+        timeout_ms=args.get("timeout") or 15000,
+        threshold=args.get("threshold") if args.get("threshold") is not None else 0.01,
+    )
+    return {
+        "ok": True,
+        "kind": "wait_stable",
+        "data_url": encoding.image_to_data_url(img, format=args.get("format", "PNG")),
+        "width": img.width,
+        "height": img.height,
+        **metrics,
+    }
+
+
 def handle(req: dict) -> dict:
     op = req.get("op")
     if op == "ping":
@@ -189,6 +222,8 @@ def handle(req: dict) -> dict:
         return _capture(req)
     if op == "wait_changed":
         return _wait_changed(req)
+    if op == "wait_stable":
+        return _wait_stable(req)
     if op == "ocr":
         return _ocr(req)
     if op == "list":

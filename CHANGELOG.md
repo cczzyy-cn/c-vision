@@ -10,6 +10,31 @@
 > - `v0.1.0` ~ `v0.1.9` 的说明只在 [GitHub Releases](https://github.com/cczzyy-cn/c-vision/releases) 里
 >   （那时还没有本文件）。
 
+## v0.2.29
+
+**新增 `wait_until_stable`：等画面「变完」，而不只是「变过」。**
+
+原来的 `wait_until_changed` 只回答一个问题：「**它变了没有**」——适合等弹窗出现、等进度条动起来。
+但它回答不了 computer-use 里更高频的那个问题：「**它变完了没有**」。点完搜索想知道结果加载完没有，
+用旧工具只能 `wait_until_changed` → `see` 复查 → 发现还没完 → 再等，白烧好几轮。
+
+- 新增 `wait_until_stable`：**连续 N 次采样都没变**才返回（默认 `stable_samples=3`、`interval=300ms`，
+  约 0.9 秒安静期）。判据是**连续**而不是累计——加载中的画面会一直动，动一次就重新计数，只有真正
+  安静下来才算结束。
+- 返回 `stable` / `diff_ratio`（最后一对采样的差异）/ `max_diff_ratio`（过程中的最大差异）/
+  `stable_for`（最终连续安静了几次）。`max_diff_ratio` 是有意加的：只看 `diff_ratio` 会把
+  「一直没动」和「动过之后安静了」混为一谈（实测动画停下前最后两次恰好同色，`diff_ratio` 是 0）。
+- `stable=false` 是**正常结果**（超时仍在变），不是错误：配 `region` 只盯结果区很关键，否则别处的
+  光标闪烁/时钟走字会让整屏永远「不稳定」。
+- 两个轮询工具共用一个新抽出的 `_make_shooter()` 取帧闭包——它们的差异只该在**判定规则**上，
+  各写一份取帧逻辑迟早漂移。
+- `diff.py` 未改动，两个工具直接复用它的 `thumbnail` / `diff_metrics`。
+- **实测**（自建动画窗口，先动 6 秒后停）：动画中 `stable=false, samples=9, max_diff=0.864`（3172ms 超时）；
+  停止后 `stable=true, samples=4, max_diff=0.0`（1375ms 返回）。
+- 新增测试：Python 231 → **236**（连续安静才收敛、中途变一次必须重新计数、永不安静要如实超时、
+  `stable_samples=1` 的边界）；JS 70 → **72**（`wait_until_stable` 的返回值同样必须 ⊆ 它声明的 schema ——
+  v0.2.24 那个「多一个键就让整次调用失败」的教训对每个新工具都成立）。
+
 ## v0.2.28
 
 **失败信息按真实原因分类，并给「目标被遮挡」补上真正的解法：点一下它的标题栏。**

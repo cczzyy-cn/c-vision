@@ -65,7 +65,7 @@ def _wait_changed(args) -> int:
         maximize=args.maximize,
         region=args.region,
         format=args.format,
-        interval_ms=args.interval,
+        interval_ms=args.interval or 500,
         timeout_ms=args.timeout,
         threshold=args.threshold,
         pixel_delta=args.pixel_delta,
@@ -86,6 +86,36 @@ def _wait_changed(args) -> int:
     return 0
 
 
+def _wait_stable(args) -> int:
+    """``--wait-stable``：轮询直到画面**连续若干次不再变化**，返回稳定后的那一帧 + 统计。"""
+    img, metrics = capturer.wait_until_stable(
+        handle=args.handle,
+        title_substr=args.window,
+        maximize=args.maximize,
+        region=args.region,
+        format=args.format,
+        interval_ms=args.interval if args.interval else 300,
+        stable_samples=args.stable_samples,
+        timeout_ms=args.timeout,
+        threshold=args.threshold,
+        pixel_delta=args.pixel_delta,
+    )
+    sys.stdout.write(
+        json.dumps(
+            {
+                "ok": True,
+                "kind": "wait_stable",
+                "data_url": encoding.image_to_data_url(img, format=args.format),
+                "width": img.width,
+                "height": img.height,
+                **metrics,
+            },
+            ensure_ascii=True,
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="截屏输出 base64 data URL，或列出窗口")
     parser.add_argument("--list", action="store_true", help="列出可见窗口(JSON)，不截图")
@@ -94,12 +124,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--text", action="store_true", help="截图后同时 OCR，返回可点击元素（含屏幕坐标）")
     parser.add_argument("--wait-changed", action="store_true", dest="wait_changed",
                         help="轮询直到画面变化才返回（等进度条/等弹窗）")
-    parser.add_argument("--interval", type=float, default=500, help="--wait-changed 的采样间隔毫秒（默认 500）")
-    parser.add_argument("--timeout", type=float, default=10000, help="--wait-changed 的总超时毫秒（默认 10000）")
+    parser.add_argument("--wait-stable", action="store_true", dest="wait_stable",
+                        help="轮询直到画面**连续若干次不再变化**才返回（等加载完成/等动画结束）")
+    parser.add_argument("--stable-samples", type=int, default=3, dest="stable_samples",
+                        help="--wait-stable 连续多少次「没变」才算稳定（默认 3）")
+    parser.add_argument("--interval", type=float, default=0, help="采样间隔毫秒（--wait-changed 默认 500；--wait-stable 默认 300）")
+    parser.add_argument("--timeout", type=float, default=10000, help="总超时毫秒（默认 10000）")
     parser.add_argument("--threshold", type=float, default=0.01,
-                        help="--wait-changed 判定「变了」的像素占比阈值（默认 0.01）")
+                        help="判定「变了」的像素占比阈值（默认 0.01）")
     parser.add_argument("--pixel-delta", type=float, default=13, dest="pixel_delta",
-                        help="--wait-changed 单个像素算变化所需的灰度差（默认 13）")
+                        help="单个像素算变化所需的灰度差（默认 13）")
     parser.add_argument("--window", default=None, help="窗口标题子串；留空则截全屏")
     parser.add_argument("--handle", type=int, default=None, help="窗口句柄")
     parser.add_argument("--maximize", action="store_true", help="先最大化目标窗口再截")
@@ -133,6 +167,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.wait_changed:
         return _wait_changed(args)
+
+    if args.wait_stable:
+        return _wait_stable(args)
 
     if args.delay:
         time.sleep(args.delay / 1000.0)

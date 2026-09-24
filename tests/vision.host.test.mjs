@@ -14,7 +14,7 @@ import test, { mock } from 'node:test'
 /** 让出一个宏任务：用于推进被 await 的处理器（如「截图进行中」的时序用例）。 */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
 
-const { apply, snipExecutor, clipboardProbe, describeRuntimeProblem, PIP_HINT, ensureRuntime, waitChangedMeta } =
+const { apply, snipExecutor, clipboardProbe, describeRuntimeProblem, PIP_HINT, ensureRuntime, waitChangedMeta, stableMeta } =
   await import('../lib/index.js')
 
 /** 捕获 apply 注册的路由与工具定义。 */
@@ -616,6 +616,55 @@ test('wait_until_changed：未变化时 diff_bbox=null 必须被丢掉（schema 
   const meta = waitChangedMeta({ ...WAIT_CHANGED_PAYLOAD, changed: false, diff_ratio: 0, mean_diff: 0, diff_bbox: null })
   assert.ok(!('diff_bbox' in meta), 'null 不能原样进返回值：schema 写的是 type: object')
   assert.equal(meta.changed, false)
+  for (const [key, value] of Object.entries(meta)) {
+    assert.notEqual(value, null, `${key} 不应为 null`)
+    assert.ok(declared.includes(key), `${key} 必须在 schema 里声明`)
+  }
+})
+
+// ── wait_until_stable：同一条不变量，但**字段是另一套** ────────────────────────
+//
+// 与 wait_until_changed 分开钉，因为两者的语义本就不同：一个讲「变没变、变在哪」，一个讲
+// 「安静下来没有、刚才动得多厉害」。若图省事共用一份整形函数，某一边多带一个键就会让整次调用
+// 失败——那正是 v0.2.23 这个故障的形状。
+
+/** Python 侧 `wait_stable` 的真实返回形状。 */
+const WAIT_STABLE_PAYLOAD = {
+  ok: true,
+  kind: 'wait_stable',
+  data_url: PNG_DATA_URL,
+  width: 900,
+  height: 220,
+  stable: true,
+  samples: 5,
+  elapsed_ms: 1234,
+  diff_ratio: 0.002,
+  max_diff_ratio: 0.42,
+  stable_for: 3,
+}
+
+/** `wait_until_stable` 声明的可返回键（`ref` 由 execute 另加）。 */
+function declaredWaitStableKeys() {
+  const tool = mountHost().tool('wait_until_stable')
+  assert.ok(tool, 'wait_until_stable 必须注册')
+  assert.equal(tool.output.schema.additionalProperties, false, '这条不变量只在 additionalProperties:false 下才有意义')
+  return Object.keys(tool.output.schema.properties).filter((key) => key !== 'ref').sort()
+}
+
+test('wait_until_stable：返回值就是 schema 声明的那套键', () => {
+  const declared = declaredWaitStableKeys()
+  const meta = stableMeta({ ...WAIT_STABLE_PAYLOAD })
+  assert.deepEqual(Object.keys(meta).sort(), declared)
+  assert.equal(meta.stable, true)
+  assert.equal(meta.stable_for, 3)
+  assert.equal(meta.width, 900, 'width/height 是 Python 每次都给、最容易漏声明的两个键')
+})
+
+test('wait_until_stable：未稳定（超时）也是正常返回值，同样不许带多余键', () => {
+  const declared = declaredWaitStableKeys()
+  const meta = stableMeta({ ...WAIT_STABLE_PAYLOAD, stable: false, stable_for: 0, diff_ratio: 0.5, max_diff_ratio: 0.9 })
+  assert.equal(meta.stable, false, '超时不是错误，要如实表达成 stable:false')
+  assert.equal(meta.stable_for, 0)
   for (const [key, value] of Object.entries(meta)) {
     assert.notEqual(value, null, `${key} 不应为 null`)
     assert.ok(declared.includes(key), `${key} 必须在 schema 里声明`)
