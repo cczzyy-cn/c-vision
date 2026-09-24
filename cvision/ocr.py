@@ -25,6 +25,56 @@ import tempfile
 
 from PIL import Image
 
+#: OCR 前的放大倍数，以及放大后长边的上限。
+#:
+#: 为什么必须放大（真机实测）：``Windows.Media.Ocr`` 对**小字**识别得非常差。同一个
+#: 1353×782 的资源管理器窗口，1x 时把 ``scripts`` 认成 ``scrlpts``、``2026/9/23`` 认成
+#: ``2025/g/23``、``文件夹`` 认成 ``文 仁 夹``、``修改日期`` 被拆成 ``修 改`` + ``期``；
+#: 拿该目录里真实存在的 15 个文件名当真值统计，1x 命中 **3/15**，3x 命中 **9/15**。
+#: 而这些文本正是「可点击元素」能否被模型认出来的关键——识别错字，模型就找不到目标。
+#: 代价是 OCR 耗时从 ~146ms 涨到 ~331ms（同一次 see 里的一次性开销）。
+_OCR_UPSCALE = 3.0
+#: 放大后长边上限：4K 截图再乘 3 会变成上亿像素，OCR 会明显变慢甚至失败。
+_OCR_MAX_SIDE = 4200
+
+
+def _upscale_for_ocr(img: Image.Image) -> tuple[Image.Image, float]:
+    """按经验放大待识别图；返回 ``(图, 倍数)``，倍数 1.0 表示没放大。"""
+    longest = max(int(img.width), int(img.height))
+    if longest <= 0:
+        return img, 1.0
+    factor = max(1.0, min(_OCR_UPSCALE, _OCR_MAX_SIDE / float(longest)))
+    if factor <= 1.01:
+        return img, 1.0
+    size = (max(1, int(round(img.width * factor))), max(1, int(round(img.height * factor))))
+    return img.resize(size), factor
+
+
+def _scale_words_back(words: list[dict], factor: float) -> list[dict]:
+    """把放大图上识别到的词框按倍数还原成**原图坐标**。
+
+    调用方拿到的 ``words`` 永远是原图坐标系——放大只是识别手段，不该泄漏到外面去
+    （否则 ``screen_center`` 会整体放大 3 倍，点哪儿都偏）。
+    """
+    out: list[dict] = []
+    for word in words:
+        try:
+            x, y = int(word.get("x", 0)), int(word.get("y", 0))
+            w, h = int(word.get("w", 0)), int(word.get("h", 0))
+        except (TypeError, ValueError):
+            out.append(word)
+            continue
+        out.append(
+            {
+                "text": word.get("text", ""),
+                "x": int(round(x / factor)),
+                "y": int(round(y / factor)),
+                "w": max(1, int(round(w / factor))),
+                "h": max(1, int(round(h / factor))),
+            }
+        )
+    return out
+
 
 def _rect_to_xywh(rect) -> dict:
     """把平台 Rect 对象转成 ``{x,y,w,h}``（Windows/Microsoft.UI 矩形）。"""
@@ -120,8 +170,20 @@ def _ocr_via_pytesseract(img: Image.Image) -> dict:
 def ocr_image(img: Image.Image) -> dict:
     """识别图片文字，返回 ``{"text","lines","words"}``。
 
+    识别前会按 :data:`_OCR_UPSCALE` 把图放大（小字识别率显著更高），
+    但 ``words`` 的坐标**已还原成原图坐标**，调用方不必关心放大这件事。
+
     优先 Windows.Media.Ocr，失败回退 pytesseract；两者皆不可用则报错。
     """
+    scaled, factor = _upscale_for_ocr(img)
+    result = _recognize(scaled)
+    if factor > 1.0:
+        result = {**result, "words": _scale_words_back(result.get("words", []), factor)}
+    return result
+
+
+def _recognize(img: Image.Image) -> dict:
+    """对（可能已放大的）图做一次识别：Windows OCR 优先，pytesseract 兜底。"""
     try:
         return _ocr_via_windows(img)
     except Exception:

@@ -71,6 +71,52 @@ class TestGroupWords(unittest.TestCase):
         self.assertEqual(len(elements), 1)
         self.assertEqual(elements[0]["text"], "保存 并 关闭")
 
+    def test_out_of_order_words_on_same_line_are_sorted_left_to_right(self):
+        """同一行里 OCR 词序可能是「先右后左」，合并前必须按 x 重排。
+
+        回归的 bug（实测一份 248 词的窗口里出现 30+ 次）：只按 (竖直中心, 左边界) 排序时，
+        两列竖直中心差 1~2px 就会让**右边**那列排在前面；而合并判据原本是 `gap <= join_gap`，
+        对**负** gap 恒成立（-311 ≤ 5.4），于是「修改日期」列被硬并进「文件名」列，拼出
+        `23 2 17 / / ： scripts` 这种跨列碎片——它的中心点正好落在两列之间的空隙上。
+        """
+        elements = ui.group_words(
+            [
+                word("2026", 300, 100, 40, 10),      # 右边那列，词框略矮 → 竖直中心更小，会排到前面
+                word("README.md", 10, 100, 90, 12),  # 左边那列
+            ]
+        )
+        self.assertEqual([e["text"] for e in elements], ["README.md", "2026"])
+        self.assertEqual(len(elements), 2, "x 回退的词不能被合并")
+
+    def test_negative_gap_never_merges(self):
+        """新词落回上一个元素的左侧时，绝不允许合并（否则元素中心会落到两个控件之间）。"""
+        elements = ui.group_words([word("右边", 500, 50, 40, 20), word("左边", 100, 50, 40, 20)])
+        self.assertEqual([e["text"] for e in elements], ["左边", "右边"])
+
+    def test_slight_overlap_still_merges(self):
+        """词框轻微重叠是正常的（OCR 框比字略宽），不能因此被切成两个元素。"""
+        elements = ui.group_words([word("保存", 100, 200, 44, 20), word("并", 140, 200, 16, 20)])
+        self.assertEqual(len(elements), 1)
+
+    def test_symbol_only_fragments_are_dropped(self):
+        """纯分隔符碎片不可能被点击，不该占 max_elements 的名额。"""
+        elements = ui.group_words(
+            [
+                word("确定", 10, 10, 40, 20),
+                word("/", 200, 10, 8, 20),
+                word(":", 240, 10, 6, 20),
+                word("--", 280, 10, 14, 20),
+            ]
+        )
+        self.assertEqual([e["text"] for e in elements], ["确定"])
+
+    def test_short_but_clickable_symbols_are_kept(self):
+        """`×`（关闭）、`下`、`OK` 这类短文本必须保留 —— 它们是真控件。"""
+        elements = ui.group_words(
+            [word("×", 10, 10, 12, 20), word("OK", 100, 10, 24, 20), word("下", 200, 10, 14, 20)]
+        )
+        self.assertEqual([e["text"] for e in elements], ["×", "OK", "下"])
+
 
 class TestToScreenElements(unittest.TestCase):
     def test_adds_screen_center_with_origin(self):

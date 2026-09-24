@@ -24,7 +24,18 @@ __all__ = [
     "capture_screen",
     "pick_window",
     "capture_with_text",
+    "resolve_window",
 ]
+
+
+def resolve_window(handle: int | None, title_substr: str | None) -> Window | None:
+    """把 ``handle`` / ``title_substr`` 解析成**当前**的 :class:`Window`（含句柄）。
+
+    宿主用它把「这次 see 看的是哪个窗口」记下来：点击类操作前要靠这个句柄把窗口置前并校验
+    坐标归属——屏幕坐标点击只命中前台窗口，不知道目标就无从校验。``maximize`` 之后窗口几何会变，
+    必须**抓完之后**再解析（见 :func:`capture_with_text`）。
+    """
+    return _resolve_window(handle, title_substr)
 
 
 def _resolve_window(handle: int | None, title_substr: str | None) -> Window | None:
@@ -39,6 +50,32 @@ def _resolve_window(handle: int | None, title_substr: str | None) -> Window | No
     return None
 
 
+def image_screen_frame(img, region: str | None, window_info: Window | None) -> dict:
+    """算出这张图覆盖的**屏幕矩形**（纯换算，不抓图）。
+
+    供 ``capture_with_text``、``cli_server`` 的非 text 抓取等多条路径共用——两处各写一份
+    迟早会漂移，而这里是「按比例点击」的唯一基准。
+
+    :param img: **尚未** ``fit_for_attachment`` 缩放的原图（缩放会改变像素尺寸，但矩形是屏幕
+        坐标、与它无关；这里要的是图片的原始像素尺寸与 DPI 缩放比）。
+    :param region: 抓取时用的裁剪区域 ``"x,y,w,h"``（原点要加上它）。
+    :param window_info: 窗口抓取时的窗口信息；整屏抓取传 None。
+    """
+    screens = screen.screen_info()
+    origin = coordinates.capture_origin(
+        region,
+        window_info.to_dict() if window_info else None,
+        screens,
+    )
+    matched = coordinates.screen_for_image(img.width, img.height, origin, screens)
+    return coordinates.image_screen_box(
+        img.width,
+        img.height,
+        origin,
+        coordinates.resolve_scale(img.width, img.height, matched),
+    )
+
+
 def capture_with_text(
     *,
     handle: int | None = None,
@@ -47,15 +84,20 @@ def capture_with_text(
     region: str | None = None,
     delay: float = 0,
     format: str = "PNG",
+    geometry_out: dict | None = None,
 ) -> tuple[object, list[dict]]:
     """抓一张图，并附带**可直接点击**的可点击元素列表。
 
     一次性完成「截图 → OCR → 词框合并 → 屏幕坐标换算」，宿主只要一次调用就能同时拿到
     图片与点击目标（不必先 ``ocr`` 再由模型自己折算坐标——那正是最容易算错的地方）。
 
+    :param geometry_out: 传入一个 dict 时，会被填入这张图覆盖的**屏幕矩形**
+        ``{"x","y","width","height"}``（见 :func:`coordinates.image_screen_box`）。宿主用它支持
+        「按比例点击」：模型读不准图片像素（它看到的预览被缩过），但读得准**比例**。用出参
+        而不是加返回值，是为了不破坏 ``(img, elements)`` 这个既有契约。
     :returns: ``(PIL.Image, elements)``。``elements`` 每项含 ``text`` / ``box`` / ``center`` /
         ``screen_box`` / ``screen_center`` / ``word_count``；没识别到文字或 OCR 不可用时返回
-        空列表——**OCR 的问题不该让整个 ``see`` 失败**。
+        空列表——**OCR 的问题不该让整个 ``see`` 失败**（``geometry_out`` 仍然有效）。
     """
     if delay:
         time.sleep(float(delay) / 1000.0)
@@ -76,6 +118,16 @@ def capture_with_text(
     try:
         words = ocr.ocr_image(img).get("words", [])
         grouped = ui_elements.group_words(words)
+    except Exception:  # noqa: BLE001 - OCR 不可用不该让截图整体失败
+        grouped = []
+
+    # 图片覆盖的屏幕矩形：它与 OCR 成败**无关**——纯图标界面（一个词都认不出来）同样需要它。
+    # 归一化坐标点击（模型按 0~1 的比例表达位置）就靠这个矩形换算成屏幕坐标，而比例在图片被
+    # 缩放到多少像素前后都不变，所以这条路径不依赖任何 provider 的缩放规则。
+    try:
+        box = image_screen_frame(img, region, window_info)
+        if geometry_out is not None:
+            geometry_out.update(box)
         if grouped:
             screens = screen.screen_info()
             origin = coordinates.capture_origin(
@@ -86,7 +138,7 @@ def capture_with_text(
             matched = coordinates.screen_for_image(img.width, img.height, origin, screens)
             to_screen = coordinates.make_mapper(img.width, img.height, matched, origin)
             elements = ui_elements.to_screen_elements(grouped, to_screen, (img.width, img.height))
-    except Exception:  # noqa: BLE001 - OCR 不可用不该让截图整体失败
+    except Exception:  # noqa: BLE001 - 坐标换算失败不该让截图整体失败
         elements = []
 
     # 缩放到附件限额可能改变图片尺寸。`screen_center`/`screen_box` 是**屏幕坐标**，与图片缩放

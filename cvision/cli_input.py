@@ -3,6 +3,9 @@
 用法::
 
     python -m cvision.cli_input --focus "Google Chrome"
+    python -m cvision.cli_input --focus-handle 12345
+    python -m cvision.cli_input --window-at 400 300      # 该屏幕点最顶层的窗口句柄
+    python -m cvision.cli_input --ensure-front 12345 --at 400 300   # 点击前置前 + 校验归属
     python -m cvision.cli_input --click 400 300 --button left
     python -m cvision.cli_input --double 400 300
     python -m cvision.cli_input --move 200 200
@@ -15,6 +18,9 @@
     python -m cvision.cli_input --set-clipboard "文本"    # 写入剪贴板
 
 每次只执行一个动作。调用前请先 ``see`` 确认目标。
+
+``--focus`` / ``--ensure-front`` 会**如实**在 JSON 里报告是否真的置前成功（``focused`` /
+``match``）——屏幕坐标点击只命中前台窗口，静默失败会让调用方点到压在上面的别的东西上。
 """
 
 from __future__ import annotations
@@ -26,10 +32,38 @@ import sys
 from cvision import input as inp
 
 
+def _emit(payload: dict) -> None:
+    """输出一行 JSON（ensure_ascii：中文转义，避免 GBK 控制台编码问题）。"""
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True))
+    sys.stdout.flush()
+
+
+def _front_error(info: dict, at: list[int] | None) -> str:
+    """把 ensure_front 的结果转成一句人能读懂的失败原因。"""
+    handle = info.get("handle")
+    if info.get("stale"):
+        return f"窗口 0x{int(handle or 0):x} 已不存在"
+    if at:
+        point = info.get("point_after") or 0
+        return (
+            f"坐标 ({at[0]}, {at[1]}) 处的顶层窗口是 0x{int(point):x}，"
+            f"而不是目标窗口 0x{int(handle or 0):x}；置前未生效，已阻止这次点击以免点错窗口"
+        )
+    return (
+        f"窗口 0x{int(handle or 0):x} 未能置前"
+        f"（前台仍是 0x{int(info.get('front_after') or 0):x}）"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="模拟用户级输入（鼠标/键盘/聚焦/剪贴板）")
     p.add_argument("--focus", default=None, help="按标题子串把窗口置前（精确标题优先；不改尺寸/最大化状态）")
     p.add_argument("--focus-handle", type=int, default=None, help="按窗口句柄把窗口置前（不改尺寸/最大化状态）")
+    p.add_argument("--window-at", nargs=2, type=int, metavar=("X", "Y"),
+                   help="输出屏幕坐标 (X,Y) 处最顶层窗口的句柄（用于点击前校验归属）")
+    p.add_argument("--ensure-front", type=int, default=None, metavar="HANDLE",
+                   help="确保该窗口在前台（点击类动作的前置条件）；配 --at 时并校验坐标归属")
+    p.add_argument("--at", nargs=2, type=int, metavar=("X", "Y"), help="配合 --ensure-front：要校验归属的屏幕坐标")
     p.add_argument("--click", nargs=2, type=int, metavar=("X", "Y"), help="鼠标单击屏幕坐标(绝对像素)")
     p.add_argument("--button", default="left", choices=["left", "right", "middle"])
     p.add_argument("--double", nargs=2, type=int, metavar=("X", "Y"), help="鼠标双击")
@@ -43,11 +77,46 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--set-clipboard", default=None, help="把文本写入剪贴板")
     args = p.parse_args(argv)
 
-    if args.focus_handle is not None:
-        inp.focus_window(handle=args.focus_handle)
-    elif args.focus:
-        inp.focus_window(title_substr=args.focus)
-    elif args.click:
+    if args.window_at:
+        try:
+            hwnd = inp.window_at(args.window_at[0], args.window_at[1])
+        except Exception as e:  # noqa: BLE001
+            _emit({"ok": False, "error": str(e)})
+            return 1
+        _emit({"ok": True, "handle": int(hwnd) if hwnd else 0})
+        return 0
+
+    if args.ensure_front is not None:
+        at = list(args.at) if args.at else None
+        try:
+            info = inp.ensure_front(args.ensure_front, tuple(at) if at else None) or {}
+        except Exception as e:  # noqa: BLE001
+            _emit({"ok": False, "error": str(e)})
+            return 1
+        ok = bool(info.get("match")) if at else bool(info.get("focused"))
+        payload = {"ok": ok, **info}
+        if not ok:
+            payload["error"] = _front_error(info, at)
+        _emit(payload)
+        # 失败走非零退出：调用方无论如何都不会把「没置前」当成成功。
+        return 0 if ok else 1
+
+    if args.focus_handle is not None or args.focus:
+        try:
+            hwnd = (
+                inp.focus_window(handle=args.focus_handle)
+                if args.focus_handle is not None
+                else inp.focus_window(title_substr=args.focus)
+            )
+        except Exception as e:  # noqa: BLE001
+            # 如实回报失败：置前失败却回 {"ok":true} 会让调用方在一个不是前台的窗口上继续点击。
+            _emit({"ok": False, "error": str(e)})
+            sys.stderr.write(str(e) + "\n")
+            return 1
+        _emit({"ok": True, "handle": int(hwnd) if hwnd is not None else None, "focused": True})
+        return 0
+
+    if args.click:
         inp.click(args.click[0], args.click[1], button=args.button)
     elif args.double:
         inp.click(args.double[0], args.double[1], button=args.button, double=True)
@@ -70,8 +139,8 @@ def main(argv: list[str] | None = None) -> int:
         inp.press_keys(args.keys)
     else:
         raise SystemExit(
-            "未指定动作：--focus/--click/--double/--move/--scroll/--scroll-h/--drag/"
-            "--type/--keys/--get-clipboard/--set-clipboard 之一"
+            "未指定动作：--focus/--focus-handle/--window-at/--ensure-front/--click/--double/"
+            "--move/--scroll/--scroll-h/--drag/--type/--keys/--get-clipboard/--set-clipboard 之一"
         )
 
     sys.stdout.write(json.dumps({"ok": True}))

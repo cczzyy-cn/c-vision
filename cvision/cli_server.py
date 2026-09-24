@@ -39,21 +39,31 @@ import sys
 import time
 
 
-def _capture_image(args: dict):
+def _capture_image(args: dict, geometry_out: dict | None = None):
     from cvision import capturer, encoding
 
     if args.get("delay"):
         time.sleep(float(args.get("delay")) / 1000.0)
+    window_info = None
     if args.get("handle") is not None or args.get("window"):
         img = capturer.capture_window(
             handle=args.get("handle"),
             title_substr=args.get("window"),
             maximize=bool(args.get("maximize")),
         )
+        # maximize 会改窗口矩形，必须在抓完之后重新解析，否则算出来的矩形整体偏移。
+        window_info = capturer.resolve_window(args.get("handle"), args.get("window"))
     else:
         img = capturer.capture_screen()
     if args.get("region"):
         img = encoding.crop_region(img, str(args.get("region")))
+    # 几何要在 `fit_for_attachment` **之前**算（那一步会改像素尺寸）。它描述的是屏幕矩形，
+    # 与图片被缩放到多少像素无关，所以时序上只要用原始尺寸即可。
+    if geometry_out is not None:
+        try:
+            geometry_out.update(capturer.image_screen_frame(img, args.get("region"), window_info))
+        except Exception:
+            pass
     img = encoding.fit_for_attachment(img, format=args.get("format", "PNG"))
     return img
 
@@ -64,6 +74,7 @@ def _capture(args: dict):
     if args.get("text"):
         # 与 `cli_capture --text` **同形状**：一次返回图 + 可点击元素。
         # 宿主 see(text=true) 两条路径（常驻 server / CLI 回退）读的是同一套字段。
+        box: dict = {}
         img, elements = capturer.capture_with_text(
             handle=args.get("handle"),
             title_substr=args.get("window"),
@@ -71,17 +82,27 @@ def _capture(args: dict):
             region=args.get("region"),
             delay=args.get("delay") or 0,
             format=args.get("format", "PNG"),
+            geometry_out=box,
         )
-        return {
+        resp = {
             "ok": True,
             "kind": "capture_text",
             "data_url": encoding.image_to_data_url(img, format=args.get("format", "PNG")),
             "width": img.width,
             "height": img.height,
             "elements": elements,
+            # 与 `cli_capture --text` 同形状：图片覆盖的屏幕矩形（供「按比例点击」换算）。
+            "image_screen_box": box,
         }
+        # 与 `cli_capture --text` 同形状地附带目标窗口句柄（宿主靠它做点击前置前与坐标归属校验）。
+        win = capturer.resolve_window(args.get("handle"), args.get("window"))
+        if win is not None:
+            resp["handle"] = win.handle
+            resp["title"] = win.title
+        return resp
 
-    img = _capture_image(args)
+    box: dict = {}
+    img = _capture_image(args, geometry_out=box)
     data_url = encoding.image_to_data_url(img, format=args.get("format", "PNG"))
     return {
         "ok": True,
@@ -89,6 +110,8 @@ def _capture(args: dict):
         "data_url": data_url,
         "width": img.width,
         "height": img.height,
+        # 非 text 抓取（整屏/窗口）同样回报屏幕矩形：模型看完图直接按比例点击是最常见的用法。
+        "image_screen_box": box,
     }
 
 

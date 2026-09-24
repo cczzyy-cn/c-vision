@@ -10,7 +10,13 @@ GDI 窗口可靠；读合成桌面区域作为最后兜底。
 from __future__ import annotations
 
 import ctypes
+import json
+import os
+import platform
+import sys
+import tempfile
 import time
+from pathlib import Path
 
 import win32con
 import win32gui
@@ -155,34 +161,19 @@ def _restore_placement(hwnd: int, placement) -> None:
 def _ensure_foreground(hwnd: int) -> None:
     """把窗口置前并置顶，避免被其他窗口遮挡（读合成桌面区域时必需）。
 
-    Windows 会限制后台进程直接 ``SetForegroundWindow``，因此先用常规方式，失败后
-    再用 ``AttachThreadInput`` 临时把自己的输入线程挂到目标线程上置前，最后分离。
+    ⚠️ 这条路径的置前**必须真的成功**：``_grab_region`` 读的是屏幕该矩形处的合成画面，
+    目标窗口不在最前时抓到的就是**遮挡它的那个窗口**的内容，而元素坐标仍按目标窗口的矩形换算
+    ——画面与坐标会一起错。
+
+    实现已与 ``cvision.input``（``focus_window`` 用的那份）统一。旧版本在这里自己写了一份
+    ``AttachThreadInput``，但把当前线程挂到了**目标窗口线程**上；前台规则要求的是挂到
+    **前台窗口线程**。实测前者 ``AttachThreadInput`` 返回 0、置前 100% 失败，后者返回 1、
+    一击即中。这里刻意不再保留第二份实现，避免两处再次漂移。
     """
     try:
-        win32gui.SetForegroundWindow(hwnd)
-        win32gui.BringWindowToTop(hwnd)
-    except Exception:
-        pass
+        from cvision.input import _force_foreground_native
 
-    try:
-        if win32gui.GetForegroundWindow() == hwnd:
-            return
-        cur_tid = ctypes.windll.kernel32.GetCurrentThreadId()
-        pid = ctypes.c_ulong()
-        fg_tid = ctypes.windll.user32.GetWindowThreadProcessId(
-            win32gui.GetForegroundWindow(), ctypes.byref(pid)
-        )
-        pid2 = ctypes.c_ulong()
-        target_tid = ctypes.windll.user32.GetWindowThreadProcessId(
-            hwnd, ctypes.byref(pid2)
-        )
-        if fg_tid and target_tid and fg_tid != target_tid:
-            ctypes.windll.user32.AttachThreadInput(cur_tid, target_tid, True)
-            try:
-                win32gui.BringWindowToTop(hwnd)
-                win32gui.SetForegroundWindow(hwnd)
-            finally:
-                ctypes.windll.user32.AttachThreadInput(cur_tid, target_tid, False)
+        _force_foreground_native(int(hwnd))
     except Exception:
         pass
 
@@ -281,112 +272,165 @@ def maximize_window(handle: int, keep_foreground: bool = True) -> None:
 
 
 # ── Windows Graphics Capture (WGC) 后端：抓取窗口「真实合成内容」 ──────────────
-_WGC_CACHE: bool | None = None
-# D3D 设备跨调用复用（单进程内多次抓屏提速）。CLI 每次独立进程用不到，MCP/循环采集可用。
+# 抓帧实现与 D3D 设备缓存都在 `cvision.capture.wgc`（那里按 PyWinRT → winsdk 的顺序挑绑定）。
 _WGC_DEVICE = None
+
+#: WGC 可用性的**真实**探测结果（进程内缓存 + 磁盘缓存）。
+#:
+#: 为什么不能只看 `import winsdk`：包装上了 ≠ WGC 能用。WGC 需要一个可用的 D3D11 设备，而拿
+#: 设备这一步在虚拟机 / 受限驱动上会失败 —— 实测 VMware SVGA 3D 虚拟显卡上
+#: ``LearningModelDevice(DIRECT_X_*)`` 返回 ``DXGI_ERROR_UNSUPPORTED``，此时 WGC 永远抓不到帧，
+#: 但 ``import winsdk`` 依旧成功。只看 import 会让 ``cvision_status`` 报出「能抓被遮挡窗口」的
+#: 错误期待。
+#:
+#: 为什么还要**磁盘**缓存：首次探测要 ~280ms（初始化 WinML/DirectX 栈），而抓一张图才 ~170ms；
+#: CLI 每次调用都是新进程，进程内缓存救不了它，于是每次 ``see`` 都白付这 280ms。
+_WGC_PROBE_MEMORY: dict | None = None
+_WGC_PROBE_FILE = Path(tempfile.gettempdir()) / "cvision-wgc-probe.json"
+#: 失败结论的保鲜期：过了就重新探测，免得环境修好后（装驱动、换显卡、重装绑定包）一直被误判。
+_WGC_PROBE_TTL_SECONDS = 12 * 3600
+
+
+def _wgc_import_ok() -> bool:
+    """有没有可用的 Python WinRT 绑定（PyWinRT 优先，回退 winsdk）。
+
+    只说明「包在」，**不代表能抓帧** —— 能不能抓要看 :func:`wgc_probe` 的真实探测。
+    """
+    from cvision.capture import wgc
+
+    return wgc.binding() is not None
+
+
+def _environment_fingerprint() -> str:
+    """环境指纹：解释器 / 系统版本 / **Python WinRT 绑定**任何一项变了，缓存立刻作废。
+
+    绑定这一项是关键：装了 PyWinRT（``winrt``）之后，WGC 可能从「不可用」直接变成「可用」
+    （它走标准 D3D11 互操作，不依赖 WinML）。指纹里不含它的话，旧的失败结论会一直被复用。
+    """
+    parts = [sys.version.split()[0], platform.version(), platform.machine()]
+    for module_name in ("winsdk._winrt", "winrt._winrt"):
+        try:
+            module = __import__(module_name, fromlist=["_winrt"])
+            stat = os.stat(module.__file__)
+            parts.append(f"{stat.st_size}:{int(stat.st_mtime)}")
+        except Exception:
+            parts.append("absent")
+    return "|".join(parts)
+
+
+def _read_probe_cache() -> dict | None:
+    """读磁盘上的**失败**结论（可用时本来就该走 WGC，没什么好跳过的）。"""
+    try:
+        raw = json.loads(_WGC_PROBE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(raw, dict) or raw.get("available"):
+        return None
+    if raw.get("fingerprint") != _environment_fingerprint():
+        return None
+    try:
+        age = time.time() - float(raw.get("ts") or 0)
+    except (TypeError, ValueError):
+        return None
+    if age < 0 or age > _WGC_PROBE_TTL_SECONDS:
+        return None
+    raw["cached"] = True
+    return raw
+
+
+def _write_probe_cache(result: dict) -> None:
+    try:
+        _WGC_PROBE_FILE.write_text(
+            json.dumps(
+                {"fingerprint": _environment_fingerprint(), "ts": time.time(), **result},
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def wgc_probe(force: bool = False) -> dict:
+    """**真实**探测 WGC 能不能用——而不是看包在不在。
+
+    :param force: 忽略缓存重新探测。
+    :returns: ``{"available": bool, "reason": str, "binding": str, "cached": bool}``；
+        ``binding`` 是实际拿到设备的那套绑定（``winrt`` = 标准互操作，``winsdk`` = WinML 变通）。
+    """
+    global _WGC_PROBE_MEMORY
+    if not force:
+        if _WGC_PROBE_MEMORY is not None:
+            return dict(_WGC_PROBE_MEMORY)
+        cached = _read_probe_cache()
+        if cached is not None:
+            _WGC_PROBE_MEMORY = cached
+            return dict(cached)
+
+    from cvision.capture import wgc
+
+    found = wgc.binding()
+    if found is None:
+        result = {
+            "available": False,
+            "reason": (
+                "未安装 Python WinRT 绑定：pip install winrt-runtime winrt-Windows.Graphics.Capture "
+                "winrt-Windows.Graphics.Capture.Interop winrt-Windows.Graphics.DirectX "
+                "winrt-Windows.Graphics.DirectX.Direct3D11 "
+                "winrt-Windows.Graphics.DirectX.Direct3D11.Interop（或旧的 winsdk）"
+            ),
+            "binding": "",
+            "cached": False,
+        }
+    else:
+        try:
+            wgc.device()
+            result = {"available": True, "reason": "ok", "binding": found.name, "cached": False}
+        except Exception as exc:  # noqa: BLE001 - 探测失败即不可用，原因如实带回
+            result = {
+                "available": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+                "binding": found.name,
+                "cached": False,
+            }
+
+    if not result["available"]:
+        _write_probe_cache(result)
+    _WGC_PROBE_MEMORY = result
+    return dict(result)
 
 
 def _wgc_backend_available() -> bool:
-    """懒加载判断 winsdk 是否可用（仅探测一次）。"""
-    global _WGC_CACHE
-    if _WGC_CACHE is None:
-        try:
-            import winsdk._winrt  # noqa: F401
-            _WGC_CACHE = True
-        except Exception:
-            _WGC_CACHE = False
-    return _WGC_CACHE
+    """WGC 是否**真的**可用（走 :func:`wgc_probe`：真实探测 + 缓存，不再只看 import）。"""
+    return bool(wgc_probe().get("available"))
 
 
 def _new_wgc_device():
     """构造一个用于 Windows Graphics Capture 的 Direct3D 设备。
 
-    说明：winsdk 未直接暴露 D3D11CreateDevice，社区通行做法是借
-    ``LearningModelDevice(DIRECT_X_HIGH_PERFORMANCE)`` 的 ``direct3_d11_device``
-    拿一个 D3D11 设备（WGC 的 ``Direct3D11CaptureFramePool`` 需要）。这是文档化的
-    变通手段，对 D3D11 设备是否来自 ML 命名空间不敏感。
+    实现在 :mod:`cvision.capture.wgc`：那里**优先走 PyWinRT 的标准 D3D11 互操作**
+    （``D3D11CreateDevice`` → ``QI(IDXGIDevice)`` → 官方 interop），失败才回退 ``winsdk`` 的
+    ``LearningModelDevice`` 变通路径。保留这个薄封装只为让既有调用方与测试继续可用。
     """
-    from winsdk.windows.ai.machinelearning import LearningModelDevice, LearningModelDeviceKind
+    from cvision.capture import wgc
 
-    return LearningModelDevice(LearningModelDeviceKind.DIRECT_X_HIGH_PERFORMANCE).direct3_d11_device
+    return wgc.device()
 
 
 def _get_wgc_device():
-    """获取（并缓存，仅成功时缓存）Direct3D 设备。多次抓屏复用同一设备更快。"""
-    global _WGC_DEVICE
-    if _WGC_DEVICE is not None:
-        return _WGC_DEVICE
-    _WGC_DEVICE = _new_wgc_device()
-    return _WGC_DEVICE
+    """获取（并缓存）Direct3D 设备；缓存由 :func:`cvision.capture.wgc.device` 负责。"""
+    return _new_wgc_device()
 
 
 def capture_window_wgc(hwnd: int, timeout: float = 4.0) -> Image.Image | None:
     """用 Windows Graphics Capture 抓取指定窗口的真实合成内容。
 
-    返回 PIL 图；任何失败/超时/未安装均返回 None（不抛错，由调用方回退）。
+    实现在 :mod:`cvision.capture.wgc`（优先 PyWinRT 标准互操作，回退 ``winsdk``/WinML）。
+    返回 PIL 图；任何失败、超时或缺依赖都返回 ``None``，由调用方回退到别的后端。
     """
-    import asyncio
-    import threading
+    from cvision.capture import wgc
 
-    try:
-        import winsdk._winrt as wr
-        import winsdk.windows.graphics.capture as gc
-        from winsdk.windows.graphics.capture.interop import create_for_window
-        from winsdk.windows.ai.machinelearning import LearningModelDevice, LearningModelDeviceKind
-        from winsdk.windows.graphics.directx import DirectXPixelFormat
-        from winsdk.windows.graphics.imaging import SoftwareBitmap, BitmapBufferAccessMode
-    except Exception:
-        return None
-
-    session = pool = None
-    try:
-        wr.init_apartment(wr.MTA)
-        item = create_for_window(hwnd)
-        try:
-            device = _get_wgc_device()
-        except Exception:
-            device = _new_wgc_device()
-        pool = gc.Direct3D11CaptureFramePool.create_free_threaded(
-            device, DirectXPixelFormat.B8_G8_R8_A8_UINT_NORMALIZED, 1, item.size
-        )
-        session = pool.create_capture_session(item)
-        session.start_capture()
-
-        ev = threading.Event()
-        frames = []
-
-        def on_frame(_sender, _args) -> None:
-            f = pool.try_get_next_frame()
-            if f is not None:
-                frames.append(f)
-                ev.set()
-
-        pool.add_frame_arrived(on_frame)
-        if not ev.wait(timeout):
-            return None
-        frame = frames[0]
-
-        async def _copy_surface():
-            op = SoftwareBitmap.create_copy_from_surface_async(frame.surface)
-            return await op
-
-        sb = asyncio.run(_copy_surface())
-        buf = sb.lock_buffer(BitmapBufferAccessMode.READ)
-        raw = bytes(buf.create_reference())
-        return Image.frombytes("RGBA", (sb.pixel_width, sb.pixel_height), raw).convert("RGB")
-    except Exception:
-        return None
-    finally:
-        try:
-            if session is not None:
-                session.close()
-        except Exception:
-            pass
-        try:
-            if pool is not None:
-                pool.close()
-        except Exception:
-            pass
+    return wgc.capture_window(int(hwnd), timeout=timeout)
 
 
 def capture_window(

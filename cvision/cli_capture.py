@@ -25,7 +25,8 @@ from cvision import capturer, encoding
 
 
 def _capture_with_text(args) -> int:
-    """``--text``：一次返回「图片 data URL + 可点击元素」。"""
+    """``--text``：一次返回「图片 data URL + 可点击元素 + 目标窗口句柄 + 图片屏幕矩形」。"""
+    box: dict = {}
     img, elements = capturer.capture_with_text(
         handle=args.handle,
         title_substr=args.window,
@@ -33,20 +34,26 @@ def _capture_with_text(args) -> int:
         region=args.region,
         delay=args.delay,
         format=args.format,
+        geometry_out=box,
     )
-    sys.stdout.write(
-        json.dumps(
-            {
-                "ok": True,
-                "kind": "capture_text",
-                "data_url": encoding.image_to_data_url(img, format=args.format),
-                "width": img.width,
-                "height": img.height,
-                "elements": elements,
-            },
-            ensure_ascii=True,
-        )
-    )
+    payload = {
+        "ok": True,
+        "kind": "capture_text",
+        "data_url": encoding.image_to_data_url(img, format=args.format),
+        "width": img.width,
+        "height": img.height,
+        "elements": elements,
+        # 这张图覆盖的屏幕矩形：宿主用它把模型给的「比例坐标」换算成屏幕坐标（与图片被缩放到
+        # 多少像素无关）。OCR 一个词都没认出来时它依然有效。
+        "image_screen_box": box,
+    }
+    # 附带目标窗口句柄：宿主据此记住「这次看的是哪个窗口」，点击前用它置前并校验坐标归属。
+    # 必须在抓取**之后**解析（maximize 会改窗口几何，抓之前的解析结果可能是错的）。
+    win = capturer.resolve_window(args.handle, args.window)
+    if win is not None:
+        payload["handle"] = win.handle
+        payload["title"] = win.title
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True))
     return 0
 
 

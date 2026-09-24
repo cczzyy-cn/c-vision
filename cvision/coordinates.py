@@ -98,6 +98,32 @@ def capture_origin(region: str | None, window: dict | None, screens: list[dict] 
     return base_x, base_y
 
 
+def image_screen_box(
+    image_width: int,
+    image_height: int,
+    origin: tuple[int, int],
+    scale: float,
+) -> dict:
+    """图片覆盖的**屏幕矩形**（物理像素）``{"x","y","width","height"}``。
+
+    为什么需要它：模型没法可靠地读「图片像素坐标」——它看到的预览是被**缩过**的（DSH 按图片
+    token 规则把它缩到预算内：1920×1080 的整屏截图，模型实际收到的只有 1708×961）。但**比例位置
+    在缩放前后不变**，所以只要给出这张图覆盖的屏幕矩形，模型按 ``(rx, ry) ∈ [0,1]`` 表达位置就能精确落点::
+
+        screen_x = box.x + rx * box.width
+        screen_y = box.y + ry * box.height
+
+    这条换算与图片被缩放到多少像素完全无关，因此不需要知道 provider 的缩放规则（那些规则会随
+    版本漂移）。纯函数，便于跨平台单测。
+    """
+    return {
+        "x": int(origin[0]),
+        "y": int(origin[1]),
+        "width": max(1, int(round(image_width * scale))),
+        "height": max(1, int(round(image_height * scale))),
+    }
+
+
 def screen_for_image(image_width: int, image_height: int, origin: tuple[int, int], screens: list[dict] | None) -> dict | None:
     """挑出这张图主要落在哪个显示器上（用于取该屏的 scale）。"""
     if not screens:

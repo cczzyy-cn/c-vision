@@ -10,7 +10,7 @@ Python 版 cvision** 截屏/OCR/输入 → 写入 Harness 附件服务（`ctx.at
 
 同一个包还带一个**浏览器半边**：输入框工具栏的「截图」按钮（人工一键抓屏，或把剪贴板里的图片作为附件）。
 
-**版本**：`0.2.24` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
+**版本**：`0.2.27` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
 **许可**：BSD-3-Clause · 变更历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 目录
@@ -104,13 +104,14 @@ see(text=true)  →  图片 + elements: [{ text, screen_center:{x,y}, screen_box
 | 工具 | 说明 |
 | --- | --- |
 | `click(x, y, button?)` / `double_click(x, y)` | 屏幕绝对坐标单击 / 双击（left/right/middle） |
+| `click_at(rx, ry, button?)` | 按**比例**点击**最近一次 `see` 那张图**上的位置（rx/ry 为 0~1，左上角 0,0）：图片被缩放到多少像素都无所谓，换算由插件做（v0.2.26 起） |
 | `mouse_move(x, y)` | 移动鼠标到屏幕坐标（不点击） |
 | `scroll(x, y, dy?, dx?)` | 在 (x,y) 处滚动（dy>0 上滚；dx 水平滚动） |
 | `drag(x1, y1, x2, y2, button?)` | 从 (x1,y1) 拖拽到 (x2,y2)（框选/拖文件） |
 | `type_text(text)` | 像键盘一样输入文本到**当前焦点** |
 | `press_key(keys)` | 发送快捷键，如 `ctrl+l`、`enter`、`ctrl+shift+t`、`alt+tab` |
 | `get_clipboard()` / `set_clipboard(text)` | 读写剪贴板**文本**（Windows 原生；macOS/Linux 走 `pyperclip`） |
-| `focus_window(title?, handle?)` | 把窗口**置前**（用户级激活）；`handle` 优先；**只改前后层级，不改窗口尺寸/最大化状态**（仅最小化的窗口会被还原） |
+| `focus_window(title?, handle?)` | 把窗口**置前**（用户级激活）；`handle` 优先；**只改前后层级，不改窗口尺寸/最大化状态**（仅最小化的窗口会被还原）；**置前失败会报错**（v0.2.25 起） |
 
 > **关键**：默认**不最大化、不切前台**——WGC 抓的是窗口自身的合成内容，与前台/遮挡无关。
 
@@ -195,12 +196,21 @@ GET /cvision/model-capability?provider=<id>&model=<id>
   兜底路径（WGC 与 PrintWindow 都失败、改用读合成桌面区域）同样会置前。
 - **什么情况才用 `maximize=true`**：仅当窗口已**最小化**、或**太小**、或被完全挡住且内容读不出来时。插件
   抓完会**自动还原**窗口原状态（`GetWindowPlacement` / `SetWindowPlacement` 成对使用）。
-- **`focus_window` 只置前**：它不会改窗口尺寸/最大化状态（v0.2.7 起）。只有真的需要键盘焦点时才调用。
+- **`focus_window` 只置前**：它不会改窗口尺寸/最大化状态（v0.2.7 起）；**置前失败会如实报错**（v0.2.25 起，
+  不再假报成功）。只有真的需要键盘焦点、或要操作一个还没 `see` 过的窗口时才调用它。
 - **推荐流程**：先 `list_windows()` → 直接 `see(handle=<句柄>)`（标题会变时优先 `handle`）；整屏用 `see()`。
 - **要点击就用 `see(text=true)`**：它返回的 `screen_center` 是**屏幕绝对坐标**，可直接喂给 `click`。
   **不要自己从截图估算像素**——裁剪、窗口位置、多屏、DPI 四层差异都由插件换算好了。
-- ⚠️ **被遮挡的窗口点不到**：`screen_center` 是按屏幕坐标算的，但点击会被**前台窗口**接住。若目标窗口
-  不是前台（或多窗口**重叠**），先 `focus_window` 把它置前再点，否则会点到压在上面的那个窗口上。
+- ✅ **被遮挡的窗口也能点到（v0.2.25 起）**：`screen_center` 是按屏幕坐标算的，而点击会被**前台窗口**
+  接住。所以 `click`/`double_click`/`drag`/`scroll`/`type_text`/`press_key` 在动作前会**自动**把
+  「你最近一次 `see` 的那个窗口」置前，并复核该坐标确实属于它；复核不过就**报错并跳过这次点击**
+  （错误里会写清「该点现在属于谁」），不会静默点到压在上面的窗口上。要操作别的窗口，先 `see` 它一次。
+- ✅ **纯图标/没识别出文字的地方，用 `click_at(rx, ry)`（v0.2.26 起）**：你看到的截图是被 DSH **缩过**
+  的（按图片 token 规则，1920×1080 的整屏截图到你眼里只剩 1708×961），所以**按图片像素估坐标一定会偏**
+  ——照着自己看到的画面数像素直接用，右下角会差 200 多像素。但**比例**在缩放前后不变：`click_at(0.64, 0.46)`
+  表示「横向 64%、纵向 46% 处」，插件按该图覆盖的屏幕矩形换算，与图片被缩到多少像素无关。
+  它**不依赖**任何 provider 的缩放规则（那些规则会随版本漂移）。代价是精度受你目测限制：比例差 1%
+  在 1920 宽的屏上约等于 19px，所以**小控件仍然优先用 `see(text=true)` 的 `screen_center`**（±1px）。
 
 ## 电脑使用（computer-use）推荐流程
 
@@ -210,7 +220,9 @@ GET /cvision/model-capability?provider=<id>&model=<id>
 2. **定位**：用 **`see(text=true)`** 拿到可点击元素的 `screen_center`（屏幕绝对坐标），直接用于点击。
    > 两步旧做法（`ocr` 取词框 → 自己把图片坐标折算成屏幕坐标）已不推荐：那段换算正是最容易错的地方，
    > 现已由插件承担。只有需要**词级**粒度（而非合并后的控件）时才用 `ocr`。
-3. **操作**：`focus_window`（仅需要键盘焦点、或要点被遮挡窗口时）→ `click(x,y)` / `double_click` / `type_text` / `press_key` / `scroll`。
+3. **操作**：`click(x,y)` / `double_click` / `type_text` / `press_key` / `scroll`。点击类动作会**自动**把
+   上一步 `see` 的窗口置前并复核坐标归属，所以**不必**手动 `focus_window`；只有要操作一个没 `see` 过的
+   窗口、或确实需要键盘焦点时，才先调 `focus_window`。
 4. **确认**：再 `see` 看结果；不对就回到 2/3 重试，直到目标达成。
 
 ```text
@@ -301,7 +313,7 @@ npm run check:deps   # Python 依赖锁定自检（9 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
-当前规模：**JS 70 条 + Python 188 条**。
+当前规模：**JS 70 条 + Python 216 条**。
 
 ### 文档约定（自动校验）
 
@@ -405,7 +417,7 @@ vision/                      # 仓库根 = 插件本体
   tsconfig.json          # TS 配置
   package.json           # 声明 dsh.bundle + dsh.client，files 含 lib/cvision/requirements.txt/CHANGELOG
   cordis.patch.yml       # bundle 的配置层，按包名引用
-  requirements.txt       # Python 依赖（全部双向锁定 >=x,<y：Pillow/pyautogui/pyperclip；Windows 加 pywin32/winsdk；macOS 加 pyobjc；需 Python 3.10+）
+  requirements.txt       # Python 依赖（全部双向锁定 >=x,<y：Pillow/pyautogui/pyperclip；Windows 加 pywin32/winsdk/winrt-*；macOS 加 pyobjc；需 Python 3.10+）
   cvision/               # 捆绑的 Python 版 cvision（截屏/OCR/用户级输入/系统截图/剪贴板）
     __init__.py          #   包标记
     capturer.py          #   兼容层：转发到平台捕获后端
@@ -413,6 +425,7 @@ vision/                      # 仓库根 = 插件本体
       __init__.py        #     选后端并暴露 list_windows/capture_window/capture_screen
       base.py            #     平台无关 Window + CaptureBackend 协议
       windows.py         #     Windows 后端（WGC > PrintWindow > 读合成桌面区域）
+      wgc.py             #     Windows Graphics Capture：优先 PyWinRT 标准 D3D11 互操作，回退 winsdk/WinML
       macos.py           #     macOS 后端（Quartz 枚举 + screencapture -l）
       linux.py           #     Linux 后端（Phase 2 占位）
     detect.py            #   纯逻辑判定（GPU 类/空白帧），不依赖 win32，可跨平台单测
@@ -439,6 +452,7 @@ vision/                      # 仓库根 = 插件本体
     test_diff.py          #   帧间差异（相同/微变/实变/尺寸变化 + 阈值边界）
     test_clipboard_race.py #  剪贴板竞态回归（用户占用期间复制的内容绝不被覆盖）
     test_capture_foreground.py #  抓图前的窗口准备：普通窗口不碰前台/最小化窗口会被置前
+    test_wgc_probe.py      #   WGC 可用性探测的缓存语义（指纹/过期/时钟回拨/损坏文件 → 必须失效）
     test_diagnose.py      #   窗口跟踪诊断（改动字段判定 / 开关 / 关闭时不写文件 / 写失败不抛）
     test_snip.py          #   系统截图 CLI 的 JSON 契约
     test_snip_windows.py  #   取消识别（假时钟/覆盖层/剪贴板：取消立即返回、晚到图片不算本次）
@@ -461,7 +475,7 @@ vision/                      # 仓库根 = 插件本体
 | 单击截图后按钮变蓝 | 已由 `served` 归属解决（v0.2.10/0.2.11）；若仍出现，见 README「取消与归属」的时序说明 |
 | 取消了截图，之后别的截图却进了附件栏 | v0.2.13 起修复（覆盖层判据）；若先前的旧版本仍在跑，重启宿主 |
 | 工具报 `python` 找不到 / 依赖缺失 | 装 Python 3.10+ 与 `python -m pip install -r requirements.txt`；**v0.2.18 起首次调用会直接给出带绝对路径的安装命令**；`cvision_status()` 会列出缺哪个模块 |
-| 抓窗口是黑图/空白 | 未装 `winsdk` 时 WGC 不可用，会回退 `PrintWindow`／桌面区域；装 `winsdk` 后最准（微信等 Qt 窗口属已知空白帧场景） |
+| 抓窗口是黑图/空白 | 依次看：① `cvision_status()` 的 `capture_backends.wgc` —— 它会**真实探测**并给出 `reason`，别只看依赖装没装；② 装了 PyWinRT（`winrt-*`，见 `requirements.txt`）时 WGC 走标准 D3D11 互操作，**虚拟机上也能抓被遮挡窗口**；只装了 `winsdk` 时它要借 WinML 拿设备，虚拟机常见 `DXGI_ERROR_UNSUPPORTED`，此时 WGC 不可用、自动回退 `PrintWindow`／桌面区域；③ 微信等 Qt 窗口属已知空白帧场景 |
 | **抓图后窗口位置/大小变了**（如分屏被破坏） | 用内置**窗口跟踪诊断**取证，别猜：`$env:CVISION_TRACE_WINDOWS='1'; $env:CVISION_TRACE_FILE='C:\Temp\cv-trace.jsonl'` → 复现一次 → `python -m cvision.diagnose`。日志按阶段（`prepare`/`wgc`/`printwindow`/`grab_region`）记录 `rect`/`showCmd`/`zoomed`/`iconic`/`foreground` 的前后值，能区分「抓取过程中动的」与「抓取前后被别的因素动的」。默认关闭、零开销 |
 | 中文窗口标题匹配不上 | v0.2.2 起所有 Python 子进程强制 UTF-8；若自行调用 Python，请一并设 `PYTHONUTF8=1` |
 | 升级后行为没变 | 见[升级后必须做什么](#升级后必须做什么)：客户端半边要**硬刷新**，宿主半边要**重启** |
@@ -472,7 +486,11 @@ vision/                      # 仓库根 = 插件本体
 
 - **跨语言**：插件用 `child_process` 调包内 Python 做截屏/OCR/输入，需目标机器有桌面环境与 Python 3.10+。
 - **截图后端**：`capture_window` 依次尝试 **Windows Graphics Capture**（真实合成内容，抓 GPU/Chromium/被遮挡
-  窗口最准，需 `winsdk`）→ **PrintWindow** → **读合成桌面区域**（兜底，此时才可能置前，抓完立即还原）。
+  窗口最准）→ **PrintWindow** → **读合成桌面区域**（兜底，此时才可能置前，抓完立即还原）。
+  WGC 需要一套 Python WinRT 绑定：**推荐 PyWinRT**（`winrt-runtime` + `winrt-Windows.Graphics.*`，见
+  `requirements.txt`），它走标准 D3D11 互操作；只装了旧的 `winsdk` 时只能借 WinML 拿设备，在虚拟机/受限
+  驱动上会失败（实测 VMware SVGA 3D：`DXGI_ERROR_UNSUPPORTED`）。`cvision_status().capture_backends`
+  会**真实探测**并说明当前走的是哪一套——不是「依赖装没装」。
 - **附件限制**：Harness attachment 单图源 ≤20MiB、单边 ≤8192px、每条消息 ≤20 张；输出前会自动缩放到限制内
   （`encoding.fit_for_attachment`），超大屏也不会被拒。
 - **省 token**：`region="x,y,w,h"` 只处理一块；`ocr` 直接返回文本；超大图自动降采样。
@@ -529,8 +547,9 @@ vision/                      # 仓库根 = 插件本体
 - **抓取最小化窗口会置前并抢走前台**（几何抓完会还原回最小化，但前台已经被它拿走）；兜底路径
   （WGC 与 PrintWindow 都失败、改读合成桌面区域）同样会置前。普通窗口（前台或背景）则不改几何、
   不抢前台。口径与实测值见[给 AI 智能体的使用提示](#给-ai-智能体的使用提示重要)。
-- **被遮挡/重叠窗口的控件点不到**：`see(text=true)` 给的 `screen_center` 坐标本身正确，但点击按屏幕
-  坐标下发、只会命中前台窗口。需先 `focus_window` 让目标在前。
+- **被遮挡/重叠窗口的控件**：`see(text=true)` 给的 `screen_center` 坐标本身正确，而点击按屏幕坐标下发、
+  只会命中前台窗口。点击类工具会**自动**把「最近一次 `see` 的那个窗口」置前并复核坐标归属（v0.2.25 起）；
+  复核不过就明确报错并**跳过这次点击**，而不是静默点到别的窗口上。目标窗口已销毁时，宿主的记录会自动作废。
 - 系统截图被用户取消 → 返回 204，客户端静默、不插入任何附件（v0.2.13 起不再把晚到的剪贴板图片当成本次结果）。
 - 剪贴板图片在未支持平台（Linux Phase 2）→ 返回 501，客户端按钮不监视也不提示（功能不报错）。
 - 跨平台支持不完整（macOS/Linux 为 Phase 1/2），在未支持平台上报错的边界由各工具显式给出。

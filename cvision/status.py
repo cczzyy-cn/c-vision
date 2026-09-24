@@ -56,6 +56,33 @@ def _ocr_engine() -> str:
     return "none"
 
 
+def _capture_backends() -> dict:
+    """窗口捕获各后端的**真实**可用性（不是「包有没有装上」）。
+
+    为什么值得单列：Windows 上 WGC 需要一个可用的 D3D11 设备，而拿设备这一步在虚拟机 / 受限
+    驱动上会失败——实测 VMware SVGA 3D 虚拟显卡上 ``LearningModelDevice(DIRECT_X_*)`` 返回
+    ``DXGI_ERROR_UNSUPPORTED``，于是 WGC 永远抓不到帧，**但 ``deps.winsdk`` 依然是 true**。
+    只看依赖会把「抓不了被遮挡的窗口」说成能抓，所以这里做一次真实探测（结果有缓存，不慢）。
+    """
+    try:
+        from cvision.capture import backend
+    except Exception:
+        return {}
+    probe = getattr(backend, "wgc_probe", None)
+    if probe is None:
+        return {}  # 非 Windows 后端没有这个分层
+    try:
+        info = probe()
+    except Exception as e:  # noqa: BLE001 - 探测本身失败也只是「不可用」
+        return {"window_capture": ["printwindow", "grab_region"], "wgc": {"available": False, "reason": str(e)}}
+    available = bool(info.get("available"))
+    return {
+        # WGC 不可用时，窗口捕获实际走这两条：PrintWindow 不需要前台，grab_region 需要。
+        "window_capture": ["wgc", "printwindow", "grab_region"] if available else ["printwindow", "grab_region"],
+        "wgc": {"available": available, "reason": str(info.get("reason") or ""), "cached": bool(info.get("cached"))},
+    }
+
+
 def status() -> dict:
     """返回插件运行环境的状态字典。"""
     try:
@@ -105,6 +132,7 @@ def status() -> dict:
         "platform_support": _platform_support(backend, backend_implemented),
         "ocr_engine": _ocr_engine(),
         "input_capabilities": input_caps,
+        "capture_backends": _capture_backends(),
         "deps": deps_status,
         "ok": backend_implemented and deps_status.get("Pillow", False),
     }

@@ -20,7 +20,13 @@ from typing import Callable, Iterable
 #: 同一行的判定阈值：两词竖直中心的距离小于「行高 × 该系数」即视为同一行。
 _SAME_LINE_RATIO = 0.5
 #: 相邻词的合并阈值：水平间距小于「行高 × 该系数」即视为同一个控件。
-_JOIN_GAP_RATIO = 0.6
+#: 0.8 是实测调的：资源管理器里同一格里 ``2026/9/23`` 与 ``2:17`` 之间隔着一个空格（约 0.67×行高），
+#: 取 0.6 会把一行日期切成两半；而**列与列**之间的间距是它的 20 倍以上（实测 186px vs 7px），
+#: 放到 0.8 完全够不到跨列，安全。
+_JOIN_GAP_RATIO = 0.8
+#: 允许的**负**间距上限（词框互相轻微重叠）占行高的比例。超过它就是 x 回退——
+#: 两个词在水平方向上是反的，绝不属于同一个控件（见 group_words 的说明）。
+_MAX_OVERLAP_RATIO = 0.2
 #: 元素四周外扩量占行高的比例（让中心点落进控件内部而不是文字边缘）。
 _PAD_RATIO = 0.2
 
@@ -49,6 +55,25 @@ def _median(values: list[int]) -> float:
     return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
+#: 会被当作「OCR 符号碎片」丢掉的字符：分隔符与标点。
+#: 刻意**不用**「非字母数字」这种通用判据——那会把 ``×``（关闭按钮）、``✓`` 这类真实可点的符号
+#: 一起丢掉。这里只列那些几乎不可能独立成为控件的分隔符。
+_SYMBOL_NOISE_CHARS = frozenset("\\/:;,.|-_=+*^~<>()[]{}\"'`!?·…、。，：；！？")
+
+
+def is_noise_text(text: str) -> bool:
+    """判断元素文本是否只是 OCR 碎片（纯分隔符、且很短）——这种不可能是点击目标。
+
+    为什么值得滤掉：``max_elements`` 按「从上到下、从左到右」截取，一堆 ``/``、``:``、``|``
+    碎片会把名额（以及模型的注意力）占满，真正能点的控件反而被挤出截断之外。
+    判据刻意保守：**长度 > 2 一律保留**，且只认 :data:`_SYMBOL_NOISE_CHARS` 里那些字符。
+    """
+    stripped = (text or "").strip()
+    if not stripped or len(stripped) > 2:
+        return False
+    return all(ch in _SYMBOL_NOISE_CHARS for ch in stripped)
+
+
 def group_words(words: Iterable[Box]) -> list[dict]:
     """把词框按「同一行 + 水平相邻」合并成元素。
 
@@ -72,19 +97,40 @@ def group_words(words: Iterable[Box]) -> list[dict]:
     line_h = _median(heights) or 1.0
     same_line = line_h * _SAME_LINE_RATIO
     join_gap = line_h * _JOIN_GAP_RATIO
+    max_overlap = line_h * _MAX_OVERLAP_RATIO
     pad = line_h * _PAD_RATIO
 
-    # 先按 (竖直中心, 左边界) 排序，让同一行的词在序列里相邻。
+    # 分两步排序：先聚成「行」，再在**行内**按左边界排序。这一步不能省——
+    # 只按 (竖直中心, 左边界) 整体排序时，同一物理行里不同列的竖直中心常差 1~2px，排序结果
+    # 就会出现 **x 回退**（先给右边那列、再给左边那列）。而合并判据原本写成 `gap <= join_gap`，
+    # 对**负** gap 恒成立（-311 <= 5.4），于是「修改日期」列被硬并进「文件名」列，拼出
+    # `23 2 17 / / ： scripts` 这种跨列碎片，其中心点正好落在两列之间的空隙上——点它等于点在空气里。
+    # 实测一份 248 词的窗口里，这类错误合并有 30+ 次。
     parsed.sort(key=lambda item: (item[2] + item[4] / 2.0, item[1]))
+    rows: list[list[tuple[str, int, int, int, int]]] = []
+    for item in parsed:
+        cy = item[2] + item[4] / 2.0
+        if rows:
+            head = rows[-1][0]
+            head_cy = head[2] + head[4] / 2.0
+            if abs(cy - head_cy) <= same_line:
+                rows[-1].append(item)
+                continue
+        rows.append([item])
+    ordered: list[tuple[str, int, int, int, int]] = []
+    for row in rows:
+        ordered.extend(sorted(row, key=lambda item: item[1]))
 
     groups: list[dict] = []
-    for text, x, y, w, h in parsed:
+    for text, x, y, w, h in ordered:
         cy = y + h / 2.0
         if groups:
             last = groups[-1]
             last_cy = last["y"] + last["h"] / 2.0
             gap = x - (last["x"] + last["w"])
-            if abs(cy - last_cy) <= same_line and gap <= join_gap:
+            # 右边界必须真的在右侧（允许轻微重叠）：`gap` 下限拦住 x 回退，
+            # 上限拦住跨控件（两列/两个按钮之间）的误并。
+            if abs(cy - last_cy) <= same_line and -max_overlap <= gap <= join_gap:
                 # 并入上一个元素：扩框、拼文本。
                 left = min(last["x"], x)
                 top = min(last["y"], y)
@@ -100,6 +146,8 @@ def group_words(words: Iterable[Box]) -> list[dict]:
 
     results: list[dict] = []
     for group in groups:
+        if is_noise_text(group["text"]):
+            continue  # 纯符号碎片：不可能是点击目标，别占 max_elements 的名额
         x, y, w, h = group["x"], group["y"], group["w"], group["h"]
         cx = x + w / 2.0
         cy = y + h / 2.0

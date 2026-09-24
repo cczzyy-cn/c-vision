@@ -21,6 +21,20 @@ pyperclip>=1.8.2,<2  # 跨平台文本剪贴板（Windows 优先原生 pywin32�
 pywin32>=311,<312; sys_platform == 'win32'  # Windows 原生 API（窗口枚举/PrintWindow/剪贴板）
 pyobjc-framework-Quartz>=12.0,<13; sys_platform == 'darwin'   # macOS 后端（Quartz / CGWindowList + screencapture）
 pyobjc-framework-Cocoa>=12.0,<13; sys_platform == 'darwin'    # macOS 读剪贴板图片（NSPasteboard）
-winsdk>=1.0.0b10,<1.0.0b11; sys_platform == 'win32'  # Windows Graphics Capture 后端（可选；未装则回退 PrintWindow/桌面区域抓取）
+winsdk>=1.0.0b10,<1.0.0b11; sys_platform == 'win32'  # Windows.Media.Ocr（OCR 引擎）+ WGC 的回退绑定
+# Windows Graphics Capture 的**推荐绑定**（PyWinRT）：它走标准 D3D11 互操作，因此在虚拟机/受限
+# 驱动上也能抓到被遮挡窗口；winsdk 只能借 WinML 拿设备，那条路在虚拟机上返回
+# DXGI_ERROR_UNSUPPORTED（实测 VMware SVGA 3D），于是 WGC 永远抓不到帧。
+# 未装时自动回退 winsdk（功能不缺失，只是抓不了被遮挡窗口）；体积合计约 0.7MB。
+winrt-runtime>=3.2.1,<4; sys_platform == 'win32'
+winrt-Windows.Foundation>=3.2.1,<4; sys_platform == 'win32'
+winrt-Windows.Foundation.Collections>=3.2.1,<4; sys_platform == 'win32'
+winrt-Windows.Graphics>=3.2.1,<4; sys_platform == 'win32'
+winrt-Windows.Graphics.Capture>=3.2.1,<4; sys_platform == 'win32'
+winrt-Windows.Graphics.Capture.Interop>=3.2.1,<4; sys_platform == 'win32'
+winrt-Windows.Graphics.DirectX>=3.2.1,<4; sys_platform == 'win32'
+winrt-Windows.Graphics.DirectX.Direct3D11>=3.2.1,<4; sys_platform == 'win32'
+winrt-Windows.Graphics.DirectX.Direct3D11.Interop>=3.2.1,<4; sys_platform == 'win32'
+winrt-Windows.Graphics.Imaging>=3.2.1,<4; sys_platform == 'win32'
 # OCR 回退（可选，未装则只走 Windows.Media.Ocr；如要装，请同样锁定上界）：
 # pytesseract>=0.3.13,<0.4; sys_platform == 'win32'

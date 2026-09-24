@@ -16,14 +16,24 @@ from cvision import input as inp
 
 
 class Recorder:
-    """记录每次调用的假 ``cvision.input`` 实现。"""
+    """记录每次调用的假 ``cvision.input`` 实现。
 
-    def __init__(self):
+    ``returns`` 可指定某个函数返回什么（给 ``ensure_front`` / ``window_at`` 这类**有返回值**的
+    接口用）；值若是异常实例则改为抛出，用来验证失败路径。
+    """
+
+    def __init__(self, returns=None):
         self.calls = []
+        self.returns = returns or {}
 
     def _make(self, name):
         def _fn(*args, **kwargs):
             self.calls.append((name, args, kwargs))
+            if name in self.returns:
+                value = self.returns[name]
+                if isinstance(value, BaseException):
+                    raise value
+                return value
         return _fn
 
     def __getattr__(self, name):
@@ -43,6 +53,8 @@ def run_cli(argv, recorder, *, get_clipboard_returns="剪贴板文本"):
         mock.patch.object(inp, "type_text", recorder.type_text),
         mock.patch.object(inp, "press_keys", recorder.press_keys),
         mock.patch.object(inp, "set_clipboard", recorder.set_clipboard),
+        mock.patch.object(inp, "window_at", recorder.window_at),
+        mock.patch.object(inp, "ensure_front", recorder.ensure_front),
         mock.patch.object(inp, "get_clipboard", lambda: get_clipboard_returns),
     ]
     for patch in patches:
@@ -178,6 +190,73 @@ class TestErrors(unittest.TestCase):
     def test_non_integer_coordinate_is_rejected(self):
         with self.assertRaises(SystemExit):
             run_cli(["--click", "abc", "2"], Recorder())
+
+
+class TestFrontGuard(unittest.TestCase):
+    """点击前置前与坐标归属校验的契约（``--window-at`` / ``--ensure-front`` / ``--focus-*``）。
+
+    这三条契约是「坐标没错却点错窗口」的防线：宿主在每次点击前都会用它们把「最近 see 的那个
+    窗口」置前，并复核点击坐标确实属于它。**失败必须非零退出**，否则调用方会把「没置前」
+    当成成功，接着点到压在上面的别的东西上。
+    """
+
+    MATCHING = {
+        "handle": 4242, "stale": False, "focused": True, "match": True,
+        "front_before": 4242, "front_after": 4242, "point_before": 4242, "point_after": 4242,
+    }
+
+    def test_window_at_reports_handle(self):
+        rec = Recorder(returns={"window_at": 4242})
+        code, out = run_cli(["--window-at", "10", "20"], rec)
+        self.assertEqual(rec.calls[0], ("window_at", (10, 20), {}))
+        self.assertEqual(json.loads(out), {"ok": True, "handle": 4242})
+        self.assertEqual(code, 0)
+
+    def test_ensure_front_passes_coordinates_through(self):
+        rec = Recorder(returns={"ensure_front": dict(self.MATCHING)})
+        code, out = run_cli(["--ensure-front", "4242", "--at", "10", "20"], rec)
+        self.assertEqual(rec.calls[0], ("ensure_front", (4242, (10, 20)), {}))
+        self.assertTrue(json.loads(out)["ok"])
+        self.assertEqual(code, 0)
+
+    def test_ensure_front_without_at_checks_front_only(self):
+        rec = Recorder(returns={"ensure_front": {"handle": 7, "stale": False, "focused": True, "match": False}})
+        code, out = run_cli(["--ensure-front", "7"], rec)
+        self.assertEqual(rec.calls[0], ("ensure_front", (7, None), {}))
+        self.assertTrue(json.loads(out)["ok"], "没给坐标时只看是否置前成功")
+        self.assertEqual(code, 0)
+
+    def test_ensure_front_blocks_when_point_belongs_to_another_window(self):
+        """校验不过时必须报 ok:false **且非零退出** —— 这是「宁可报错，绝不点偏」的落点。"""
+        rec = Recorder(returns={"ensure_front": dict(self.MATCHING, match=False, point_after=7)})
+        code, out = run_cli(["--ensure-front", "4242", "--at", "10", "20"], rec)
+        payload = json.loads(out)
+        self.assertFalse(payload["ok"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("已阻止这次点击", payload["error"], "失败原因要说清「为什么没点」")
+        self.assertIn(f"0x{4242:x}", payload["error"], "原因里要带上目标窗口，便于排查")
+
+    def test_ensure_front_reports_stale_window(self):
+        rec = Recorder(returns={"ensure_front": {"handle": 9, "stale": True, "focused": False, "match": False}})
+        code, out = run_cli(["--ensure-front", "9", "--at", "1", "1"], rec)
+        payload = json.loads(out)
+        self.assertTrue(payload["stale"], "宿主靠 stale 丢弃过期的窗口记录")
+        self.assertNotEqual(code, 0)
+
+    def test_focus_reports_real_handle(self):
+        rec = Recorder(returns={"focus_window": 4242})
+        code, out = run_cli(["--focus-handle", "4242"], rec)
+        self.assertEqual(json.loads(out), {"ok": True, "handle": 4242, "focused": True})
+        self.assertEqual(code, 0)
+
+    def test_focus_failure_is_reported_not_swallowed(self):
+        """置前失败**绝不能**回 {"ok": true}：旧实现的假成功正是点击点偏的根源。"""
+        rec = Recorder(returns={"focus_window": RuntimeError("前台锁定拒绝了这次激活")})
+        code, out = run_cli(["--focus-handle", "5"], rec)
+        payload = json.loads(out)
+        self.assertFalse(payload["ok"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("前台锁定", payload["error"])
 
 
 if __name__ == "__main__":

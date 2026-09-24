@@ -82,11 +82,161 @@ def bring_to_front(hwnd: int, gui, con) -> None:
         pass
 
 
-def focus_window(title_substr: str | None = None, handle: int | None = None) -> int | None:
+def attach_thread_for(current_tid: int, foreground_tid: int, target_tid: int) -> int | None:
+    """决定 ``AttachThreadInput`` 该把当前线程挂到**哪个**线程；``None`` 表示不用挂。
+
+    **只能挂前台窗口的线程**（``foreground_tid``）——Windows 的前台规则是「调用线程必须拥有
+    前台窗口的输入队列」。把当前线程挂到**目标窗口**的线程（这正是本插件旧实现的做法）满足
+    不了这条规则：真机实测 ``AttachThreadInput`` 直接返回 0，紧接着的 ``SetForegroundWindow``
+    照旧被前台锁定拒绝，于是 ``focus_window`` 100% 无效。
+
+    这个判断被单独抽成纯函数，就是为了让上面这条规则能被跨平台单测钉死，避免哪天又被改回去。
+    """
+    if not foreground_tid:
+        return None
+    if foreground_tid == target_tid:
+        return None  # 目标线程本身就是前台线程，无需附加
+    if foreground_tid == current_tid:
+        return None  # 当前线程已是前台线程，直接调用即可
+    return int(foreground_tid)
+
+
+def _force_foreground_native(hwnd: int) -> bool:
+    """尽力把 ``hwnd`` 变成**前台窗口**，返回是否真的成功（仅 Windows）。
+
+    为什么必须这么写（真机实测出来的缺陷）：``SetForegroundWindow`` 会被 Windows 的**前台锁定**
+    直接拒绝——非前台进程调用它几乎一定失败。而旧实现的两条路径都不成立：
+
+    * ``bring_to_front`` 只调 ``SetForegroundWindow`` + ``BringWindowToTop``，没有任何兜底；
+    * ``capture.windows._ensure_foreground`` 虽有 ``AttachThreadInput`` 兜底，却把当前线程挂到
+      **目标窗口的线程**上；前台规则要求的其实是「调用线程拥有**前台窗口**的输入队列」。
+      实测：挂目标线程时 ``AttachThreadInput`` 返回 0（附加失败），置前依旧失败；
+      挂前台线程返回 1，置前立刻成功。
+
+    因此顺序是：先给当前线程补一个消息队列（CLI 子进程的线程默认没有消息队列，附加会失败），
+    再挂**前台窗口的线程**并置前；仍失败就轻敲一次 ALT，让本进程成为「最后收到输入事件的进程」
+    以绕过前台锁定。最后以 ``GetForegroundWindow`` 的**实测结果**为准，不靠返回值猜。
+    """
+    import ctypes
+    import ctypes.wintypes as wt
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    def foreground() -> int:
+        return int(user32.GetForegroundWindow() or 0)
+
+    target = int(hwnd)
+    if foreground() == target:
+        return True
+
+    # 当前线程可能还没有消息队列；AttachThreadInput 要求调用线程有队列（CLI 子进程尤其如此）。
+    msg = wt.MSG()
+    user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, 0)
+
+    cur_tid = int(kernel32.GetCurrentThreadId())
+    pid = wt.DWORD()
+    fg = foreground()
+    fg_tid = int(user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))) if fg else 0
+    target_tid = int(user32.GetWindowThreadProcessId(target, ctypes.byref(pid)))
+
+    attached = False
+    attach_tid = attach_thread_for(cur_tid, fg_tid, target_tid)
+    if attach_tid is not None:
+        attached = bool(user32.AttachThreadInput(cur_tid, attach_tid, True))
+    try:
+        user32.BringWindowToTop(target)
+        user32.SetForegroundWindow(target)
+        user32.SetFocus(target)
+    except Exception:
+        pass
+    finally:
+        if attached:
+            try:
+                user32.AttachThreadInput(cur_tid, attach_tid, False)
+            except Exception:
+                pass
+
+    if foreground() == target:
+        return True
+
+    # 兜底：轻敲 ALT 把「最后输入事件」交给本进程，从而绕过前台锁定。
+    vk_menu, keyeventf_keyup = 0x12, 0x0002
+    try:
+        user32.keybd_event(vk_menu, 0, 0, 0)
+        user32.keybd_event(vk_menu, 0, keyeventf_keyup, 0)
+        user32.SetForegroundWindow(target)
+    except Exception:
+        pass
+    return foreground() == target
+
+
+def window_at(x: int, y: int) -> int:
+    """返回屏幕物理坐标 ``(x, y)`` 处**最顶层**窗口的句柄（无窗口时返回 0）。
+
+    用于点击前校验「这个坐标现在到底属于哪个窗口」——屏幕坐标点击只会命中该点最顶层的窗口，
+    这正是「坐标没错却点错窗口」的判据。
+    """
+    if not _is_windows():
+        raise RuntimeError("window_at 仅在 Windows 上支持（依赖 ctypes/win32）")
+    import ctypes
+    import ctypes.wintypes as wt
+
+    user32 = ctypes.windll.user32
+    user32.WindowFromPoint.restype = wt.HWND
+    user32.WindowFromPoint.argtypes = [wt.POINT]
+    hwnd = user32.WindowFromPoint(wt.POINT(int(x), int(y)))
+    if not hwnd:
+        return 0
+    root = user32.GetAncestor(hwnd, 2)  # GA_ROOT：从子控件上溯到顶层窗口
+    return int(root or hwnd)
+
+
+def ensure_front(handle: int, at: tuple[int, int] | None = None) -> dict:
+    """确保 ``handle`` 在前台（点击类动作的前置条件），可选校验坐标归属。
+
+    屏幕坐标点击只会命中**前台**窗口；目标不在前台时，点下去会打在压着它的窗口上，或者直接
+    落空。所以点击前先把它置前，并用 :func:`window_at` 复核 ``at=(x, y)`` 处的窗口就是它——
+    两条都成立才放行。
+
+    :returns: ``{"handle","stale","focused","match","front_before","front_after",
+        "point_before","point_after"}``。``stale=True`` 表示窗口已不存在（调用方应丢弃它）。
+    """
+    if not _is_windows():
+        raise RuntimeError("ensure_front 仅在 Windows 上支持")
+    import win32gui
+
+    target = int(handle)
+    if not win32gui.IsWindow(target):
+        return {"handle": target, "stale": True, "focused": False, "match": False}
+
+    front_before = int(win32gui.GetForegroundWindow() or 0)
+    point_before = window_at(*at) if at else 0
+    focused = front_before == target
+    if not focused:
+        focused = _force_foreground_native(target)
+    front_after = int(win32gui.GetForegroundWindow() or 0)
+    point_after = window_at(*at) if at else 0
+    return {
+        "handle": target,
+        "stale": False,
+        "focused": bool(focused),
+        "match": (point_after == target) if at else bool(focused),
+        "front_before": front_before,
+        "front_after": front_after,
+        "point_before": point_before,
+        "point_after": point_after,
+    }
+
+
+def focus_window(title_substr: str | None = None, handle: int | None = None) -> int:
     """把窗口置前：优先按 ``handle`` 精确定位，否则按标题（精确标题优先，其次子串）。
 
-    **只置前，不改窗口状态**：最小化的窗口会被还原，最大化/普通窗口保持原样（同理，不抢前台时也不
-    改尺寸）。Windows 用 pywin32；仅 Windows 支持。返回最终置前的窗口句柄。
+    **只置前，不改窗口状态**：最小化的窗口会被还原，最大化/普通窗口保持原样。仅 Windows 支持。
+
+    与旧实现的区别：置前后用 ``GetForegroundWindow`` **实测校验**，失败就抛
+    :class:`RuntimeError`——不再出现「调用返回成功、其实根本没置前」的假成功（那会让调用方
+    在一个并非前台的窗口上继续点击，点中的是压在上面的别的东西）。
     """
     if not _is_windows():
         raise RuntimeError("focus_window 仅在 Windows 上支持（依赖 pywin32）")
@@ -108,6 +258,11 @@ def focus_window(title_substr: str | None = None, handle: int | None = None) -> 
     if not win32gui.IsWindow(hwnd):
         raise LookupError(f"无效窗口句柄 {handle}")
     bring_to_front(hwnd, win32gui, win32con)
+    if not _force_foreground_native(hwnd):
+        raise RuntimeError(
+            f"窗口 0x{hwnd:x} 未能置前（仍停留在前台窗口 0x{int(win32gui.GetForegroundWindow() or 0):x}）。"
+            "Windows 前台锁定拒绝了这次激活；请重试，或先用鼠标点一下该窗口。"
+        )
     time.sleep(0.2)
     return hwnd
 

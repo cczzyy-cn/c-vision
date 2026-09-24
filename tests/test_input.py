@@ -9,7 +9,7 @@ import sys
 import unittest
 
 from cvision import input as input_module
-from cvision.input import bring_to_front, show_command_for
+from cvision.input import attach_thread_for, bring_to_front, show_command_for
 
 SW_RESTORE = 9
 SW_MAXIMIZE = 3
@@ -102,6 +102,32 @@ class TestBringToFront(unittest.TestCase):
                 raise OSError("前台锁")
 
         bring_to_front(1, Broken(), FakeCon())  # 不抛异常即为通过
+
+
+class TestAttachThreadFor(unittest.TestCase):
+    """``AttachThreadInput`` 必须挂到**前台窗口的线程**——真机实测出来的关键规则。
+
+    回归的 bug：旧实现挂的是**目标窗口**的线程。Windows 的前台规则是「调用线程必须拥有
+    **前台窗口**的输入队列」，所以那条附加满足不了规则：实测 ``AttachThreadInput`` 直接返回 0，
+    随后的 ``SetForegroundWindow`` 继续被前台锁定拒绝，``focus_window`` 在真机上 100% 无效。
+    后果不是「置前没生效」这么轻——click 只命中**前台**窗口，于是用户看到的是
+    「坐标明明没错，点了却没反应 / 点到了别的窗口上」。
+    """
+
+    def test_attaches_to_foreground_thread_not_target(self):
+        self.assertEqual(
+            attach_thread_for(100, 200, 300), 200,
+            "必须挂前台线程(200)，绝不能挂目标线程(300)",
+        )
+
+    def test_no_attach_when_target_is_already_foreground(self):
+        self.assertIsNone(attach_thread_for(100, 300, 300))
+
+    def test_no_attach_when_current_thread_is_foreground(self):
+        self.assertIsNone(attach_thread_for(200, 200, 300))
+
+    def test_no_attach_without_a_foreground_window(self):
+        self.assertIsNone(attach_thread_for(100, 0, 300))
 
 
 if __name__ == "__main__":

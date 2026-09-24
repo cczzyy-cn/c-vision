@@ -10,6 +10,124 @@
 > - `v0.1.0` ~ `v0.1.9` 的说明只在 [GitHub Releases](https://github.com/cczzyy-cn/c-vision/releases) 里
 >   （那时还没有本文件）。
 
+## v0.2.27
+
+**修好「WGC 明明能用、却永远抓不到帧」：换用标准 D3D11 互操作，虚拟机上也恢复了抓被遮挡窗口的能力。**
+
+背景：`see(handle=…)` 优先走 Windows Graphics Capture —— 它是唯一能抓**被遮挡窗口**、又不抢前台的
+路径。但它一直拿不到 D3D 设备，报 `DXGI_ERROR_UNSUPPORTED`（0x887A0004）。深挖后确认**机器没问题**：
+
+| 判据 | 实测 |
+| --- | --- |
+| `GraphicsCaptureSession.is_supported()` | **True** |
+| `D3D11CreateDevice(HARDWARE, 11_0)` | **成功**（hr=0x00000000） |
+| `CreateDirect3D11DeviceFromDXGIDevice` | **成功**（hr=0x00000000） |
+| `LearningModelDevice(DIRECT_X_*)` | 全部失败 —— 而旧实现**只走这一条** |
+
+原因：`winsdk` 没有暴露 D3D11 互操作，代码只能借 WinML 的 `LearningModelDevice` 变通拿设备；而 WinML
+要求的不只是「能建 D3D11 设备」，虚拟显卡（本机 VMware SVGA 3D）不满足它那套设备接口检查。
+
+- 修法：新增 `cvision/capture/wgc.py`，**优先用 PyWinRT（`winrt` 包）的标准互操作路径**：
+  `D3D11CreateDevice`（硬件，失败退 WARP）→ `QI(IDXGIDevice)` → 官方
+  `create_direct3d11_device_from_dxgi_device` → `create_for_window` → 抓帧；`winsdk` 的 WinML
+  路径保留为回退。两套绑定共用同一份抓帧代码。
+- **实测**：同一台虚拟机上，WGC 抓一个**不在前台、被 Chrome 遮挡**的 v2rayN 窗口，拿到了它完整的
+  真实界面（此前只能靠 `grab_region` 抓到遮挡者）。
+- **`wgc_probe()`**：可用性改为**真实探测**（不再只看 `import winsdk`），并回报实际生效的绑定
+  （`binding: winrt` / `winsdk`）。结果做**进程内 + 磁盘双缓存**：首次 ~280ms，之后 <1ms ——
+  CLI 每次调用都是新进程，没有磁盘缓存的话每次 `see` 都白付这 280ms（而抓一张图才 ~170ms）。
+  缓存带**环境指纹**（解释器/系统/两套绑定），装了 PyWinRT 会立刻失效重探。
+- **`cvision_status` 新增 `capture_backends`**：如实说明当前能抓什么、WGC 不可用时原因是什么。
+  旧行为只看 `deps.winsdk == true`，会把「抓不了被遮挡窗口」说成能抓。
+- **`requirements.txt` 新增 PyWinRT 系列**（Windows，合计约 0.7MB）；装了它 WGC 才走标准路径。
+  `winsdk` 仍然必需 —— `Windows.Media.Ocr` 用它。
+- 新增测试：Python 209 → **216**（探测缓存的失效语义：指纹不符 / 过期 / 时钟回拨 / 文件损坏，
+  以及「可用时不写缓存」）；JS 保持 70。
+
+## v0.2.26
+
+**新增 `click_at(rx, ry)`：按比例点击，让「模型自己看图定位」这条路径真正可用。**
+
+背景：模型读不准图片**像素**。`see()` 整屏抓的是 1920×1080，而模型实际收到的是 **1708×961**：
+存储层并不缩图（1920×1080 远在 8192px / 4.19M 像素的限额内），是 **LLM 路由在发往 provider 前**
+按 DeepSeek 的图片 token 规则缩的（`deepSeekRequestImageDimensions()`：14px patch 网格、每轴 3:1
+下采样、单图 1024 token 上限 —— 1920×1080 算出 1224 token 超限，解出的长边正是 1708）。
+照着自己看到的画面数像素直接用，右下角会偏 **212×119 px**；而插件侧**没有任何 API** 能问到
+「模型最终看到的尺寸」。
+
+- 修法不是去复现 provider 的缩放规则（那份规则绑在 `v41` 配置上，换版本或换模型就漂移），而是
+  **换一套坐标表达**：比例位置在缩放前后**不变**。
+- `see` 现在随图回报 `image_screen_box`（这张图覆盖的屏幕矩形），`click_at(rx, ry)` 用它换算
+  `screen = (x + rx·width, y + ry·height)`——与图片被缩放到多少像素**完全无关**，也不需要知道
+  任何 provider 规则。
+- 矩形在 **OCR 失败时依然有效**：纯图标界面一个词都认不出来，照样能按比例点。为此把几何计算从
+  OCR 的 `try` 块里拆出来，并抽成 `capturer.image_screen_frame()`，供 `capture_with_text` 与
+  `cli_server` 的非 text 抓取共用（两处各写一份迟早漂移）。
+- `click_at` 复用既有链路：同样会先把「最近一次 `see` 的窗口」置前、并校验坐标确实属于它，
+  复核不过就报错跳过；它还把**换算出的屏幕坐标**回报给模型，便于对照「我按比例指的点落在哪」。
+- 精度边界如实写进了工具描述与 README：比例差 1% ≈ 1920 宽屏上 19px，**小控件仍应优先用
+  `see(text=true)` 的 `screen_center`（±1px）**；`click_at` 解决的是「OCR 压根没覆盖到的目标」。
+- 新增测试：Python 204 → **209**（矩形与 `elements` 同坐标系、负原点、DPI 缩放、不退化成 0 尺寸）；
+  JS 保持 70。
+
+## v0.2.25
+
+**修一个真实缺陷：`see` 给的坐标是对的，但点击「点了没反应」或点到别的窗口上。**
+
+现象：`see(text=true)` 回来的 `screen_center` 精确到个位（实测误差 −1 px），照着点却什么都没发生，
+或者点中了压在上面的另一个窗口。用户侧的直观印象是「see 和定位点击有问题」，而**坐标那一环其实没问题**。
+
+根因全在「置前」这一步，三处叠加：
+
+1. **两处置前实现都是无效的**，而点击只命中**前台**窗口：
+   - `input.bring_to_front` 只调 `SetForegroundWindow` + `BringWindowToTop`——非前台进程调用它会被
+     Windows 前台锁定直接拒绝，没有任何兜底；
+   - `capture.windows._ensure_foreground` 有 `AttachThreadInput` 兜底，却把当前线程挂到**目标窗口的
+     线程**上。前台规则要求的是「调用线程拥有**前台窗口**的输入队列」：实测这样挂 `AttachThreadInput`
+     直接返回 0（附加失败），置前依旧失败；改挂**前台线程**返回 1，一击即中。
+2. **`focus_window` 无条件返回 `{ok:true}`**——置前失败也报成功，调用方于是放心去点。
+3. **`click` / `drag` / `scroll` 只看坐标**，既不校验该坐标此刻属于哪个窗口，也不会把目标置前。
+
+实测（自建标定窗口 + `ClientToScreen` 真值，1920×1080 / 100% 缩放）：
+
+| 环节 | 结果 |
+| --- | --- |
+| PrintWindow 位图原点 vs `GetWindowRect` | 偏移 **0 px**（坐标换算本身是对的） |
+| `see(text=true)` 元素定位 | 误差 −1 / +1 px |
+| 被遮挡的目标 + 旧 `focus_window` | 置前失败，点击**落空**（目标窗口收到 0 次点击） |
+| 同一坐标 + 修复后置前 | **命中目标**，点击坐标误差 **(0, 0)** |
+
+- 修法：新增 `input.attach_thread_for()`——纯函数，把「只能挂前台线程」这条规则钉死；
+  `input._force_foreground_native()`：补线程消息队列（CLI 子进程默认没有，附加必失败）→ 挂前台线程 →
+  置前 → 仍失败则轻敲 ALT 兜底 → **以 `GetForegroundWindow` 实测为准**。`focus_window` 失败即抛错。
+  `capture.windows._ensure_foreground` 改为复用同一份实现（旧的那份会让 GPU/合成窗口的 `see` 在目标
+  不在前台时抓到**遮挡者的画面**，而元素坐标仍按目标矩形换算——图文双错），避免两处再次漂移。
+- 新增能力：`cli_input --window-at X Y`（该屏幕点最顶层的窗口）、`--ensure-front H [--at X Y]`
+  （置前 + 坐标归属校验）；`cli_capture --text` 与 `cli_server` 的 `capture` 现在附带目标窗口 `handle`。
+- 宿主侧：`see` 记住目标窗口；`click`/`double_click`/`drag`/`scroll`/`type_text`/`press_key` 执行前自动
+  置前并复核坐标归属，**复核不过直接报错并跳过这次点击**（错误里写明「该点现在属于谁」），绝不静默点偏；
+  窗口已销毁时自动丢弃过期记录，不会永久卡住后续点击。`focus_window` 改为读 CLI 的真实结果，失败即报错。
+- 新增测试：Python 188 → **204**（`AttachThreadInput` 必须挂前台线程、`--window-at`/`--ensure-front`
+  的参数映射与失败非零退出、focus 失败不得被吞、同一行里 x 回退的词不得合并、纯符号碎片必须被丢掉）；
+  JS 保持 70。
+
+**同一版还修了 `see(text=true)` 的元素质量——那是「坐标对、却定位不到目标」的另一半原因。**
+
+- **负 gap 合并（主因）**：合并判据写的是 `gap <= join_gap`，而它对**负** gap 恒成立。偏偏 OCR 在
+  同一行内并不保证从左到右（两列的竖直中心差 1~2px 就会让右边那列排到前面），于是「修改日期」列被
+  硬并进「文件名」列，拼出 `23 2 17 / / ： scripts` 这种跨列碎片——它的中心点正好落在两列之间的空隙上，
+  点它等于点在空气里。实测一份 248 词的窗口里这类错误合并 **77 次**、超宽跨列碎片 13 个；修后**均为 0**。
+  修法两步：先聚成「行」、再在**行内按 x 排序**，并给 gap 补上负值下限（只容忍词框的轻微重叠）。
+- **OCR 放大**：`Windows.Media.Ocr` 对**小字**识别得很差。同一张 1353×782 的窗口图，1x 时把 `scripts`
+  认成 `scrlpts`、`2026/9/23` 认成 `2025/g/23`、`文件夹` 认成 `文 仁 夹`。改为先按经验放大 **3x**
+  再识别（长边上限 4200px，避免 4K 截图被放大到上亿像素），拿该目录里真实存在的 15 个文件名当真值，
+  命中从 **3/15 升到 9/15**，而元素总数几乎不变（103 → 106）。代价是 OCR 耗时 146ms → 331ms。
+  `words` 坐标会按倍数**还原成原图坐标**，调用方完全无感。
+- **纯符号碎片不再占名额**：`/`、`:`、`--` 这类短碎片不可能被点击，却会挤掉真正能点的控件。
+  判据刻意保守（长度 > 2 一律保留，且只认分隔符字符集），所以 `×`（关闭）、`下`、`OK` 都照常保留。
+- **截断提示给全**：`max_elements` 默认 40 → **60**，且截断时直接写明「要拿全请传 max_elements=N」——
+  实测一个资源管理器窗口就有 100+ 个元素，前 40 个只覆盖屏幕上半部分，模型会误以为目标不在界面上。
+
 ## v0.2.24
 
 **修一个真实缺陷：`wait_until_changed` 每一次调用都必然失败——返回值里带着 schema 没声明的键。**
