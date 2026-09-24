@@ -10,7 +10,7 @@ Python 版 cvision** 截屏/OCR/输入 → 写入 Harness 附件服务（`ctx.at
 
 同一个包还带一个**浏览器半边**：输入框工具栏的「截图」按钮（人工一键抓屏，或把剪贴板里的图片作为附件）。
 
-**版本**：`0.2.29` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
+**版本**：`0.2.30` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
 **许可**：BSD-3-Clause · 变更历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 目录
@@ -81,7 +81,7 @@ python -m pip install -r <插件安装目录>\requirements.txt
 | `cvision_status()` | 运行环境健康探针（Python 版本、平台后端、OCR 引擎、依赖/后端是否可用、`platform_support` 三态、本平台能力清单） |
 | `wait_for_window(title?, timeout?)` | 轮询等某个窗口出现（默认 500ms/次，10s 超时） |
 | `wait_until_stable(window?, handle?, region?, interval?, stable_samples?, timeout?, threshold?, format?)` | 轮询截图，**直到画面连续若干次不再变化**才返回（等加载完成/等动画结束）。返回 `stable`/`diff_ratio`/`max_diff_ratio`/`stable_for`/`width`/`height`；与上一个的区别是「等**变完**」而非「等开始变」（v0.2.29 起） |
-| `wait_until_changed(window?, handle?, region?, interval?, timeout?, threshold?, format?)` | 轮询截图，**直到画面真的变了**才把那一帧返回（等进度条/等弹窗）。返回 `changed`/`diff_ratio`/`diff_bbox`/`width`/`height`（未变化时没有 `diff_bbox`）；默认阈值 0.01 |
+| `wait_until_changed(window?, handle?, region?, interval?, timeout?, threshold?, format?)` | 轮询截图，**直到画面真的变了**才把那一帧返回（等进度条/等弹窗）。返回 `changed`/`diff_ratio`/`diff_bbox`/`diff_boxes`/`width`/`height`（未变化时没有 `diff_bbox`）；**返回的图里变化区域已用红框标出**，`diff_boxes` 是**分开的**变化区域（v0.2.30 起）；默认阈值 0.01 |
 
 ### 点击定位：`see(text=true)`
 
@@ -219,6 +219,9 @@ GET /cvision/model-capability?provider=<id>&model=<id>
   「**连续 N 次**没变化」，后者只等「变过一次」。加载中的画面一直在动，用后者你只知道「它动过」，
   还得反复 `see` 复查、白烧轮次。**务必配 `region` 只盯结果区**——别处的光标闪烁与时钟走字会让整屏
   永远「不稳定」，那样只能等到超时（返回 `stable: false`，并给出 `max_diff_ratio` 说明动得多厉害）。
+- ✅ **`wait_until_changed` 返回的图里，变化区域已经用红框标出（v0.2.30 起）**：直接看框就知道
+  「哪里变了」，不必去读 `diff_bbox` 的数字。另外注意 `diff_bbox` 是**把所有变化包在一起**的总框——
+  两处同时变时它会横跨整屏、基本没有信息量；要看**分开的**改动请用 `diff_boxes`（最多 5 处，按变化量排序）。
 
 ## 电脑使用（computer-use）推荐流程
 
@@ -321,7 +324,7 @@ npm run check:deps   # Python 依赖锁定自检（9 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
-当前规模：**JS 72 条 + Python 236 条**。
+当前规模：**JS 73 条 + Python 246 条**。
 
 ### 文档约定（自动校验）
 
@@ -439,7 +442,7 @@ vision/                      # 仓库根 = 插件本体
     detect.py            #   纯逻辑判定（GPU 类/空白帧），不依赖 win32，可跨平台单测
     coordinates.py       #   图片像素 → 屏幕绝对坐标（裁剪/窗口/多屏/DPI 四层换算）
     ui_elements.py       #   词框合并成可点击元素（同行相邻词合并 + padding + 屏幕坐标）
-    diff.py              #   帧间差异度量（灰度缩略图 + 变化占比 + 变化区域），供两个 wait_until_* 共用
+    diff.py              #   帧间差异度量 + 变化区域聚类 + 高亮画框，供两个 wait_until_* 共用
     diagnose.py          #   窗口跟踪诊断（默认关闭、零开销）：定位「抓图是否挪动了窗口」
     encoding.py          #   PIL -> data URL；crop_region；fit_for_attachment（附件缩图）
     screen.py            #   显示器/DPI 布局（Windows/macOS；Linux 回退 PIL 单屏）

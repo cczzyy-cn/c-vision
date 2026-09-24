@@ -109,5 +109,86 @@ class TestScaleBbox(unittest.TestCase):
         self.assertIsNone(diff.scale_bbox((0, 0, 1, 1), (0, 0), (10, 10)))
 
 
+class TestChangeClusters(unittest.TestCase):
+    """变化区域聚类：**分开的**改动必须分别成框。
+
+    这是 ``diff_bbox`` 单框缺陷的补丁——它包裹的是**全部**变化像素，两处同时变时那个框会横跨
+    整屏（数值没错，信息量为零）。聚类之后，分开的改动才各得其所。
+    """
+
+    def _with_blocks(self, blocks, size=(160, 120)):
+        before = flat(size, 0)
+        after = before.copy()
+        for ox, oy, side in blocks:
+            for x in range(ox, ox + side):
+                for y in range(oy, oy + side):
+                    after.putpixel((x, y), 255)
+        return before, after
+
+    def test_two_separate_changes_become_two_boxes(self):
+        before, after = self._with_blocks([(0, 0, 16), (144, 104, 16)])
+        boxes = diff.change_clusters(before, after)
+        self.assertEqual(len(boxes), 2, "两处相距很远的变化必须各成一框")
+        # 一框在左上、一框在右下（顺序按变化量排，这里量相同，所以按位置判定）
+        left = min(boxes, key=lambda b: b[0])
+        right = max(boxes, key=lambda b: b[0])
+        self.assertLess(left[0], 32)
+        self.assertGreater(right[0], 128)
+
+    def test_a_lone_change_is_covered_by_its_box(self):
+        before, after = self._with_blocks([(40, 40, 16)])
+        boxes = diff.change_clusters(before, after)
+        self.assertEqual(len(boxes), 1)
+        x, y, w, h = boxes[0]
+        self.assertLessEqual(x, 40)
+        self.assertLessEqual(y, 40)
+        self.assertGreaterEqual(x + w, 56)
+        self.assertGreaterEqual(y + h, 56)
+
+    def test_no_change_gives_no_boxes(self):
+        self.assertEqual(diff.change_clusters(flat(), flat()), [])
+
+    def test_size_mismatch_is_not_clustered(self):
+        """尺寸都变了（换分辨率/换窗口大小）时给不出有意义的框，返回空让调用方用整图。"""
+        self.assertEqual(diff.change_clusters(flat((10, 10)), flat((20, 20))), [])
+
+    def test_max_clusters_caps_the_result_but_keeps_the_biggest(self):
+        blocks = [((i % 3) * 56, (i // 3) * 56, 8) for i in range(6)]
+        before, after = self._with_blocks(blocks)
+        self.assertEqual(len(diff.change_clusters(before, after, max_clusters=10)), 6, "放开上限应得到 6 个独立区域")
+        self.assertEqual(len(diff.change_clusters(before, after, max_clusters=3)), 3, "上限要真的生效")
+        # 默认上限就是 CLUSTER_MAX：碎块再多也不该无边界地塞给模型。
+        self.assertEqual(len(diff.change_clusters(before, after)), diff.CLUSTER_MAX)
+
+
+class TestScaleBoxes(unittest.TestCase):
+    def test_scales_every_box(self):
+        out = diff.scale_boxes([(8, 8, 8, 8), (16, 16, 8, 8)], (160, 120), (1600, 1200))
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["x"], 78, "8 缩略图像素 × 10 倍，再减 2px 余量")
+
+    def test_empty_input_stays_empty(self):
+        self.assertEqual(diff.scale_boxes([], (160, 120), (1600, 1200)), [])
+
+
+class TestHighlightBoxes(unittest.TestCase):
+    def test_draws_onto_a_copy_and_leaves_the_original_alone(self):
+        img = flat((100, 80), 0)
+        out = diff.highlight_boxes(img, [{"x": 10, "y": 10, "w": 20, "h": 20}])
+        self.assertIsNot(out, img, "必须返回新图")
+        self.assertEqual(img.getpixel((10, 10)), 0, "原图不能被改动")
+        self.assertNotEqual(out.getpixel((10, 10)), 0, "框线要真的画上去")
+
+    def test_box_is_closed_on_all_four_sides(self):
+        img = flat((100, 80), 0)
+        out = diff.highlight_boxes(img, [{"x": 10, "y": 10, "w": 20, "h": 20}], width=1)
+        for point in ((10, 10), (29, 10), (10, 29), (29, 29)):
+            self.assertNotEqual(out.getpixel(point), 0, f"四角 {point} 都该有框线")
+
+    def test_no_boxes_returns_the_original_untouched(self):
+        img = flat()
+        self.assertIs(diff.highlight_boxes(img, []), img)
+
+
 if __name__ == "__main__":
     unittest.main()

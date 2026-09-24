@@ -232,7 +232,14 @@ def wait_until_changed(
         samples += 1
         metrics = diff_mod.diff_metrics(base_thumb, diff_mod.thumbnail(current), pixel_delta)
         if metrics["diff_ratio"] >= threshold:
-            full = encoding.fit_for_attachment(current, format=format)
+            current_thumb = diff_mod.thumbnail(current)
+            boxes = diff_mod.scale_boxes(
+                diff_mod.change_clusters(base_thumb, current_thumb, pixel_delta),
+                current_thumb.size,
+                current.size,
+            )
+            # **先画框再 fit_for_attachment**：后者可能缩放图片，框得跟着一起缩才不会错位。
+            full = encoding.fit_for_attachment(diff_mod.highlight_boxes(current, boxes), format=format)
             return full, {
                 "changed": True,
                 "samples": samples,
@@ -240,6 +247,7 @@ def wait_until_changed(
                 "diff_ratio": round(metrics["diff_ratio"], 6),
                 "mean_diff": round(metrics["mean_diff"], 3),
                 "diff_bbox": diff_mod.scale_bbox(metrics["bbox"], base_thumb.size, current.size),
+                "diff_boxes": boxes,
             }
         baseline, base_thumb = current, diff_mod.thumbnail(current)
 
@@ -251,6 +259,7 @@ def wait_until_changed(
         "diff_ratio": round(metrics["diff_ratio"], 6),
         "mean_diff": round(metrics["mean_diff"], 3),
         "diff_bbox": None,
+        "diff_boxes": [],
     }
 
 

@@ -588,6 +588,7 @@ const WAIT_CHANGED_PAYLOAD = {
   diff_ratio: 0.031,
   mean_diff: 12.5,
   diff_bbox: { x: 10, y: 20, w: 30, h: 40 },
+  diff_boxes: [{ x: 10, y: 20, w: 30, h: 40 }],
 }
 
 /** `wait_until_changed` 声明的可返回键（`ref` 由 execute 另加，不由整形函数产出）。 */
@@ -613,13 +614,21 @@ test('wait_until_changed：返回值就是 schema 声明的那套键（多一个
 
 test('wait_until_changed：未变化时 diff_bbox=null 必须被丢掉（schema 声明的是 object）', () => {
   const declared = declaredWaitChangedKeys()
-  const meta = waitChangedMeta({ ...WAIT_CHANGED_PAYLOAD, changed: false, diff_ratio: 0, mean_diff: 0, diff_bbox: null })
+  const meta = waitChangedMeta({ ...WAIT_CHANGED_PAYLOAD, changed: false, diff_ratio: 0, mean_diff: 0, diff_bbox: null, diff_boxes: [] })
   assert.ok(!('diff_bbox' in meta), 'null 不能原样进返回值：schema 写的是 type: object')
   assert.equal(meta.changed, false)
   for (const [key, value] of Object.entries(meta)) {
     assert.notEqual(value, null, `${key} 不应为 null`)
     assert.ok(declared.includes(key), `${key} 必须在 schema 里声明`)
   }
+})
+
+test('wait_until_changed：多处变化时 diff_boxes 要如实带上', () => {
+  // 这是 diff_bbox 的固有缺陷的补丁：两处同时变时那个总框会横跨整屏、没有信息量，
+  // 所以另外给出分开的框（并且已经画进返回的图里，模型直接看图最省事）。
+  const boxes = [{ x: 1, y: 2, w: 3, h: 4 }, { x: 50, y: 60, w: 7, h: 8 }]
+  const meta = waitChangedMeta({ ...WAIT_CHANGED_PAYLOAD, diff_boxes: boxes })
+  assert.deepEqual(meta.diff_boxes, boxes, '分开的变化区域必须原样带出')
 })
 
 // ── wait_until_stable：同一条不变量，但**字段是另一套** ────────────────────────
