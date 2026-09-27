@@ -29,6 +29,8 @@ from cvision.detect import (
     is_blank_image as _is_blank_image,
     looks_like_gpu_class as _looks_like_gpu_class,
 )
+# 跨进程输入互斥：抓图有两条分支**会改前台/Z 序**，而前台与输入设备是同一个资源（见 input_lock 文档）
+from cvision.input_lock import ForegroundGuard
 # 窗口跟踪诊断（默认关闭、零开销；开启后能确定「哪一步动了窗口」，见 cvision/diagnose.py）
 from cvision.diagnose import snapshot as _trace_snapshot
 from cvision.diagnose import trace_capture as _trace_capture
@@ -463,7 +465,14 @@ def capture_window(
     _tr_backend = "none"
     _tr_outcome = "exception"
 
+    # 惰性跨进程锁：**真的**要改前台/Z 序时才取（见下面两处 ensure），抓完并还原后释放。
+    # 为什么需要：置前/还原和输入抢的是同一个前台，而且正好能插进另一个进程「已校验坐标、还没点下去」
+    # 的那个窗口期——那时它算好的坐标会落到别的窗口上，我们抓到的画面也会是遮挡者的。
+    guard = ForegroundGuard(label=f"抓取窗口 0x{int(handle):x}")
+
     def _grab_region() -> Image.Image:
+        # 读合成桌面区域**必须**让目标窗口在最前（否则抓到的是遮挡它的窗口），这就是改前台。
+        guard.ensure("兜底读屏需要把目标窗口置前")
         _ensure_foreground(handle)
         rect = _safe_get_window_rect(handle)
         if rect is None:
@@ -471,6 +480,9 @@ def capture_window(
         return _grab_rect(*rect)
 
     try:
+        if saved_placement is not None:
+            # 只有 maximize / 还原最小化窗口这两条分支才会改窗口状态与前台。
+            guard.ensure("需要最大化窗口或还原被最小化的窗口")
         _prepare_window_for_capture(handle, maximize=maximize)
         if _tr is not None:
             _tr = _trace_step(handle, "prepare(maximize=%s)" % maximize, _tr) or _tr
@@ -505,7 +517,9 @@ def capture_window(
     finally:
         # saved_placement 只在「我们确实改过窗口状态」时才非 None（见 should_restore_placement）：
         # 普通窗口抓取时它是 None，_restore_placement 直接返回 —— 不会去撤销用户的吸附/分屏。
+        # 顺序要紧：**先把窗口状态还原、再放锁**，否则别的进程会在「还没还原」的空档里动手。
         _restore_placement(handle, saved_placement)
+        guard.release()
         if _tr is not None:
             _trace_capture(handle, _tr_backend, _tr_outcome, _tr, _trace_snapshot(handle))
 

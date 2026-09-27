@@ -22,6 +22,8 @@ import sys
 import time
 
 from cvision import capturer, encoding
+# 「会改前台」的抓取被跨进程输入锁挡住时抛的就是这个（见 cvision/input_lock.py 的锁边界表）
+from cvision.input_lock import ForegroundBusy
 
 
 def _capture_with_text(args) -> int:
@@ -116,7 +118,7 @@ def _wait_stable(args) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def _run(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="截屏输出 base64 data URL，或列出窗口")
     parser.add_argument("--list", action="store_true", help="列出可见窗口(JSON)，不截图")
     parser.add_argument("--screen-info", action="store_true", help="输出显示器/DPI 布局(JSON)，不截图")
@@ -185,6 +187,20 @@ def main(argv: list[str] | None = None) -> int:
 
     sys.stdout.write(encoding.image_to_data_url(img, format=args.format))
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI 入口：把**预期内**的拒绝打成一行说明，而不是一屏 traceback。
+
+    抓图要改前台、但另一个进程正在操作电脑时，``capture_window`` 会抛 :class:`ForegroundBusy`
+    （消息本身就是可行动的人话）。常驻 server 路径上它已经是干净的 JSON 错误；CLI 回退路径若让它
+    冒成 traceback，那句提示就会被埋在一堆栈帧里——而它恰恰是要给用户看的那一句。
+    """
+    try:
+        return _run(argv)
+    except ForegroundBusy as e:
+        sys.stderr.write(str(e) + "\n")
+        return 1
 
 
 if __name__ == "__main__":

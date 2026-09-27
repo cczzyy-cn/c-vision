@@ -9,12 +9,13 @@
  * 需要先构建（`npm run build`）——这里跑的是 DSH 真正会加载的 `lib/index.js`。
  */
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test, { mock } from 'node:test'
 
 /** 让出一个宏任务：用于推进被 await 的处理器（如「截图进行中」的时序用例）。 */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
 
-const { apply, snipExecutor, clipboardProbe, describeRuntimeProblem, PIP_HINT, ensureRuntime, waitChangedMeta, stableMeta } =
+const { apply, snipExecutor, clipboardProbe, inputRunner, operationTarget, withLockLabel, describeRuntimeProblem, PIP_HINT, ensureRuntime, waitChangedMeta, stableMeta } =
   await import('../lib/index.js')
 
 /** 捕获 apply 注册的路由与工具定义。 */
@@ -677,5 +678,144 @@ test('wait_until_stable：未稳定（超时）也是正常返回值，同样不
   for (const [key, value] of Object.entries(meta)) {
     assert.notEqual(value, null, `${key} 不应为 null`)
     assert.ok(declared.includes(key), `${key} 必须在 schema 里声明`)
+  }
+})
+
+// ── 输入动作：置前与动作必须落在**同一次** CLI 调用里 ────────────────────────────
+//
+// 为什么这条值得机械地钉住：跨进程输入互斥（cvision/input_lock.py）是在 **CLI 进程内**取的，所以
+// 「先调一次 --ensure-front、再调一次动作」中间**有缝**——另一个 DSH 实例正好在那条缝里把它的窗口
+// 置前，我们这一击就落到它的窗口上，而坐标全对。这类故障在真实使用中只表现为「偶发点错窗口」，
+// 人肉回归根本发现不了，只能断言 argv 的形状。
+
+/** 用假 runner 跑一段输入工具调用，返回 runner 收到的每一批 argv。 */
+async function captureInputArgs(outcomes, run) {
+  const calls = []
+  const original = inputRunner.run
+  inputRunner.run = async (args) => {
+    calls.push([...args])
+    const outcome = outcomes[Math.min(calls.length - 1, outcomes.length - 1)]
+    if (outcome instanceof Error) throw outcome
+    return outcome
+  }
+  try {
+    return await run(calls)
+  } finally {
+    inputRunner.run = original
+    operationTarget.handle = null
+    operationTarget.frame = null
+  }
+}
+
+/** 工具 execute 需要的执行上下文（只用到 signal）。 */
+const fakeExec = () => ({ signal: new AbortController().signal })
+
+test('click：置前与点击必须在同一次 CLI 调用里（否则跨进程互锁中间有缝）', async () => {
+  const { tool } = mountHost()
+  operationTarget.handle = 4242
+  await captureInputArgs([{ ok: true }], async (calls) => {
+    await tool('click').execute({ x: 10, y: 20 }, fakeExec())
+    assert.equal(calls.length, 1, '置前与动作不许拆成两次调用')
+    assert.deepEqual(calls[0], ['--ensure-front', '4242', '--unblock', '--at', '10', '20', '--click', '10', '20'])
+  })
+})
+
+test('click：没 see 过目标时只跑动作本身（不带 --ensure-front）', async () => {
+  const { tool } = mountHost()
+  await captureInputArgs([{ ok: true }], async (calls) => {
+    await tool('click').execute({ x: 3, y: 4 }, fakeExec())
+    assert.deepEqual(calls, [['--click', '3', '4']], '没有目标窗口就没有前置校验可做')
+  })
+})
+
+test('click：前置校验不过要报错，且绝不单独再点一次', async () => {
+  const { tool } = mountHost()
+  operationTarget.handle = 4242
+  await captureInputArgs([{ ok: false, error: '坐标 (10, 20) 处最顶层的窗口是 0x200「记事本」' }], async (calls) => {
+    await assert.rejects(() => tool('click').execute({ x: 10, y: 20 }, fakeExec()), /0x200/)
+    assert.equal(calls.length, 1, 'CLI 已经在持锁区间内把动作挡住了，宿主不许再补一次点击')
+  })
+})
+
+test('click：目标窗口已消失（stale）→ 丢掉过期记录并只跑动作本身', async () => {
+  const { tool } = mountHost()
+  operationTarget.handle = 9
+  await captureInputArgs([{ ok: false, stale: true }, { ok: true }], async (calls) => {
+    await tool('click').execute({ x: 1, y: 2 }, fakeExec())
+    assert.equal(calls.length, 2)
+    assert.ok(calls[0].includes('--ensure-front'), '第一次要带前置校验，才知道窗口已经没了')
+    assert.deepEqual(calls[1], ['--click', '1', '2'], '重跑时不得再带已经过期的前置校验')
+    assert.equal(operationTarget.handle, null, '过期记录必须清掉，否则会永久卡住之后的点击')
+  })
+})
+
+test('type_text：置前合并进同一次调用，且不带 --at（键盘输入没有坐标）', async () => {
+  const { tool } = mountHost()
+  operationTarget.handle = 77
+  await captureInputArgs([{ ok: true }], async (calls) => {
+    await tool('type_text').execute({ text: 'hello' }, fakeExec())
+    assert.deepEqual(calls[0], ['--ensure-front', '77', '--unblock', '--type', 'hello'])
+  })
+})
+
+test('scroll：水平/竖直都走同一条合并路径，前置校验的坐标就是鼠标所在点', async () => {
+  const { tool } = mountHost()
+  operationTarget.handle = 100
+  await captureInputArgs([{ ok: true }, { ok: true }], async (calls) => {
+    await tool('scroll').execute({ x: 5, y: 6, dx: 3 }, fakeExec())
+    await tool('scroll').execute({ x: 7, y: 8, dy: -2 }, fakeExec())
+    assert.deepEqual(calls[0], ['--ensure-front', '100', '--unblock', '--at', '5', '6', '--scroll-h', '5', '6', '3'])
+    assert.deepEqual(calls[1], ['--ensure-front', '100', '--unblock', '--at', '7', '8', '--scroll', '7', '8', '-2'])
+  })
+})
+
+// ── 跨进程输入锁：会话身份 + 等待上限的预算关系 ─────────────────────────────────
+
+test('输入锁：exec.agent 的会话 id 要变成 --lock-label（超时的人才知道去找谁）', () => {
+  const args = withLockLabel(['--click', '1', '2'], { signal: new AbortController().signal, agent: { id: 'sess-42' } })
+  const at = args.indexOf('--lock-label')
+  assert.ok(at >= 0, '持有者记录里要能看出是哪个会话占着锁')
+  assert.equal(args[at + 1], 'session=sess-42')
+  assert.deepEqual(args.slice(0, 3), ['--click', '1', '2'], '原参数不许被改动')
+})
+
+test('输入锁：拿不到会话身份时就不带 --lock-label（不编一个假身份出来）', () => {
+  const bare = { signal: new AbortController().signal }
+  assert.deepEqual(withLockLabel(['--click', '1', '2'], bare), ['--click', '1', '2'])
+  assert.deepEqual(withLockLabel(['--click', '1', '2'], { ...bare, agent: {} }), ['--click', '1', '2'])
+  assert.deepEqual(withLockLabel(['--click', '1', '2'], { ...bare, agent: { id: 123 } }), ['--click', '1', '2'])
+})
+
+test('输入锁：超长的会话 id 要截断（它只是给人看的诊断信息，不该把一条错误消息撑成一屏）', () => {
+  const args = withLockLabel([], { signal: new AbortController().signal, agent: { id: 'x'.repeat(200) } })
+  assert.equal(args[1].length, 'session='.length + 64)
+})
+
+test('输入锁：身份只在两处注入（标准输入路径 1 处 + get_clipboard 自己 1 处）', () => {
+  // 为什么是源码级断言：`withLockLabel` 是纯函数（上面已单测），真正会漂的是**注入点**——
+  // 多一处调用就多一条「有的路径带了身份、有的没带」的路。故意新增注入点时，请同时改这个数字。
+  const lib = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const occurrences = [...lib.matchAll(/withLockLabel\(/g)].length
+  assert.equal(occurrences, 3, `withLockLabel 应为 1 处定义 + 2 处调用，实际 ${occurrences} 处`)
+})
+
+test('输入锁的等待上限必须给动作留出足够时间（锁等待 + 动作 < 工具超时）', () => {
+  // 跨语言不变量：Python 侧的等待上限一调大，这条就会红。规则：等待上限 ≤ 工具超时的 1/3，
+  // 这样即使真的等到最后一刻，动作本身仍有 2/3 的预算——否则工具会在等待中被宿主 abort。
+  const source = readFileSync(new URL('../cvision/input_lock.py', import.meta.url), 'utf8')
+  const lockWaitMs = Number(source.match(/DEFAULT_TIMEOUT_S\s*=\s*([\d.]+)/)?.[1]) * 1000
+  assert.ok(Number.isFinite(lockWaitMs) && lockWaitMs > 0, 'input_lock.py 里要能读到 DEFAULT_TIMEOUT_S')
+  const { definitions } = mountHost()
+  const inputTools = [
+    'click', 'click_at', 'double_click', 'mouse_move', 'scroll', 'drag',
+    'type_text', 'press_key', 'focus_window', 'get_clipboard', 'set_clipboard',
+  ]
+  for (const name of inputTools) {
+    const tool = definitions.find((definition) => definition.name === name)
+    assert.ok(tool, `${name} 必须注册`)
+    assert.ok(
+      lockWaitMs * 3 <= tool.timeoutMs,
+      `${name}: 锁等待 ${lockWaitMs}ms 超过它超时的 1/3（${tool.timeoutMs}ms）——等待会把动作预算吃光`,
+    )
   }
 })

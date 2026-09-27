@@ -160,5 +160,126 @@ class TestShouldRestorePlacement(unittest.TestCase):
 # 不适合放进 unittest 套件，所以这里刻意不留一个永远 skip 的占位用例冒充覆盖。
 
 
+@unittest.skipIf(win_backend is None, f"仅 Windows 可跑：{_IMPORT_ERROR}")
+class TestForegroundGuardWiring(unittest.TestCase):
+    """**会动前台**的抓取必须跨进程互斥，纯只读的抓取必须不取锁。
+
+    为什么值得钉：跨进程输入锁的粒度是「一个资源 = 一套输入设备 + 前台/Z 序」。抓图里有两条分支会改
+    前台（maximize / 还原最小化、以及兜底读屏），它们正好能插进另一个进程「已校验坐标、还没点下去」
+    的那个窗口期；而绝大多数抓取是纯只读的，把它们也锁进去会让「另一个会话在打字」时连截图都做不了。
+    两个方向都得钉住，否则改起来只会往一边漂。
+    """
+
+    class FakeGuard:
+        """记录 ensure/release 的假守卫（真守卫的互斥语义由 test_input_lock.py 测）。"""
+
+        instances = []
+        order = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.ensured = []
+            self.released = 0
+            self.state = None
+            self.reason = ""
+            TestForegroundGuardWiring.FakeGuard.instances.append(self)
+
+        def ensure(self, reason):
+            self.ensured.append(reason)
+            self.reason = self.ensured[0]
+            TestForegroundGuardWiring.FakeGuard.order.append("ensure")
+
+        def release(self):
+            self.released += 1
+            TestForegroundGuardWiring.FakeGuard.order.append("release")
+
+    def setUp(self):
+        from unittest import mock
+
+        self.mock = mock
+        self.FakeGuard.instances = []
+        self.FakeGuard.order = []
+        self._patch = mock.patch.object(win_backend, "ForegroundGuard", self.FakeGuard)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+    def _run_capture(self, *, maximize=False, iconic=False, wgc_ok=False, gpu=False):
+        """跑一次 capture_window，返回 (守卫实例, restore mock)。
+
+        默认配置让 WGC 成功（纯只读路径）；gpu=True 时走 `_grab_region`（会置前）。
+        """
+        restore_order = self.FakeGuard.order
+
+        def _restore(*_args):
+            restore_order.append("restore")
+
+        with self.mock.patch.object(win_backend.win32gui, "IsIconic", return_value=iconic), \
+             self.mock.patch.object(win_backend, "_safe_get_placement", return_value="PLACEMENT"), \
+             self.mock.patch.object(win_backend, "_restore_placement", side_effect=_restore) as restore, \
+             self.mock.patch.object(win_backend, "_prepare_window_for_capture"), \
+             self.mock.patch.object(win_backend, "_wgc_backend_available", return_value=wgc_ok), \
+             self.mock.patch.object(win_backend, "capture_window_wgc", return_value="IMG"), \
+             self.mock.patch.object(win_backend, "_print_window", return_value="IMG"), \
+             self.mock.patch.object(win_backend, "_is_blank_image", return_value=False), \
+             self.mock.patch.object(win_backend, "_is_gpu_composited_window", return_value=gpu), \
+             self.mock.patch.object(win_backend, "_ensure_foreground"), \
+             self.mock.patch.object(win_backend, "_safe_get_window_rect", return_value=(0, 0, 4, 4)), \
+             self.mock.patch.object(win_backend, "_grab_rect", return_value="IMG"), \
+             self.mock.patch.object(win_backend.time, "sleep", lambda *_: None):
+            win_backend.capture_window(handle=4321, maximize=maximize)
+        guard = self.FakeGuard.instances[-1]
+        return guard, restore
+
+    def test_readonly_capture_takes_no_lock(self):
+        """WGC 成功 = 纯只读：**不该**碰跨进程锁（否则另一个会话一打字，连截图都做不了）。"""
+        guard, _ = self._run_capture(wgc_ok=True)
+        self.assertEqual(guard.ensured, [], "只读抓取不该取锁")
+        self.assertEqual(guard.released, 1, "没取过也要能安全 release")
+
+    def test_maximize_capture_takes_the_lock(self):
+        """maximize=true 会改窗口状态与前台 → 必须取锁。"""
+        guard, _ = self._run_capture(maximize=True)
+        self.assertTrue(guard.ensured, "会改前台的抓取必须取锁")
+        self.assertIn("最大化", guard.ensured[0])
+        self.assertEqual(guard.released, 1)
+
+    def test_iconic_capture_takes_the_lock(self):
+        """抓之前是最小化 → 我们会 SW_RESTORE 并置前 → 必须取锁。"""
+        guard, _ = self._run_capture(iconic=True)
+        self.assertTrue(guard.ensured)
+        self.assertIn("最小化", guard.ensured[0])
+
+    def test_grab_region_takes_the_lock_even_without_maximize(self):
+        """兜底读屏（GPU 合成窗口 / 最后兜底）同样要置前 → 即使没传 maximize 也得取锁。"""
+        guard, _ = self._run_capture(wgc_ok=False, gpu=True)
+        self.assertTrue(guard.ensured)
+        self.assertIn("置前", guard.ensured[0])
+
+    def test_lock_is_released_after_the_window_state_is_restored(self):
+        """顺序要紧：**先还原窗口状态、再放锁**；反了就会留下「已改前台但没人管」的空档。"""
+        self._run_capture(maximize=True)
+        self.assertEqual(
+            self.FakeGuard.order,
+            ["ensure", "restore", "release"],
+            "顺序必须是「取锁 → 抓图 → 还原 → 放锁」",
+        )
+
+    def test_foreground_busy_is_not_swallowed(self):
+        """守卫拿不到锁时抛的 ForegroundBusy **必须传到调用方**：吞掉它就等于偷偷硬抓。"""
+        from cvision.input_lock import ForegroundBusy
+
+        def boom(self, reason):
+            raise ForegroundBusy(reason, 2.0, {"pid": 999})
+
+        with self.mock.patch.object(self.FakeGuard, "ensure", boom), \
+             self.mock.patch.object(win_backend.win32gui, "IsIconic", return_value=True), \
+             self.mock.patch.object(win_backend, "_safe_get_placement", return_value="P"), \
+             self.mock.patch.object(win_backend, "_restore_placement"), \
+             self.mock.patch.object(win_backend, "_prepare_window_for_capture"), \
+             self.mock.patch.object(win_backend.time, "sleep", lambda *_: None):
+            with self.assertRaises(ForegroundBusy):
+                win_backend.capture_window(handle=4321)
+
+
 if __name__ == "__main__":
     unittest.main()

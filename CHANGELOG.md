@@ -10,6 +10,88 @@
 > - `v0.1.0` ~ `v0.1.9` 的说明只在 [GitHub Releases](https://github.com/cczzyy-cn/c-vision/releases) 里
 >   （那时还没有本文件）。
 
+## v0.2.32
+
+**跨进程输入互斥落地；并按「一个资源」把锁的边界划准——会改前台/Z 序的抓图也进锁。**
+
+查「插件有没有处理多会话同时操作电脑」时逐层核对出来的结论：进程内是安全的（DSH 对没声明
+`isConcurrencySafe` 的工具一律按 exclusive 排队、常驻 server 是单请求队列），但**跨进程完全没有约束**
+——两个 DSH 实例、独立进程的子代理、用户自己的脚本，各自 spawn 一个 `cli_input` 就在同一套鼠标键盘上
+并发下发。后果不是「慢」，而是**静默点错窗口**：A 把目标窗口置前后，B 又把它的窗口置前，A 那一击就落到
+B 的窗口上，而坐标全对。
+
+**一、互斥本身**
+
+- 新增 `cvision/input_lock.py`：**Windows 用命名互斥体**（`CreateMutexW` + `WaitForSingleObject`）、
+  **macOS/Linux 用 `fcntl.flock`**。两者都由内核/文件系统在**持有者进程消失时自动释放**（Windows 下一位
+  拿到的是 `WAIT_ABANDONED`，按「拿到」处理）——这正是敢用真互斥的前提：一把没释放的锁会卡死所有人，
+  而这两条路径都不会。用**会话内**命名空间（不加 `Global\` 前缀）：那需要 `SeCreateGlobalPrivilege`，
+  普通交互进程拿不到，而需要互斥的进程本来就都在同一个交互桌面会话里。
+- **超时如实报错，不无限排队**：默认等 10s（`CVISION_INPUT_LOCK_TIMEOUT` 或 `--lock-timeout` 可调），
+  超时回 `{ok:false,error:...}` + 退出 1，错误里**点名持有者**（`pid` + 起始时间 + 在干什么，来自
+  `<tmp>/cvision-input.owner.json`），并明确告诉调用方「本次输入未执行」。`--no-lock` 是唯一的跳过方式。
+- **锁机制本身不可用就降级放行，但如实标注**：静默失去互斥保证比报错更危险，可它也不该把「只想点一下」
+  整个打死。跳过了/降级时 CLI 多回一个 `lock` 字段，`cvision_status().input_lock` 则**真实探测**并给出
+  `backend`/`available`/`reason`（与 `capture_backends.wgc` 同一套口径）。
+- **宿主把「置前 + 校验」与动作合成一次 CLI 调用**（`runInputAction`）：互斥是在 CLI 进程内取的，两次
+  独立调用之间**有缝**——另一个实例正好能在缝里把它的窗口置前，那么坐标校验就白做了。合成一次后，
+  置前、校验、动作落在同一个持锁区间内。`ensureTargetFront` 就此退役；`click`/`click_at`/`double_click`/
+  `scroll`/`drag`/`type_text`/`press_key` 全部走这条路。
+- `lastSeeHandle`/`lastSeeFrame` 合并成导出的 `operationTarget`（只由 `see`/`focus_window` 更新），
+  配套导出 `inputRunner`——**只为单测注入**（同 `snipExecutor`），因为「同一次调用」这条不变量在真实
+  使用中几乎看不出来，只能靠断言 argv 钉住。
+
+**二、边界与诊断**
+
+落地互斥后逐个核对「哪些动作其实在抢同一个全局资源」，发现边界划窄了：物理鼠标键盘、**前台窗口**、
+**Z 序**是耦合的一体（一次点击会改前台，改前台又会让另一次纯键盘输入打错窗口），而抓图里有两条分支会改
+前台——`maximize=True`（`_prepare_window_for_capture` 用 `keep_foreground=False`）和「目标最小化 →
+`SW_RESTORE`」，以及兜底读屏 `_grab_region → _ensure_foreground`。它们跑在常驻 server / `cli_capture`
+进程里，**原本不在锁内**，而它们恰好能插进另一个进程「已校验坐标、还没点下去」的那个窗口期——那个窗口期
+只有几十毫秒，人肉根本复现不了，却是「点错窗口」剩余的**唯一**来源。
+
+- 新增 `input_lock.ForegroundGuard`：抓图侧的**惰性**守卫。纯只读抓取（WGC/PrintWindow 成功、整屏）
+  **完全不取锁**（否则「另一个会话在打字」会连截图都做不了，已实测：持锁期间只读抓图照常成功）；只有
+  **真的**要动前台时才 `ensure()`，且用**独立的短等待** `FOREGROUND_TIMEOUT_S = 2s`——它只是为了避免
+  搅乱别人的前台，不值得让一次截图等 10s。拿不到就抛 `ForegroundBusy`：**一行可行动说明 + 退出 1**，
+  绝不硬抓（`cli_capture` 会把它打成一行而不是一屏 traceback；server 路径本来就是干净 JSON）。
+  macOS 后端同理：`--maximize` 的「解除最小化」同样会改前台，也走同一个守卫。
+- 释放顺序在代码里定死并上了测试：**先还原窗口状态、再放锁**，否则会留下「已改前台却没人管」的空档。
+- **等待上限与工具超时成为一条被机械校验的预算**：`DEFAULT_TIMEOUT_S(10s) × 3 ≤ 工具 timeoutMs(30s)`。
+  新增 JS 测试直接读 `cvision/input_lock.py` 的常量来断言——谁单独调大锁等待而不动 `timeoutMs`，
+  CI 就会红（否则工具会在等待中被宿主 abort，既没拿到锁又白等）。
+- **超时消息点名持有者，且带会话身份**：宿主把 `exec.agent.id` 通过 `--lock-label` 传下去，持有者记录
+  写成 `session=<id> click(400,300)`，于是对方读到的不是「另一个进程 pid=1234」而是**哪个会话**在操作
+  电脑（对装了两份 DSH 的用户，前者可行动、后者毫无指向性）。已端到端实测：工具真的等了 1.99s，
+  随后自己写下的记录是 `{"label": "session=sess-42 get_clipboard"}`。
+- **`cvision_status().input_lock` 增加 `holder`**（谁在持锁 + `alive`：pid 是否还活着）：用户问
+  「为什么卡住」时能自查。持有者记录可能残留自**已退出**的进程（新持有者刚拿到锁、还没来得及写下自己的
+  记录），这时会如实标注「该 pid 已退出，这条记录可能是它留下的」，而不是把排查带偏。
+- **锁不可重入**：Windows 互斥体是线程递归的、flock 同 fd 也可重入，重入会「成功」却**不提供任何额外
+  排他性**。现在同一线程重入直接报错并说清「已持有的那把正在做什么」，而不是放任一个悄悄失效的假设。
+- `input_lock` 模块文档里补上**锁边界表与三条纪律**（加第二把锁必须固定顺序；绝不在持锁期间等待用户
+  输入或回调宿主；不可重入），README 同步。
+- 已知未做（README 已写明）：「最近一次 see 的目标窗口」仍是**宿主进程级**记录，同一进程内多个会话/
+  子代理共用它，跨会话同时操作时仍可能互相覆盖（跨进程冲突由锁挡住）；只读截图/OCR/`wait_*` 与
+  `cli_snip` 也**刻意不进锁**（`wait_*` 会阻塞 10–45s，锁进去等于把桌面串行化；snip 属人工交互，
+  对这类「用户 vs agent」冲突一贯是如实提示 busy）。
+
+**三、测试与实测**
+
+- Python 246 → **292**：`test_input_lock.py` 30 条（**真 spawn 另一个进程**争用→超时要点名持有者、
+  持有者被 kill 后锁必须立刻可用、持锁期间写持有者记录/释放后清掉、`--no-lock` 与环境变量跳过、降级不抛、
+  取锁过程出错不许被吞、重入报错且退出后能重新取、持有者存活判定「不知道≠已退出」、`ForegroundGuard` 的
+  惰性/幂等/超时文案/降级）；`test_capture_foreground.py` +6 条（只读不取锁 / maximize 取锁 / 最小化还原
+  取锁 / 兜底读屏取锁 / 「还原→放锁」顺序 / `ForegroundBusy` 不许被吞）；`test_cli_input.py` +15 条
+  （动作必须落在持锁区间**内**、置前与动作共用**一次**持锁、校验不过不许点、锁超时不许把点击发出去、
+  `--no-lock`/`--lock-timeout`/`--lock-label` 真的传下去、跳过/降级要写进 JSON）。
+- JS 73 → **84**：合并调用的 argv 形状（没 see 过目标时只跑动作、前置校验失败绝不补点、stale 只重跑动作、
+  `type_text` 不带 `--at`、scroll 两条路径）、会话 id → `--lock-label`（无身份就不带、超长截断、注入点
+  只有两处）、锁等待 ≤ 工具超时 1/3。
+- **真机实测**（Windows，用自建 notepad 窗口，不动用户已有窗口）：另一个进程持锁时
+  `cli_capture --handle H --maximize` → 2.21s 后退出 1，一行说明点名 `pid + 时间 + 占位者 session=other`；
+  同一时刻 `cli_capture --handle H`（只读）**照常成功**（16.9KB 图）。会话身份那条链路也端到端验过。
+
 ## v0.2.30
 
 **变化区域改成「多个框 + 图里画红框」：`diff_bbox` 那个总框在多点变化时等于没有信息。**

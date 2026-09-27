@@ -10,7 +10,7 @@ Python 版 cvision** 截屏/OCR/输入 → 写入 Harness 附件服务（`ctx.at
 
 同一个包还带一个**浏览器半边**：输入框工具栏的「截图」按钮（人工一键抓屏，或把剪贴板里的图片作为附件）。
 
-**版本**：`0.2.30` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
+**版本**：`0.2.32` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
 **许可**：BSD-3-Clause · 变更历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 目录
@@ -74,11 +74,11 @@ python -m pip install -r <插件安装目录>\requirements.txt
 
 | 工具 | 说明 |
 | --- | --- |
-| `see(handle?, window?, region?, delay?, maximize?, format?, ocr?, text?, max_elements?)` | 截屏/窗口 → **图片**返回（模型原生看）。`handle`（来自 `list_windows`）比 `window` 标题**更精确、标题变化时更稳**，二者二选一且**优先 `handle`**；`region="x,y,w,h"` 只取一块（省 token）；`delay=毫秒` 等渲染；`maximize` 默认关；`format` 可选 PNG/JPEG/WEBP；`ocr=true` 同时返回 OCR 文本/词框；**`text=true` 同时返回可点击元素**（见下） |
+| `see(handle?, window?, region?, delay?, maximize?, format?, ocr?, text?, max_elements?)` | 截屏/窗口 → **图片**返回（模型原生看）。`handle`（来自 `list_windows`）比 `window` 标题**更精确、标题变化时更稳**，二者二选一且**优先 `handle`**；`region="x,y,w,h"` 只取一块（省 token）；`delay=毫秒` 等渲染；`maximize` 默认关（**会改前台的抓法**要先取跨进程锁，拿不到就如实报错）；`format` 可选 PNG/JPEG/WEBP；`ocr=true` 同时返回 OCR 文本/词框；**`text=true` 同时返回可点击元素**（见下） |
 | `ocr(handle?, window?, region?, delay?)` | 截屏后 **OCR** → **文本 + 词级边界框 `words`**（`{text,x,y,w,h}`，供精确定位点击点）；同样 **`handle` 优先于 `window`** |
 | `list_windows()` | 列出可见窗口（标题 + 句柄 + 尺寸） |
 | `screen_info()` | 列出显示器/DPI 布局（`x/y/width/height/primary/scale`），高 DPI 折算坐标用 |
-| `cvision_status()` | 运行环境健康探针（Python 版本、平台后端、OCR 引擎、依赖/后端是否可用、`platform_support` 三态、本平台能力清单） |
+| `cvision_status()` | 运行环境健康探针（Python 版本、平台后端、OCR 引擎、依赖/后端是否可用、`platform_support` 三态、本平台能力清单、跨进程输入互斥的 `input_lock` 真实探测含 `holder`：谁在持锁） |
 | `wait_for_window(title?, timeout?)` | 轮询等某个窗口出现（默认 500ms/次，10s 超时） |
 | `wait_until_stable(window?, handle?, region?, interval?, stable_samples?, timeout?, threshold?, format?)` | 轮询截图，**直到画面连续若干次不再变化**才返回（等加载完成/等动画结束）。返回 `stable`/`diff_ratio`/`max_diff_ratio`/`stable_for`/`width`/`height`；与上一个的区别是「等**变完**」而非「等开始变」（v0.2.29 起） |
 | `wait_until_changed(window?, handle?, region?, interval?, timeout?, threshold?, format?)` | 轮询截图，**直到画面真的变了**才把那一帧返回（等进度条/等弹窗）。返回 `changed`/`diff_ratio`/`diff_bbox`/`diff_boxes`/`width`/`height`（未变化时没有 `diff_bbox`）；**返回的图里变化区域已用红框标出**，`diff_boxes` 是**分开的**变化区域（v0.2.30 起）；默认阈值 0.01 |
@@ -324,7 +324,7 @@ npm run check:deps   # Python 依赖锁定自检（9 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
-当前规模：**JS 73 条 + Python 246 条**。
+当前规模：**JS 84 条 + Python 292 条**。
 
 ### 文档约定（自动校验）
 
@@ -393,9 +393,9 @@ git push origin v0.2.14          # ⚠️ 一次只推一个 tag，见下
 
 | 入口 | 参数 | 结果 |
 | --- | --- | --- |
-| `cvision.cli_capture` | `--list` / `--screen-info` / `--status` / `--window` / `--handle` / `--region` / `--delay` / `--format` / **`--text`** / **`--wait-changed`** | 截图时是**裸 data URL 字符串**（不是 JSON）；`--list`/`--screen-info`/`--status` 是各自的 JSON；`--text` → `{ok:true,kind:"capture_text",data_url,width,height,elements:[{text,box,center,screen_box,screen_center,word_count}]}`；`--wait-changed` → `{ok:true,kind:"wait_changed",data_url,changed,samples,elapsed_ms,diff_ratio,mean_diff,diff_bbox}` |
+| `cvision.cli_capture` | `--list` / `--screen-info` / `--status` / `--window` / `--handle` / `--region` / `--delay` / `--format` / **`--text`** / **`--wait-changed`** / `--maximize` | 截图时是**裸 data URL 字符串**（不是 JSON）；`--list`/`--screen-info`/`--status` 是各自的 JSON；`--text` → `{ok:true,kind:"capture_text",data_url,width,height,elements:[{text,box,center,screen_box,screen_center,word_count}]}`；`--wait-changed` → `{ok:true,kind:"wait_changed",data_url,changed,samples,elapsed_ms,diff_ratio,mean_diff,diff_bbox}`；**会改前台**的抓取（`--maximize`、还原最小化窗口、兜底读屏）被跨进程锁挡住时 → 一行 `ForegroundBusy` 说明 + 退出 1 |
 | `cvision.cli_ocr` | `--window` / `--handle` / `--region` / `--delay` | `{ok:true,text,lines,words:[{text,x,y,w,h}]}` |
-| `cvision.cli_input` | `--click/--double/--move/--scroll/--scroll-h/--drag/--type/--keys/--focus/--focus-handle/--get-clipboard/--set-clipboard` | 动作类 `{ok:true}`；`--get-clipboard` → `{text}` |
+| `cvision.cli_input` | `--click/--double/--move/--scroll/--scroll-h/--drag/--type/--keys/--focus/--focus-handle/--get-clipboard/--set-clipboard`，以及前置校验 `--ensure-front H [--unblock] [--at X Y]`、互斥开关 `--lock-timeout SECONDS` / `--no-lock`、会话身份 `--lock-label TEXT` | 动作类 `{ok:true}`；`--get-clipboard` → `{text}`；前置校验失败 → `{ok:false,stale?,error}` + 退出 1 且**动作不执行**；`--ensure-front` 与动作可以**合成一次调用**（置前、校验、动作同在**一个持锁区间**内）；锁超时 → `{ok:false,error}` + 退出 1；互斥被跳过/降级时多一个 `lock` 字段 |
 | `cvision.cli_snip` | `--timeout 60` / `--format` | `{ok:true,data_url}`（退出 0）/ `{ok:false,reason:"cancelled"}`（2）/ `"unsupported"`（3）/ `"error"`（1） |
 | `cvision.cli_clipboard` | `--state` / `--image` | `{ok:true,supported,image,token,reason}` / `{ok:true,data_url}`、`{ok:false,reason:"empty"\|"unsupported"\|"error"}` |
 
@@ -449,6 +449,7 @@ vision/                      # 仓库根 = 插件本体
     status.py            #   运行环境探针（平台后端/OCR/依赖/能力清单）
     ocr.py               #   OCR（Windows.Media.Ocr 优先 / pytesseract 回退）
     input.py             #   用户级输入（pyautogui）+ focus_window（仅 Windows；只置前不改尺寸）
+    input_lock.py        #   跨进程输入互斥（Windows 命名互斥体 / POSIX flock；锁边界与纪律、抓图侧惰性守卫、超时/降级如实上报）
     snip.py              #   系统级区域截图（人工通道）：拉起系统截图 UI、识别取消、取回框选结果
     clipboard.py         #   剪贴板图片读取 + 「是否变了」判定（Windows/macOS；Linux Phase 2）
     cli_capture.py cli_ocr.py cli_input.py cli_snip.py cli_clipboard.py cli_server.py
@@ -457,7 +458,8 @@ vision/                      # 仓库根 = 插件本体
     test_input.py         #   置前语义（假 win32：最大化绝不被降级）+ 能力清单按平台
     test_cli_ocr.py       #   cli_ocr stdout 契约（词框透传/字段形状/缺字段兜底/--region 转发）
     test_cli_server.py    #   **常驻 server 的 JSON-line 协议**（响应形状 + 真 spawn 进程往返）
-    test_cli_input.py     #   cli_input 参数层（13 个子命令 → input 函数的逐条映射）
+    test_cli_input.py     #   cli_input 参数层（子命令 → input 函数的逐条映射）+ 动作必须落在持锁区间内
+    test_input_lock.py    #   跨进程输入互斥（真 spawn 进程争用/超时点名持有者/释放/降级/持有者记录）
     test_coordinates.py   #   坐标换算（DPI/裁剪/窗口/多屏/负坐标）
     test_ui_elements.py   #   词框合并成可点击元素（同行相邻合并/间距切分/坐标换算）
     test_diff.py          #   帧间差异（相同/微变/实变/尺寸变化 + 阈值边界）
@@ -508,6 +510,30 @@ vision/                      # 仓库根 = 插件本体
 - **省 token**：`region="x,y,w,h"` 只处理一块；`ocr` 直接返回文本；超大图自动降采样。
 - **无出站网络**：所有捕获/OCR/输入都在本地完成。
 - **输入类工具**（`click`/`type_text` 等）会**真实操作你的鼠标键盘**；调用前请先 `see` 确认坐标。
+- **跨进程输入互斥**（v0.2.32 起）：每次输入动作前都取一把**跨进程锁**——Windows 用命名互斥体
+  （`CreateMutexW`）、macOS/Linux 用 flock 锁临时文件，见 `cvision/input_lock.py`。于是两个 DSH 实例、
+  独立进程的子代理、用户自己的脚本**不会同时**驱动同一套鼠标键盘；「先置前、再点击」也不再被别的进程
+  从中间插队（宿主把两者**合成一次 CLI 调用**，见 `cli_input` 契约）。锁是内核对象/flock，持有者崩溃会
+  **自动释放**（接手时如实记为 `abandoned`），不会把插件锁死；拿不到锁**不无限等**：默认 10s 后如实报错
+  （`CVISION_INPUT_LOCK_TIMEOUT` 或 `--lock-timeout` 可调），`--no-lock` 才能显式跳过。互斥是否真的可用由
+  `cvision_status().input_lock` **真实探测**给出（含 `holder`：谁在持锁）；跳过了或降级了，CLI 会多回一个
+  `lock` 字段。超时消息会**点名持有者**（pid + 起始时间 + 在干什么，含会话身份 `--lock-label`）。
+- **锁的边界 = 一个资源：鼠标键盘 + 前台窗口 + Z 序**。这三样是耦合的（一次点击会改前台，
+  改前台又会让另一次纯键盘输入打错窗口），所以按资源划边界，而不是按「哪个工具动了输入」：
+
+  | 动作 | 取锁 | 为什么 |
+  | --- | --- | --- |
+  | 输入类（click/drag/scroll/type/keys/focus/剪贴板读写） | 是（10s） | 直接驱动设备、改前台；读剪贴板也算，因为非 ASCII 输入会**临时改写**剪贴板 |
+  | 抓图且**会**改前台/窗口状态（`maximize=true`、还原最小化窗口、兜底读屏；macOS 的解除最小化同理） | 是（**2s**） | 与输入抢同一个前台；它正好能插进「已校验坐标、还没点下去」的那个窗口期 |
+  | 抓图但不改状态（WGC/PrintWindow 成功、整屏抓取） | 否 | 纯只读，锁进去只会让「另一个会话在打字」时连截图都做不了（已实测：持锁期间只读抓图照常成功） |
+  | OCR / `list_windows` / `screen_info` / `status` / `wait_*` | 否 | 只读；`wait_*` 还会阻塞 10–45s，锁进去等于把桌面串行化 |
+  | `cli_snip`（系统截图 UI） | 否 | 人工交互，属「用户 vs agent」；这类冲突一贯是**如实提示 busy**，不是抢锁 |
+
+  抓图侧拿不到就**如实失败**（`ForegroundBusy`，一行可行动说明 + 退出 1），绝不冒着搅乱别人前台的风险硬抓。
+- **互斥覆盖不到的地方**：「最近一次 see 的目标窗口」是**宿主进程级**记录（`operationTarget`），同一进程内
+  多个会话/子代理共用它，跨会话同时操作时仍可能互相覆盖——跨进程的鼠标键盘冲突由锁挡住，这一条是
+  **已知未做**的部分（见 [变更记录](./CHANGELOG.md)）。另外锁**不可重入**：同一进程内嵌套取锁会直接报错
+  （Windows 互斥体是线程递归的，重入会「成功」却不提供额外排他性），要串两件事请放进同一个临界区。
 - **macOS/Linux 后端**为编写实现，需在对应平台 + 权限下验证；未支持平台上的边界由各工具显式报错。
 
 ---

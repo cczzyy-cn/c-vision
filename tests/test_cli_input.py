@@ -8,11 +8,13 @@
 import io
 import json
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
+from types import SimpleNamespace
 from unittest import mock
 
 from cvision import cli_input
 from cvision import input as inp
+from cvision import input_lock
 
 
 class Recorder:
@@ -20,15 +22,20 @@ class Recorder:
 
     ``returns`` 可指定某个函数返回什么（给 ``ensure_front`` / ``window_at`` 这类**有返回值**的
     接口用）；值若是异常实例则改为抛出，用来验证失败路径。
+    ``log`` 传入一个列表时，还会把 ``("call", 函数名)`` 追加进去——与假锁的 ``lock-enter/exit``
+    共用一个列表，就能断言「动作有没有落在持锁区间里」这件事的**顺序**。
     """
 
-    def __init__(self, returns=None):
+    def __init__(self, returns=None, log=None):
         self.calls = []
         self.returns = returns or {}
+        self.log = log
 
     def _make(self, name):
         def _fn(*args, **kwargs):
             self.calls.append((name, args, kwargs))
+            if self.log is not None:
+                self.log.append(("call", name))
             if name in self.returns:
                 value = self.returns[name]
                 if isinstance(value, BaseException):
@@ -42,7 +49,27 @@ class Recorder:
         return self._make(name)
 
 
-def run_cli(argv, recorder, *, get_clipboard_returns="剪贴板文本"):
+def fake_lock(log, *, state=None, error=None):
+    """替身 ``input_lock.input_lock``：只记**顺序**，可按需伪造状态或异常。
+
+    真锁的语义（跨进程互斥、超时、降级）由 ``tests/test_input_lock.py`` 真刀真枪地测；这里要钉的是
+    **接线**——动作必须落在持锁区间**里面**，`--no-lock` / `--lock-timeout` 必须真的传下去。
+    """
+
+    @contextmanager
+    def _cm(**kwargs):
+        log.append(("lock-enter", kwargs))
+        if error is not None:
+            raise error
+        try:
+            yield SimpleNamespace(note=lambda: dict(state or {}))
+        finally:
+            log.append(("lock-exit", {}))
+
+    return _cm
+
+
+def run_cli(argv, recorder, *, get_clipboard_returns="剪贴板文本", lock=None):
     """跑一次 ``cli_input.main``，返回 (exit_code, stdout, recorder)。"""
     patches = [
         mock.patch.object(inp, "focus_window", recorder.focus_window),
@@ -57,6 +84,8 @@ def run_cli(argv, recorder, *, get_clipboard_returns="剪贴板文本"):
         mock.patch.object(inp, "ensure_front", recorder.ensure_front),
         mock.patch.object(inp, "get_clipboard", lambda: get_clipboard_returns),
     ]
+    if lock is not None:
+        patches.append(mock.patch.object(input_lock, "input_lock", lock))
     for patch in patches:
         patch.start()
     buffer = io.StringIO()
@@ -264,6 +293,122 @@ class TestFrontGuard(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertNotEqual(code, 0)
         self.assertIn("前台锁定", payload["error"])
+
+
+class TestInputLockWiring(unittest.TestCase):
+    """「动作落在持锁区间内」的接线契约（跨进程互斥的真行为见 ``tests/test_input_lock.py``）。
+
+    为什么单列：跨进程互斥只在**一次 CLI 调用内部**有效，所以「先置前、再动作」如果拆成两次调用，
+    锁就等于没加——另一个进程正好能在两次调用之间插队把它的窗口置前。这个缝在真实使用中几乎看不出来
+    （只会偶发点错窗口），只能靠断言调用顺序钉住。
+    """
+
+    MATCHING = TestFrontGuard.MATCHING
+
+    def test_action_runs_inside_the_lock(self):
+        log = []
+        rec = Recorder(log=log)
+        code, out = run_cli(["--click", "10", "20"], rec, lock=fake_lock(log))
+        self.assertEqual([entry[0] for entry in log], ["lock-enter", "call", "lock-exit"])
+        self.assertEqual(json.loads(out), {"ok": True}, "锁正常时 JSON 形状不许变")
+        self.assertEqual(code, 0)
+
+    def test_preflight_and_action_share_one_lock(self):
+        """置前与动作必须在**同一个**持锁区间里：两次调用各锁一次 = 中间有缝 = 等于没锁。"""
+        log = []
+        rec = Recorder(returns={"ensure_front": dict(self.MATCHING)}, log=log)
+        code, _ = run_cli(
+            ["--ensure-front", "4242", "--unblock", "--at", "10", "20", "--click", "10", "20"],
+            rec,
+            lock=fake_lock(log),
+        )
+        self.assertEqual([entry[0] for entry in log], ["lock-enter", "call", "call", "lock-exit"])
+        self.assertEqual([call[0] for call in rec.calls], ["ensure_front", "click"], "顺序必须是先置前后动作")
+        self.assertEqual(rec.calls[0][2], {"unblock": True})
+        self.assertEqual(code, 0)
+
+    def test_front_check_failure_skips_the_action(self):
+        """校验没过时**不许**执行动作——「宁可报错，绝不点偏」在合并调用里同样成立。"""
+        log = []
+        rec = Recorder(returns={"ensure_front": dict(self.MATCHING, match=False, point_after=7)}, log=log)
+        code, out = run_cli(
+            ["--ensure-front", "4242", "--at", "10", "20", "--click", "10", "20"],
+            rec,
+            lock=fake_lock(log),
+        )
+        self.assertNotEqual(code, 0)
+        self.assertEqual([call[0] for call in rec.calls], ["ensure_front"])
+        self.assertIn("已阻止这次点击", json.loads(out)["error"])
+
+    def test_lock_timeout_fails_without_touching_input(self):
+        log = []
+        rec = Recorder(log=log)
+        code, out = run_cli(
+            ["--click", "1", "2"],
+            rec,
+            lock=fake_lock(log, error=input_lock.InputLockTimeout(0.5, {"pid": 4242, "label": "holder"})),
+        )
+        payload = json.loads(out)
+        self.assertFalse(payload["ok"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("pid=4242", payload["error"], "超时要如实说清是谁占着")
+        self.assertEqual(rec.calls, [], "超时绝不能还是把点击发出去了")
+        self.assertEqual([entry[0] for entry in log], ["lock-enter"], "根本没进临界区")
+
+    def test_no_lock_flag_reaches_the_lock(self):
+        """``--no-lock`` 必须真的传下去（enabled=False），而不是被静默忽略。"""
+        log = []
+        rec = Recorder(log=log)
+        run_cli(["--click", "1", "2", "--no-lock"], rec, lock=fake_lock(log))
+        self.assertEqual(log[0][1]["enabled"], False)
+        self.assertEqual(log[0][1]["label"], "click(1,2)", "持锁记录要写清在干什么")
+
+    def test_no_lock_is_reported_in_json(self):
+        """走**真锁**：跳过互斥这件事必须写进返回 JSON（静默失去保证比报错更危险）。
+
+        用真锁而不是替身：``enabled=False`` 根本不会碰操作系统对象，所以在任何平台上都安全。
+        """
+        rec = Recorder()
+        _, out = run_cli(["--click", "1", "2", "--no-lock"], rec)
+        self.assertIn("--no-lock", json.loads(out)["lock"]["skipped"])
+
+    def test_lock_timeout_flag_reaches_the_lock(self):
+        log = []
+        rec = Recorder(log=log)
+        run_cli(["--click", "1", "2", "--lock-timeout", "0.25"], rec, lock=fake_lock(log))
+        self.assertEqual(log[0][1]["timeout_s"], 0.25)
+
+    def test_lock_label_carries_the_session_identity(self):
+        """宿主传来的会话身份要出现在持有者记录最前面——等锁的对方才知道该去看哪个会话。"""
+        log = []
+        rec = Recorder(log=log)
+        run_cli(
+            ["--click", "1", "2", "--lock-label", "session=abc123"],
+            rec,
+            lock=fake_lock(log),
+        )
+        self.assertEqual(log[0][1]["label"], "session=abc123 click(1,2)")
+
+    def test_lock_label_also_covers_a_preflight_only_call(self):
+        """只有 --ensure-front（没有动作）时同样要有标签，否则超时的人只看到一句空白。"""
+        log = []
+        rec = Recorder(returns={"ensure_front": dict(TestFrontGuard.MATCHING)}, log=log)
+        run_cli(
+            ["--ensure-front", "4242", "--lock-label", "session=abc123"],
+            rec,
+            lock=fake_lock(log),
+        )
+        self.assertEqual(log[0][1]["label"], "session=abc123 ensure-front(0x1092)")
+
+    def test_degraded_lock_is_surfaced_in_json(self):
+        """锁机制不可用（降级放行）时必须让调用方看见——静默失去保证比报错更危险。"""
+        log = []
+        rec = Recorder(log=log)
+        _, out = run_cli(
+            ["--click", "1", "2"], rec, lock=fake_lock(log, state={"degraded": "CreateMutexW 失败"})
+        )
+        self.assertEqual(json.loads(out)["lock"], {"degraded": "CreateMutexW 失败"})
+        self.assertEqual([call[0] for call in rec.calls], ["click"], "降级仍然要执行动作（不然等于把工具打死）")
 
 
 class TestFrontError(unittest.TestCase):

@@ -83,6 +83,19 @@ def _capture_backends() -> dict:
     }
 
 
+def _input_lock() -> dict:
+    """跨进程输入互斥的**真实**能力状态（真去建一次锁对象，见 ``input_lock.status``）。
+
+    为什么要进体检：互斥失效不会当场报错——它表现为「两个会话偶尔互相点错窗口」，最难归因的那类。
+    把它做成机器可读字段，调用方（和排查的人）才有办法确认「这一刻到底有没有跨进程保证」。
+    """
+    try:
+        from cvision import input_lock
+        return input_lock.status()
+    except Exception as e:  # noqa: BLE001 - 探测失败也只是「没有这项保证」
+        return {"backend": "none", "available": False, "reason": f"{type(e).__name__}: {e}"}
+
+
 def status() -> dict:
     """返回插件运行环境的状态字典。"""
     try:
@@ -132,6 +145,7 @@ def status() -> dict:
         "platform_support": _platform_support(backend, backend_implemented),
         "ocr_engine": _ocr_engine(),
         "input_capabilities": input_caps,
+        "input_lock": _input_lock(),
         "capture_backends": _capture_backends(),
         "deps": deps_status,
         "ok": backend_implemented and deps_status.get("Pillow", False),

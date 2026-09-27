@@ -327,8 +327,30 @@ async function withInputBusy<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * 输入类 CLI 的调用上下文：取消信号，外加**是哪个会话/子代理**在调用。
+ *
+ * 为什么要会话身份：跨进程输入锁会把「谁在持锁」写进持有者记录，超时的一方读到的才是
+ * 「另一个 DSH 会话 xxx」而不是一句「另一个进程 pid=1234」——对装了不止一份 DSH 的用户，
+ * 前者可行动，后者毫无指向性。
+ */
+type InputExec = { signal: AbortSignal; agent?: { id?: unknown } }
+
+/**
+ * 把会话身份塞进 CLI 参数（`--lock-label`），供持有者记录与超时消息使用。
+ *
+ * 导出只为单测（同 `snipExecutor` 的套路）：它唯一的调用点在 `runCliInputText`——**所有**输入类 CLI
+ * 都从那里发出去，所以身份只会被追加一次，不会出现「有的路径带了、有的没带」。
+ */
+export function withLockLabel(args: string[], exec: InputExec): string[] {
+  const id = exec?.agent?.id
+  // 截到 64 字符：这是给人看的诊断信息，不值得为它让一条错误消息变成一屏。
+  const label = typeof id === 'string' && id !== '' ? `session=${id.slice(0, 64)}` : ''
+  return label === '' ? args : [...args, '--lock-label', label]
+}
+
 /** 把输入类 CLI 调用包进「占用中」窗口。 */
-function runCliInputTracked(args: string[], exec: { signal: AbortSignal }): Promise<void> {
+function runCliInputTracked(args: string[], exec: InputExec): Promise<void> {
   return withInputBusy(() => runCliInput(args, exec))
 }
 
@@ -341,10 +363,10 @@ function inputBusy(): boolean {
 }
 
 /** 运行一次用户级输入（python -m cvision.cli_input <args>），返回它的 stdout。 */
-async function runCliInputText(args: string[], exec: { signal: AbortSignal }): Promise<string> {
+async function runCliInputText(args: string[], exec: InputExec): Promise<string> {
   await ensureRuntime(exec)
   assertCvisionPresent()
-  const { stdout } = await execFileAsync(PYTHON, ['-m', 'cvision.cli_input', ...args], {
+  const { stdout } = await execFileAsync(PYTHON, ['-m', 'cvision.cli_input', ...withLockLabel(args, exec)], {
     cwd: PY_CWD,
     env: PY_ENV,
     maxBuffer: 1 * 1024 * 1024,
@@ -354,7 +376,7 @@ async function runCliInputText(args: string[], exec: { signal: AbortSignal }): P
 }
 
 /** 运行一次用户级输入，忽略输出。 */
-async function runCliInput(args: string[], exec: { signal: AbortSignal }): Promise<void> {
+async function runCliInput(args: string[], exec: InputExec): Promise<void> {
   await runCliInputText(args, exec)
 }
 
@@ -365,7 +387,7 @@ async function runCliInput(args: string[], exec: { signal: AbortSignal }): Promi
  * （这样即便调用方只看退出码也不会把「没置前」当成功），但**仍会在 stdout 上给出结构化原因**
  * （``ok:false`` + ``error``），所以这里连非零退出的情况也要把 stdout 捞回来解析。
  */
-async function runCliInputJson(args: string[], exec: { signal: AbortSignal }): Promise<Row> {
+async function runCliInputJson(args: string[], exec: InputExec): Promise<Row> {
   let out: string
   try {
     out = await withInputBusy(() => runCliInputText(args, exec))
@@ -380,6 +402,17 @@ async function runCliInputJson(args: string[], exec: { signal: AbortSignal }): P
   return parsed
 }
 
+/**
+ * 一次输入类 CLI 调用的出口。默认走 :func:`runCliInputJson`。
+ *
+ * **导出可变对象只为单测注入假实现**（同 `snipExecutor` 的套路）：真实输入会动用户的鼠标键盘，
+ * CI 里不能跑；而「置前与动作必须落在**同一次**调用里」这条不变量也只有在这里能被机械地钉住——
+ * 它一旦退回两次调用，跨进程就又有了缝，而那在真实使用中几乎看不出来。
+ */
+export const inputRunner: { run: (args: string[], exec: InputExec) => Promise<Row> } = {
+  run: (args, exec) => runCliInputJson(args, exec),
+}
+
 /** 宽松解析 CLI 的一行 JSON：解析不了就返回 null（由调用方决定怎么处理）。 */
 function parseJsonLoose(text: string): Row | null {
   if (!text) return null
@@ -392,44 +425,52 @@ function parseJsonLoose(text: string): Row | null {
 }
 
 /**
- * 最近一次 ``see`` 看到的窗口句柄——也就是「接下来要操作的那个窗口」。
+ * 「接下来要操作的那个窗口」：最近一次 ``see`` 看到的句柄，以及那张图覆盖的屏幕矩形
+ * （`click_at` 按比例换算坐标的基准；模型说「点图的 64%、46%」时指的就是这张图）。
  *
- * 点击类工具靠它把窗口置前并校验坐标归属；置前过的窗口（``focus_window``）同样是操作目标。
+ * 点击类工具靠句柄把窗口置前并校验坐标归属；置前过的窗口（``focus_window``）同样是操作目标。
+ *
+ * **导出可变对象只为单测注入与复位**（同 `snipExecutor` 的套路）：这两项状态只能由 ``see`` /
+ * ``focus_window`` 更新，而「置前与动作必须落在同一次 CLI 调用里」这条不变量没有别的办法机械地钉住。
+ * ⚠️ 它是**进程级**的，不区分会话——同一进程内的多个会话/子代理共用这一份记录（跨进程的互斥见
+ * `cvision/input_lock.py`）。
  */
-let lastSeeHandle: number | null = null
+export const operationTarget: { handle: number | null; frame: SeeFrame | null } = {
+  handle: null,
+  frame: null,
+}
 
 /**
- * 最近一次 `see` 那张图覆盖的屏幕矩形——`click_at`（按比例点击）的换算基准。
+ * 跑一次输入动作，并把「置前 + 坐标归属校验」**合并进同一次 CLI 调用**。
  *
- * 与 `lastSeeHandle` 同一次 `see` 一起更新：模型说「点图的 64%、46%」时指的就是这张图。
- */
-let lastSeeFrame: SeeFrame | null = null
-
-/**
- * 点击类动作的前置保障：把「最近的 see 目标窗口」拉到前台，并**复核**坐标确实属于它。
- *
- * 为什么必须有这一步（实测）：``click`` 下发的是**屏幕坐标**，Windows 只把它派给该点**最顶层**的
- * 窗口——不只是「前台」那么简单。目标不在最前面时，点下去会打在压着它的窗口上、或者直接落空，
- * 而坐标全对——这是最难自查的一类失败。所以要么把目标弄到最前，要么明确报错，绝不静默打偏。
+ * 为什么必须合并（早期是「先调一次 `--ensure-front`、再调一次动作」）：跨进程输入互斥是在 CLI
+ * 进程内取的（见 `cvision/input_lock.py`），两次独立调用之间**有缝**——另一个 DSH 实例正好在那条
+ * 缝里把它的窗口置前，我们的坐标校验就白做了，这一击会落到它的窗口上（而坐标全对）。合并成一次
+ * 调用后，置前、校验、动作落在**同一个持锁区间**内，跨进程也插不进来。
  *
  * ``--unblock`` 是**操作策略**的关键一环：程序化提升层叠顺序在 Windows 上并不成立（实测
  * ``SetWindowPos(HWND_TOP)`` / ``BringWindowToTop`` / ``SwitchToThisWindow`` 都返回成功却不改变
  * 层叠），只有**真实鼠标输入**才会让系统重排。所以目标被盖住时，插件会先点一下它自己的标题栏中央
  * ——正是人遇到这种情况会做的事——把它带到最前，再去点目标位置。代价是那一次点击会真的发生。
  */
-async function ensureTargetFront(
-  exec: { signal: AbortSignal },
+async function runInputAction(
+  cmd: string[],
+  exec: InputExec,
   at?: { x: number; y: number },
 ): Promise<void> {
-  if (lastSeeHandle == null) return
-  const handle = lastSeeHandle
-  const args = ['--ensure-front', String(handle), '--unblock']
-  if (at) args.push('--at', String(Math.round(at.x)), String(Math.round(at.y)))
-  const info = await runCliInputJson(args, exec)
+  const handle = operationTarget.handle
+  if (handle == null) {
+    await inputRunner.run(cmd, exec)
+    return
+  }
+  const pre = ['--ensure-front', String(handle), '--unblock']
+  if (at) pre.push('--at', String(Math.round(at.x)), String(Math.round(at.y)))
+  const info = await inputRunner.run([...pre, ...cmd], exec)
   if (info.ok) return
   if (info.stale) {
-    // 窗口已经不存在：这份记录过期了。清掉并放行，否则它会永久卡住之后所有的点击。
-    lastSeeHandle = null
+    // 窗口已经不存在：这份记录过期了。清掉并只跑动作本身，否则它会永久卡住之后所有的点击。
+    operationTarget.handle = null
+    await inputRunner.run(cmd, exec)
     return
   }
   throw new Error(String(info.error ?? `窗口 0x${handle.toString(16)} 未能置前`))
@@ -1222,6 +1263,8 @@ export function apply(ctx: Context): void {
         '⚠️ 但「不抢前台」只对**普通窗口**成立：目标**处于最小化**时，抓取会先把它还原、因而**会抢走前台**' +
         '（抓完几何会还原成最小化，但前台已经变了）；兜底抓取路径（WGC 与 PrintWindow 都失败、改读合成桌面区域）' +
         '同样会置前。所以不要假设抓完前台没变——尤其在用户正在别处打字时。' +
+        '这些「会动前台」的抓取会先取**跨进程输入锁**（短等待）：另一个会话/实例正在操作电脑时，' +
+        '它会**如实报错**而不是硬抓（否则画面与坐标都会错），稍后重试即可。' +
         '仅当窗口已最小化/太小/被遮挡看不清时才用 maximize=true（截图后会自动还原原状态）。' +
         '传 ocr=true 可在返回图片的同时附带 OCR 文本/词框（省去一次 ocr 调用）。' +
         '传 text=true 会额外返回「可点击元素」列表（每个带 text + screen_center 屏幕绝对坐标，可直接传给 click）——' +
@@ -1311,9 +1354,9 @@ export function apply(ctx: Context): void {
         // 记住这次看的是哪个窗口：后续 click/scroll/drag/type_text 会先把它置前、并校验点击坐标
         // 确实属于它。返回值没带 handle 时退回参数里的 handle（例如 see(handle=H) 不带 text 的用法）。
         const target = handle ?? positiveInt(args.handle)
-        if (target != null) lastSeeHandle = target
+        if (target != null) operationTarget.handle = target
         // 记住这张图占了屏幕哪一块：click_at 按比例换算屏幕坐标全靠它。
-        if (frame) lastSeeFrame = frame
+        if (frame) operationTarget.frame = frame
         const { data, mediaType, ext } = parseDataUrl(dataUrl)
         const ref = await ctx.attachments.saveImage({ data, mediaType, name: `vision-capture.${ext}` })
         const out: {
@@ -1698,15 +1741,14 @@ export function apply(ctx: Context): void {
   ctx.tools.register(
     defineTool({
       name: 'click',
-      description: '在屏幕绝对坐标 (x,y) 模拟鼠标单击。先 see 确认目标位置后再点。点击前会自动把「你最近一次 see 的窗口」置前，并校验该坐标确实属于它；校验不过则报错，避免点到压在上面的窗口上。',
+      description: '在屏幕绝对坐标 (x,y) 模拟鼠标单击。先 see 确认目标位置后再点。点击前会自动把「你最近一次 see 的窗口」置前，并校验该坐标确实属于它；校验不过则报错，避免点到压在上面的窗口上。同一时刻只有一个进程能操作这台电脑：另一个会话/实例正在输入时会等一小会儿，超时则**如实报错且不会硬点**（按提示稍后重试，不要改成别的坐标硬试）。',
       parameters: { x: { type: 'integer' }, y: { type: 'integer' }, button: { type: 'string', description: 'left/right/middle，默认 left' } },
       output: inputOut,
       timeoutMs: 30000,
       async execute(args, exec) {
         const cmd = ['--click', String(args.x), String(args.y)]
         if (args.button && args.button !== 'left') cmd.push('--button', String(args.button))
-        await ensureTargetFront(exec, { x: Number(args.x), y: Number(args.y) })
-        await runCliInputTracked(cmd, exec)
+        await runInputAction(cmd, exec, { x: Number(args.x), y: Number(args.y) })
         return { ok: true }
       },
     }),
@@ -1730,7 +1772,7 @@ export function apply(ctx: Context): void {
       output: pointOut,
       timeoutMs: 30000,
       async execute(args, exec) {
-        const frame = lastSeeFrame
+        const frame = operationTarget.frame
         if (!frame) {
           throw new Error('click_at 需要先 see 一次——比例是相对「你最近看到的那张图」的（若上次 see 走的是 CLI 回退路径，请改用 see(text=true)）')
         }
@@ -1743,8 +1785,7 @@ export function apply(ctx: Context): void {
         const y = Math.round(frame.y + ry * frame.height)
         const cmd = ['--click', String(x), String(y)]
         if (args.button && args.button !== 'left') cmd.push('--button', String(args.button))
-        await ensureTargetFront(exec, { x, y })
-        await runCliInputTracked(cmd, exec)
+        await runInputAction(cmd, exec, { x, y })
         return { ok: true, x, y }
       },
     }),
@@ -1758,8 +1799,8 @@ export function apply(ctx: Context): void {
       output: inputOut,
       timeoutMs: 30000,
       async execute(args, exec) {
-        await ensureTargetFront(exec, { x: Number(args.x), y: Number(args.y) })
-        await runCliInputTracked(['--double', String(args.x), String(args.y)], exec)
+        const cmd = ['--double', String(args.x), String(args.y)]
+        await runInputAction(cmd, exec, { x: Number(args.x), y: Number(args.y) })
         return { ok: true }
       },
     }),
@@ -1792,12 +1833,10 @@ export function apply(ctx: Context): void {
       output: inputOut,
       timeoutMs: 30000,
       async execute(args, exec) {
-        await ensureTargetFront(exec, { x: Number(args.x), y: Number(args.y) })
-        if (args.dx) {
-          await runCliInputTracked(['--scroll-h', String(args.x), String(args.y), String(args.dx)], exec)
-        } else {
-          await runCliInputTracked(['--scroll', String(args.x), String(args.y), String(args.dy ?? 0)], exec)
-        }
+        const cmd = args.dx
+          ? ['--scroll-h', String(args.x), String(args.y), String(args.dx)]
+          : ['--scroll', String(args.x), String(args.y), String(args.dy ?? 0)]
+        await runInputAction(cmd, exec, { x: Number(args.x), y: Number(args.y) })
         return { ok: true }
       },
     }),
@@ -1819,8 +1858,7 @@ export function apply(ctx: Context): void {
       async execute(args, exec) {
         const cmd = ['--drag', String(args.x1), String(args.y1), String(args.x2), String(args.y2)]
         if (args.button && args.button !== 'left') cmd.push('--button', String(args.button))
-        await ensureTargetFront(exec, { x: Number(args.x1), y: Number(args.y1) })
-        await runCliInputTracked(cmd, exec)
+        await runInputAction(cmd, exec, { x: Number(args.x1), y: Number(args.y1) })
         return { ok: true }
       },
     }),
@@ -1834,8 +1872,7 @@ export function apply(ctx: Context): void {
       output: inputOut,
       timeoutMs: 30000,
       async execute(args, exec) {
-        await ensureTargetFront(exec)
-        await runCliInputTracked(['--type', String(args.text)], exec)
+        await runInputAction(['--type', String(args.text)], exec)
         return { ok: true }
       },
     }),
@@ -1849,8 +1886,7 @@ export function apply(ctx: Context): void {
       output: inputOut,
       timeoutMs: 30000,
       async execute(args, exec) {
-        await ensureTargetFront(exec)
-        await runCliInputTracked(['--keys', String(args.keys)], exec)
+        await runInputAction(['--keys', String(args.keys)], exec)
         return { ok: true }
       },
     }),
@@ -1875,12 +1911,18 @@ export function apply(ctx: Context): void {
       output: clipboardOut,
       timeoutMs: 30000,
       async execute(_args, exec) {
-        const { stdout } = await execFileAsync(PYTHON, ['-m', 'cvision.cli_input', '--get-clipboard'], {
-          cwd: PY_CWD,
-          env: PY_ENV,
-          maxBuffer: 4 * 1024 * 1024,
-          signal: exec.signal,
-        })
+        // `--get-clipboard` 也走输入锁（Python 侧）：非 ASCII 输入会**临时改写**剪贴板，
+        // 不互斥就可能读到别人那次粘贴的临时内容。所以这里同样带上会话身份。
+        const { stdout } = await execFileAsync(
+          PYTHON,
+          ['-m', 'cvision.cli_input', ...withLockLabel(['--get-clipboard'], exec)],
+          {
+            cwd: PY_CWD,
+            env: PY_ENV,
+            maxBuffer: 4 * 1024 * 1024,
+            signal: exec.signal,
+          },
+        )
         const info = JSON.parse(stdout) as { text?: string }
         return { ok: true, text: info.text ?? '' }
       },
@@ -1923,7 +1965,7 @@ export function apply(ctx: Context): void {
           throw new Error(String(info.error ?? '窗口未能置前'))
         }
         const target = positiveInt(info.handle) ?? positiveInt(args.handle)
-        if (target != null) lastSeeHandle = target // 刚置前的窗口就是接下来的操作目标
+        if (target != null) operationTarget.handle = target // 刚置前的窗口就是接下来的操作目标
         return { ok: true }
       },
     }),

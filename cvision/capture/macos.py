@@ -18,6 +18,8 @@ import tempfile
 from PIL import Image, ImageGrab
 
 from cvision.capture.base import Window, pick_window
+# 跨进程输入互斥：解除最小化会改前台/Z 序，而前台与输入设备是同一个资源（见 input_lock 的锁边界表）
+from cvision.input_lock import ForegroundGuard
 
 try:
     import Quartz
@@ -99,7 +101,8 @@ def capture_window(
     """抓取窗口画面：``screencapture -l <CGWindowID>``。
 
     macOS 的 ``screencapture -l`` 直接抓窗口自身内容，与是否前台无关；默认不切前台。
-    ``maximize`` 仅在窗口被最小化时尽力解除最小化（否则抓不到）。
+    ``maximize`` 仅在窗口被最小化时尽力解除最小化（否则抓不到）——那一步**会**把窗口带到前面，
+    所以要和输入共用同一把跨进程锁（与 Windows 后端的 ``ForegroundGuard`` 同一套边界）。
     """
     if handle is None:
         if not title_substr:
@@ -108,9 +111,15 @@ def capture_window(
         if win is None:
             raise LookupError(f"未找到标题含 {title_substr!r} 的窗口")
         handle = win.handle
-    if maximize:
+    if not maximize:
+        return _capture_window_by_id(int(handle))
+    guard = ForegroundGuard(label=f"抓取窗口 {int(handle)}")
+    try:
+        guard.ensure("需要解除最小化才能抓到画面")
         _unminimize(int(handle))
-    return _capture_window_by_id(int(handle))
+        return _capture_window_by_id(int(handle))
+    finally:
+        guard.release()
 
 
 def capture_screen() -> Image.Image:
