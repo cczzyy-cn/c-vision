@@ -21,13 +21,37 @@ import json
 import sys
 import time
 
-from cvision import capturer, encoding
 # 「会改前台」的抓取被跨进程输入锁挡住时抛的就是这个（见 cvision/input_lock.py 的锁边界表）
 from cvision.input_lock import ForegroundBusy
 
 
+def _capture_deps():
+    """延迟导入捕获层，返回 ``(capturer, encoding)``。
+
+    **为什么不能放在模块顶层**：这两个 import 会链式拉进 Pillow 与平台后端（Windows 上是
+    ``win32gui``）。放顶层时，一个依赖都没装的环境连 ``--status`` 都跑不起来——而 ``--status``
+    恰恰是那种环境下唯一还该能跑、也唯一能告诉用户「缺什么」的东西。
+
+    v0.2.33 修的就是这个：``python -m cvision.cli_capture --status`` 曾在这条 import 链上
+    （``cli_capture`` → ``capturer`` → ``encoding`` 的 ``from PIL import Image``）直接崩，
+    宿主两条通道（常驻 server 与 CLI）因此**全断**，README 承诺的「缺什么 + 怎么装」拿不到。
+
+    只有**真的要抓图**时才调用它，所以错误信息按「抓图失败」写给人看。
+    """
+    try:
+        from cvision import capturer, encoding
+    except Exception as e:  # noqa: BLE001 - 依赖缺失/后端导入失败都要变成一句可行动的话
+        raise RuntimeError(
+            f"cvision 的 Python 依赖不可用（{type(e).__name__}: {e}）。"
+            "请先安装：python -m pip install -r requirements.txt；"
+            "用 python -m cvision.cli_capture --status 可以看缺哪个模块。"
+        ) from e
+    return capturer, encoding
+
+
 def _capture_with_text(args) -> int:
     """``--text``：一次返回「图片 data URL + 可点击元素 + 目标窗口句柄 + 图片屏幕矩形」。"""
+    capturer, encoding = _capture_deps()
     box: dict = {}
     img, elements = capturer.capture_with_text(
         handle=args.handle,
@@ -61,6 +85,8 @@ def _capture_with_text(args) -> int:
 
 def _wait_changed(args) -> int:
     """``--wait-changed``：轮询直到画面变化，返回变化后的那一帧 + 差异统计。"""
+    capturer, encoding = _capture_deps()
+    box: dict = {}
     img, metrics = capturer.wait_until_changed(
         handle=args.handle,
         title_substr=args.window,
@@ -71,25 +97,31 @@ def _wait_changed(args) -> int:
         timeout_ms=args.timeout,
         threshold=args.threshold,
         pixel_delta=args.pixel_delta,
+        geometry_out=box,
     )
-    sys.stdout.write(
-        json.dumps(
-            {
-                "ok": True,
-                "kind": "wait_changed",
-                "data_url": encoding.image_to_data_url(img, format=args.format),
-                "width": img.width,
-                "height": img.height,
-                **metrics,
-            },
-            ensure_ascii=True,
-        )
-    )
+    payload = {
+        "ok": True,
+        "kind": "wait_changed",
+        "data_url": encoding.image_to_data_url(img, format=args.format),
+        "width": img.width,
+        "height": img.height,
+        # 这张图覆盖的屏幕矩形 + 目标窗口（与常驻 server 同形状）：`wait_*` 返回的是一张**新图**，
+        # 宿主据此把 `click_at` 的比例基准换到这一张上。
+        "image_screen_box": box,
+        **metrics,
+    }
+    win = capturer.resolve_window(args.handle, args.window)
+    if win is not None:
+        payload["handle"] = win.handle
+        payload["title"] = win.title
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True))
     return 0
 
 
 def _wait_stable(args) -> int:
     """``--wait-stable``：轮询直到画面**连续若干次不再变化**，返回稳定后的那一帧 + 统计。"""
+    capturer, encoding = _capture_deps()
+    box: dict = {}
     img, metrics = capturer.wait_until_stable(
         handle=args.handle,
         title_substr=args.window,
@@ -101,20 +133,22 @@ def _wait_stable(args) -> int:
         timeout_ms=args.timeout,
         threshold=args.threshold,
         pixel_delta=args.pixel_delta,
+        geometry_out=box,
     )
-    sys.stdout.write(
-        json.dumps(
-            {
-                "ok": True,
-                "kind": "wait_stable",
-                "data_url": encoding.image_to_data_url(img, format=args.format),
-                "width": img.width,
-                "height": img.height,
-                **metrics,
-            },
-            ensure_ascii=True,
-        )
-    )
+    payload = {
+        "ok": True,
+        "kind": "wait_stable",
+        "data_url": encoding.image_to_data_url(img, format=args.format),
+        "width": img.width,
+        "height": img.height,
+        "image_screen_box": box,
+        **metrics,
+    }
+    win = capturer.resolve_window(args.handle, args.window)
+    if win is not None:
+        payload["handle"] = win.handle
+        payload["title"] = win.title
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True))
     return 0
 
 
@@ -142,11 +176,14 @@ def _run(argv: list[str] | None = None) -> int:
     parser.add_argument("--region", default=None, help="裁剪区域 x,y,w,h（像素，相对截图）")
     parser.add_argument("--delay", type=float, default=0, help="抓取前等待毫秒")
     parser.add_argument("--format", default="PNG", help="PNG/JPEG/WEBP，默认 PNG（与插件 see 工具一致）")
+    parser.add_argument("--json", action="store_true",
+                        help="非 text 截图也输出 JSON（含 handle 与 image_screen_box），而不是裸 data URL")
     args = parser.parse_args(argv)
 
     if args.list:
         # ensure_ascii=True：中文窗口标题转成 \uXXXX，输出纯 ASCII，避免 GBK 控制台
         # 编码问题；插件端 JSON.parse 会还原成正确的中文。
+        capturer, _ = _capture_deps()
         sys.stdout.write(
             json.dumps([w.to_dict() for w in capturer.list_windows()], ensure_ascii=True)
         )
@@ -173,17 +210,52 @@ def _run(argv: list[str] | None = None) -> int:
     if args.wait_stable:
         return _wait_stable(args)
 
+    capturer, encoding = _capture_deps()
+
     if args.delay:
         time.sleep(args.delay / 1000.0)
 
+    window_info = None
     if args.handle is not None or args.window:
         img = capturer.capture_window(handle=args.handle, title_substr=args.window, maximize=args.maximize)
+        # maximize 会改窗口矩形，必须在抓完之后重新解析，否则算出来的矩形整体偏移
+        # （与 cli_server._capture_image 同一处理）。只有 `--json` 需要它：缺省路径保持原样，
+        # 不为一个用不到的字段多枚举一次窗口。
+        if args.json:
+            window_info = capturer.resolve_window(args.handle, args.window)
     else:
         img = capturer.capture_screen()
 
     if args.region:
         img = encoding.crop_region(img, args.region)
+
+    # 几何要在 fit_for_attachment **之前**算：那一步会改像素尺寸，而矩形是屏幕坐标、与像素无关。
+    box: dict = {}
+    if args.json:
+        try:
+            box = capturer.image_screen_frame(img, args.region, window_info)
+        except Exception:  # noqa: BLE001 - 拿不到矩形不该让整次截图失败（元素/图片仍然有效）
+            box = {}
+
     img = encoding.fit_for_attachment(img, format=args.format)
+
+    if args.json:
+        # 与 `cli_server` 的非 text 抓取**同形状**（并附带 handle/title）：宿主靠它记住
+        # 「这次看的是哪个窗口」「这张图覆盖屏幕哪一块」——后续 click/type_text 才不会
+        # 沿用上一次的窗口（那会把键盘输入送进错误的窗口，v0.2.33 修的真实缺陷）。
+        payload = {
+            "ok": True,
+            "kind": "capture",
+            "data_url": encoding.image_to_data_url(img, format=args.format),
+            "width": img.width,
+            "height": img.height,
+            "image_screen_box": box,
+        }
+        if window_info is not None:
+            payload["handle"] = window_info.handle
+            payload["title"] = window_info.title
+        sys.stdout.write(json.dumps(payload, ensure_ascii=True))
+        return 0
 
     sys.stdout.write(encoding.image_to_data_url(img, format=args.format))
     return 0

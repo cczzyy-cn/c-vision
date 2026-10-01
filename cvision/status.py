@@ -11,8 +11,6 @@ import inspect
 import os
 import sys
 
-from cvision import capturer
-
 
 def _module_ok(name: str) -> tuple[bool, str]:
     try:
@@ -23,11 +21,40 @@ def _module_ok(name: str) -> tuple[bool, str]:
 
 
 def _backend() -> str:
+    """本平台捕获后端的名字——**按平台名推导，不去 import 后端模块**。
+
+    为什么不能 import：这条 import 链会拉进被探测对象本身——`cvision.capture` →
+    `capture.windows`（顶层 `import win32gui`）/ `capture.base`（顶层 `import PIL`），
+    于是「探针」依赖它要检查的东西。v0.2.33 修的真实缺陷正是这个：缺 Pillow 时
+    `python -m cvision.cli_capture --status` 在 import 期就崩，用户拿不到「缺哪个模块」。
+
+    后果还不止「崩」：旧实现在导入失败时返回 `"unknown"`，于是 `backend_implemented=False`，
+    宿主会把**缺依赖**错报成「本平台后端未实现」——这两件事的处置完全不同
+    （一个要 pip install，一个只能等）。
+
+    「后端到底能不能用」由 :func:`_capture_backend` 与 `backend_import_error` 单独回答。
+    平台映射与 `cvision/capture/__init__.py` 的 `_select_backend` 保持一致（那边不得不
+    import 后端，所以没法复用它的代码，只能靠这条注释钉住「两处要一起改」）。
+    """
+    if sys.platform.startswith("win"):
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    return "linux"
+
+
+def _capture_backend():
+    """尝试导入本平台捕获后端；返回 ``(模块或 None, 一句导入失败原因)``。
+
+    这里是**真的**去 import——它回答的是「依赖装没装、后端能不能用」，而不是「代码在不在」。
+    失败不抛错：导入失败本身就是一条结论，宿主会把它翻成带 pip 命令的提示。
+    """
     try:
         from cvision.capture import backend
-        return backend.__name__.split(".")[-1] or "unknown"
-    except Exception:
-        return "unknown"
+
+        return backend, ""
+    except Exception as e:  # noqa: BLE001 - 导入失败即结论
+        return None, f"{type(e).__name__}: {e}"
 
 
 def _platform_support(backend: str, backend_implemented: bool) -> str:
@@ -56,18 +83,24 @@ def _ocr_engine() -> str:
     return "none"
 
 
-def _capture_backends() -> dict:
+def _capture_backends(backend, import_error: str) -> dict:
     """窗口捕获各后端的**真实**可用性（不是「包有没有装上」）。
 
     为什么值得单列：Windows 上 WGC 需要一个可用的 D3D11 设备，而拿设备这一步在虚拟机 / 受限
     驱动上会失败——实测 VMware SVGA 3D 虚拟显卡上 ``LearningModelDevice(DIRECT_X_*)`` 返回
     ``DXGI_ERROR_UNSUPPORTED``，于是 WGC 永远抓不到帧，**但 ``deps.winsdk`` 依然是 true**。
     只看依赖会把「抓不了被遮挡的窗口」说成能抓，所以这里做一次真实探测（结果有缓存，不慢）。
+
+    :param backend: 已导入的后端模块；为 None 表示**导不进来**（缺依赖等）。
+    :param import_error: 导入失败原因，会原样回报给调用方（那是用户唯一能自救的线索）。
     """
-    try:
-        from cvision.capture import backend
-    except Exception:
-        return {}
+    if backend is None:
+        # 「有实现但导不进来」必须与「平台未实现」分开回报：前者装依赖就好，后者只能等。
+        return {
+            "window_capture": [],
+            "import_error": import_error,
+            "wgc": {"available": False, "reason": f"捕获后端导入失败：{import_error}"},
+        }
     probe = getattr(backend, "wgc_probe", None)
     if probe is None:
         return {}  # 非 Windows 后端没有这个分层
@@ -122,6 +155,7 @@ def status() -> dict:
     deps_status = {name: _module_ok(module)[0] for name, module in deps.items()}
 
     backend = _backend()
+    backend_mod, backend_import_error = _capture_backend()
     backend_known = backend in ("windows", "macos", "linux")
     backend_implemented = {
         "windows": True,
@@ -142,13 +176,18 @@ def status() -> dict:
         "backend": backend,
         "backend_known": backend_known,
         "backend_implemented": backend_implemented,
+        # 空串 = 后端导得进来；非空 = 缺依赖/导入失败，内容就是那句原因（用户自救的唯一线索）。
+        "backend_import_error": backend_import_error,
         "platform_support": _platform_support(backend, backend_implemented),
         "ocr_engine": _ocr_engine(),
         "input_capabilities": input_caps,
         "input_lock": _input_lock(),
-        "capture_backends": _capture_backends(),
+        "capture_backends": _capture_backends(backend_mod, backend_import_error),
         "deps": deps_status,
-        "ok": backend_implemented and deps_status.get("Pillow", False),
+        # `ok` 要同时满足三条：后端已实现 + 后端**真的导得进来** + Pillow 可用。
+        # 少任何一条都抓不了图：装了 Pillow 却缺 pywin32/pyobjc 时报 ok=true 就是谎报，
+        # 而 CI 的 windows 冒烟 job 正是用这个字段判断「照 README 装完到底能不能用」。
+        "ok": backend_implemented and not backend_import_error and deps_status.get("Pillow", False),
     }
 
 

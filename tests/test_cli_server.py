@@ -66,12 +66,32 @@ class TestHandleContract(unittest.TestCase):
 
     def test_wait_changed_shape(self):
         meta = {"changed": True, "samples": 3, "elapsed_ms": 120, "diff_ratio": 0.05, "mean_diff": 1.0, "diff_bbox": None}
-        with mock.patch.object(capturer, "wait_until_changed", return_value=(fake_image(), meta)):
-            resp = cli_server.handle({"op": "wait_changed"})
+        box = {}
+        window = Window(handle=4321, title="记事本", left=0, top=0, width=8, height=6)
+        with mock.patch.object(capturer, "wait_until_changed", return_value=(fake_image(), meta)) as wait:
+            with mock.patch.object(capturer, "resolve_window", return_value=window):
+                resp = cli_server.handle({"op": "wait_changed", "handle": 4321})
         self.assertTrue(resp["ok"])
         self.assertEqual(resp["kind"], "wait_changed")
         for key in ("changed", "samples", "elapsed_ms", "diff_ratio"):
             self.assertIn(key, resp, key)
+        # v0.2.33：`wait_*` 返回的是一张**新图**，必须一并给出「这张图覆盖的屏幕矩形 + 目标窗口」，
+        # 宿主靠它把 `click_at` 的比例基准换到这一张上（缺了它，比例点击会用上一次 see 的矩形）。
+        self.assertIn("image_screen_box", resp, "宿主需要几何来更新 click_at 的基准")
+        self.assertEqual(resp["handle"], 4321)
+        self.assertEqual(resp["title"], "记事本")
+        self.assertIn("geometry_out", wait.call_args.kwargs, "geometry_out 必须真的传给捕获层")
+
+    def test_wait_stable_shape(self):
+        meta = {"stable": True, "samples": 4, "elapsed_ms": 900, "diff_ratio": 0.0, "max_diff_ratio": 0.2, "stable_for": 3}
+        with mock.patch.object(capturer, "wait_until_stable", return_value=(fake_image(), meta)):
+            resp = cli_server.handle({"op": "wait_stable"})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["kind"], "wait_stable")
+        for key in ("stable", "samples", "max_diff_ratio", "stable_for"):
+            self.assertIn(key, resp, key)
+        self.assertIn("image_screen_box", resp)
+        self.assertNotIn("handle", resp, "整屏轮询没有目标窗口，不许编一个句柄出来")
 
     def test_ocr_shape_includes_words(self):
         """词框是 ocr 工具的核心产物，协议里不能少（v0.2.17 修过一次这个问题）。"""

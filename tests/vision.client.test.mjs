@@ -525,6 +525,94 @@ test('同一模型只查一次宿主（结果缓存）', async () => {
   })
 })
 
+// ── 能力门控的「在途态」与「重试」（v0.2.33） ──────────────────────────────
+//
+// 背景：早期实现「发起查询前先乐观写 'error'」，而 'error' 的语义是「交给名字启发式」——于是名字里
+// 带 vision|visual 的模型会先闪出一个按钮、拿到权威否定后再消失（注释里恰恰写着要避免这种猜测）。
+// 另外失败结果被永久缓存：一次瞬时故障（宿主路由还没就绪/网络抖一下）就让该模型在整个页面生命
+// 周期里退回启发式，不刷新页面永远好不了。
+
+test('能力门控：在途态不按名字猜（名字带 vision、宿主还没答 → 先不显示）', async () => {
+  let release
+  await withFetch(async () => new Promise((resolve) => { release = resolve }), async () => {
+    const client = mountClient()
+    const state = directoryState('local', 'llama-vision-preview', 'Llama Vision Preview')
+    const props = propsFor(state, client.slot.inject('s'))
+    client.component(props)
+    await settle()
+    assert.equal(client.component(props), null, '在途（宿主还没答）时不许按名字猜出按钮')
+    release({ ok: true, json: async () => ({ source: 'declared', image: false }) })
+    await settle()
+    assert.equal(client.component(props), null, '权威否定压过名字启发式')
+  })
+})
+
+test('能力门控：宿主瞬时不可达 → 会重试，拿到权威结论后按它渲染', async () => {
+  // 用假定时器：重试用的是 setTimeout，而 `settle()` 也依赖 setTimeout，所以这里改用 setImmediate
+  // 的 flush（mock.timers 只接管列出的 API）。setInterval 一起接管，避免按钮可见后漏出真轮询。
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval'] })
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+  let calls = 0
+  try {
+    await withFetch(async (url) => {
+      if (!String(url).includes('/cvision/model-capability')) {
+        return { ok: true, status: 200, json: async () => ({}), blob: async () => new Blob([]), text: async () => '' }
+      }
+      calls += 1
+      if (calls === 1) throw new Error('offline')
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ source: 'declared', image: true }),
+        blob: async () => new Blob([]),
+        text: async () => '',
+      }
+    }, async () => {
+      const client = mountClient()
+      // 名字不含 vision：兜底态下按钮本来就是隐藏的，于是断言只反映「权威结论」的影响。
+      const state = directoryState('deepseek-official', 'deepseek-v4.1', 'DeepSeek-V4.1')
+      const props = propsFor(state, client.slot.inject('s'))
+      client.component(props)
+      await flush()
+      assert.equal(client.component(props), null, '第一次失败 → 名字不含 vision，兜底态也是不显示')
+      mock.timers.tick(5000) // 触发重试
+      await flush()
+      assert.equal(calls, 2, '失败后必须重试一次（否则一次瞬时故障就永久退回启发式）')
+      assert.ok(client.component(props), '重试拿到「可收图」→ 按钮出现')
+    })
+  } finally {
+    mock.timers.reset()
+  }
+})
+
+test('能力门控：重试有上限，一直失败也不无限空转', async () => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval'] })
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+  let calls = 0
+  try {
+    await withFetch(async (url) => {
+      if (!String(url).includes('/cvision/model-capability')) {
+        return { ok: true, status: 200, json: async () => ({}), blob: async () => new Blob([]), text: async () => '' }
+      }
+      calls += 1
+      throw new Error('offline')
+    }, async () => {
+      const client = mountClient()
+      const state = directoryState('deepseek-official', 'deepseek-v4.1', 'DeepSeek-V4.1')
+      const props = propsFor(state, client.slot.inject('s'))
+      client.component(props)
+      await flush()
+      for (let i = 0; i < 6; i++) {
+        mock.timers.tick(5000)
+        await flush()
+      }
+      assert.equal(calls, 4, '首次 + 最多 3 次重试后必须停下（不许无限空转）')
+    })
+  } finally {
+    mock.timers.reset()
+  }
+})
+
 // ── 插入链 ──────────────────────────────────────────────────────────────────
 
 test('默认走宿主系统截图：POST /cvision/snip → 直接入附件栏（不经浏览器抓屏）', async () => {

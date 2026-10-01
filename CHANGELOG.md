@@ -10,6 +10,193 @@
 > - `v0.1.0` ~ `v0.1.9` 的说明只在 [GitHub Releases](https://github.com/cczzyy-cn/c-vision/releases) 里
 >   （那时还没有本文件）。
 
+## v0.2.33
+
+**修三个真实缺陷：抓取目标不再沿用旧值（键盘输入曾被静默送进上一个窗口）、体检探针不再依赖
+PIL/win32gui、`see` 的 format 说明不再承诺 GIF；并顺手清掉同一份分析列出的另外六项（客户端门控的
+在途态与永久缓存、`snipInFlight` 未复位、体检负缓存不可失效、能力路由无同源校验、
+`cvision/__init__.py` 版本漂移、`diff.py` 用了 Pillow 14 将移除的 API），以及最后一项
+**`wait_*` 不更新比例点击的基准**（等它变完之后按比例点结果区会整体点偏，而且不报错）。
+另外修了用户报告的**「截图按钮在 DSH 桌面版失效」**——见第八节，那是一条独立的、只在桌面版成立的
+根因。**
+
+前三项最重要，所以拆开写；后六项合并在「四、五、六」。九项都来自同一份全景分析
+（`docs/analysis/c-vision-review.md`）：那里给每条都留了行号级证据，最致命的那条（键盘输入进错窗口）
+是**代码路径可复现但极难人肉回归**的那类，所以修法是「先钉不变量」——把「每次抓取都是权威」抽成
+纯函数并上测试，而不是靠真桌面打字去试。
+
+三项都来自一次全景分析（`docs/analysis/c-vision-review.md`）：那里给每条都留了行号级证据，
+最致命的一条（键盘输入进错窗口）是**代码路径可复现但极难人肉回归**的那类，所以修法是「先钉不变量」——
+把「每次抓取都是权威」抽成纯函数并上测试，而不是靠真桌面打字去试。
+
+### 一、抓取目标：每次抓取都是权威（`operationTarget` 不再沿用旧值）
+
+- **缺陷**：`see(window=…)`（不带 text）与整屏 `see()` 的响应里没有窗口句柄，而宿主**只在「非 null」
+  时写入** `operationTarget`——于是**上一个窗口**的句柄一直留着。后续 `type_text`/`press_key` 会把它
+  当成目标：真的把那个窗口置前、把按键送进去；而键盘类动作没有坐标可校验（CLI 的判据是
+  `focused`），**整条链路报成功**。点击类动作会被前置校验拦下，但在那之前 `--unblock` 会**真的
+  移动鼠标并点一下旧窗口的标题栏**，且报错指向错误的窗口——排查方向也被带偏。
+- **修法**：新增导出的 `noteCaptureTarget(handle, frame)`，每次抓取**覆盖**这两项、拿不到就**清空**
+  （`see` 只调它一处）。清空不是降级：没有目标窗口时输入动作只跑动作本身（退化成按焦点/坐标），
+  `click_at` 则会**明确报错**，而不是拿上一张图的矩形去换算坐标。
+- **同时补齐信息源**（否则「清空」会让 CLI 回退路径白白丢掉保护）：
+  - `cli_server` 的非 text `capture` 响应**也带 `handle`/`title`**（与 `--text` 同形状）；
+  - `cli_capture` 新增 **`--json`**：非 text 截图输出 `{ok,kind,data_url,width,height,image_screen_box,handle?,title?}`，
+    宿主 CLI 回退路径改用它；**缺省仍是裸 data URL**（既有契约不破，README 契约表已同步）。
+- 现在的语义：`see(handle=…)` / `see(window=…)` / `see(text=true)` 都把**这一次**的窗口记为操作目标；
+  **整屏 `see()` 清掉目标**（整屏本来就没有「目标窗口」）。
+
+### 二、体检探针真的零依赖了（此前它会先崩在 import 上）
+
+- **缺陷**：`status.py` 顶层 `from cvision import capturer`（**这个 import 根本没人用**）→ 链式拉进
+  `encoding`(`from PIL import Image`) 与 `capture.windows`(`import win32gui`)；`cli_capture` 同样在模块
+  顶层 import 捕获层。于是**一个依赖都没装的环境**里 `python -m cvision.cli_capture --status` 在 import
+  期就崩：宿主两条通道（常驻 server + CLI 回退）**全断**，连「唯一还能用的排错手段」`cvision_status()`
+  也一起挂，用户拿到的是一句裸 `ImportError`——而 README 承诺的是「缺什么 + 带绝对路径的 pip 命令」。
+  **实测复现**（故障注入一个抛 `ImportError` 的 `PIL` 包）：
+  `cli_capture.py:24 → capturer.py:15 → encoding.py:8`，exit=1，无任何 JSON。
+- **修法**：
+  - 删掉那个没人用的 import；
+  - `_backend()` 改为**按平台名推导**（不再 import 后端），于是缺依赖时仍能如实说「平台=windows、
+    后端=windows」（旧实现在导入失败时返回 `unknown`，会把**缺依赖**错报成「本平台后端未实现」）；
+  - 新增 `backend_import_error`：导入失败的真实原因（`ModuleNotFoundError: No module named 'win32gui'`），
+    `capture_backends` 也带上 `import_error` + 人话 reason；
+  - `cli_capture` 的捕获层改为**延迟导入**（`_capture_deps()`，报错里带 `pip install` 与 `--status` 指引）；
+  - `ok` 现在同时要求「后端已实现 + 后端**真的导得进来** + Pillow 可用」——装了 Pillow 却缺
+    pywin32/pyobjc 时不再谎报 `ok:true`（CI 的 windows 冒烟 job 正是靠这个字段下判断）。
+- 宿主侧：`describeRuntimeProblem` 认识 `backend_import_error`——「有实现但导不进来」会被拦下并给出
+  pip 命令，**不再**被写成「本平台后端未实现」（后者会让用户白等一个不存在的修复）。
+- **实测**（同一次故障注入）：`--status` 现在 exit=0，输出
+  `backend:"windows"`、`backend_import_error:"ImportError: simulated: Pillow is not installed"`、
+  `deps.Pillow:false`、`ok:false`；常驻通道返回结构化 `status` 而不是 `{ok:false}`。正常环境里探针
+  **不再**把 `PIL`/`win32gui`/`cvision.capturer` 拉进 `sys.modules`（新增子进程用例钉住）。
+
+### 三、`see` 的 format 说明不再承诺 GIF
+
+- `see` 的参数说明写着「PNG/JPEG/WEBP/GIF」，而宿主早就**刻意**把 `image/gif` 从可回传类型里移除了
+  （多帧图只会写出第一帧）。模型行事的依据是工具说明而不是 README（v0.2.21 的教训），于是它会去传
+  `format='GIF'`：**截图成功，回传时才抛**「不支持的图片类型」。实测 Python 侧确实产出
+  `data:image/gif;base64,R0lGODdhBA…`。
+- 说明改为 `PNG/JPEG/WEBP，默认 PNG`；并给 `check:docs` 加了一条**永久断言**：工具说明里不得出现
+  `MEDIA_TYPES` 之外的图片格式名（允许集从产物里的 `MEDIA_TYPES` 派生，解析不出来即判失败）。
+  这类「文本语义漂移」此前是门禁的盲区（v0.2.21 记过）。
+
+### 四、客户端能力门控：在途态不再「按名字猜」，失败也不再永久降级
+
+- **缺陷一（`src/client.js`）**：发起能力查询前先乐观写 `'error'`，而 `'error'` 的语义是「交给名字
+  启发式」——于是名字里带 `vision|visual`、实际不收图的模型会**先闪出一个按钮**，拿到权威否定后再
+  消失。注释里恰恰写着要避免这种猜测，代码却做着相反的事。现在在途只记在独立的 `inFlight` 集合里
+  （只做去重），`verdicts` 保持为空 → 渲染成 `'pending'` → **先不显示**。
+- **缺陷二**：失败结论被永久缓存（`verdicts.has(key)` 早退），一次瞬时故障（宿主路由还没就绪、
+  网络抖一下）就让该模型在**整个页面生命周期**里退回名字启发式，不刷新页面永远好不了。
+  现在失败**有限次重试**：`VERDICT_RETRY_MS = 5s` × `VERDICT_MAX_ATTEMPTS = 3`；重试期间不改动已落地的
+  结论（否则按钮会每 5 秒闪一次 `error → pending → error`），一旦拿到权威结论就按它渲染。
+
+### 五、三个小缺陷（各一两行，但都会造成「静默失灵」）
+
+- **`snipInFlight` 未用 try/finally 复位**（`src/index.ts`）：`snipExecutor` 是导出的注入点，一旦它抛异常，
+  这个标记会**永久为真** → 之后**任何**剪贴板图片都被当成「我们自己刚产出的」→ 按钮再也不亮、
+  长按永远不触发，直到重启宿主。现在复位放进 `finally`。
+- **体检负缓存不可失效**（`src/index.ts`）：结论曾是「整个进程只探一次」的负缓存，用户跑完
+  `pip install` 后 `see` 继续报同一个错，而 `cvision_status()`（刻意不过门）已经显示一切正常——
+  两个工具口径互相矛盾。现在失败结论只保 `RUNTIME_PROBE_RETRY_MS = 30s`，且 **`cvision_status()` 成功时
+  直接清掉负缓存**（下一次门立刻重探）。判定抽成导出的纯函数 `shouldProbeRuntime()` 并上测试。
+- **能力路由缺同源校验**（`src/index.ts`）：`GET /cvision/model-capability` 此前对谁都答。现在**只拒绝
+  明确跨站**（带 `Origin` 且 host ≠ `Host`）——刻意**不**复用 POST 那条「缺 `Origin` 也拒绝」的口径：
+  浏览器不给同源 GET 加 `Origin`，照 POST 卡会把插件自己的 `fetch` 一起挡掉，按钮退回名字启发式，
+  比不设防更糟。
+
+### 六、两处「将来会坏」与一处版本漂移
+
+- **`diff.py` 用了将被移除的 API**：`Image.getdata()` 自 Pillow 12.3 弃用、**14 起移除**，而 README
+  约定每季度审查一次依赖上界——上界一推到 14，`wait_until_changed`/`wait_until_stable` 的核心就会报错。
+  新增 `diff.pixel_rows()`：优先 `get_flattened_data()`（实测 12.3 上取值与旧 API **逐字一致**），
+  取不到才回退 `getdata()`——不能直接换名字，因为 `requirements.txt` 的下界是 Pillow **12.0**，
+  而新 API 是 12.x 中途才加的。
+- **`cvision/__init__.py` 的 `__version__` 长期停在 `0.1.0`**（包已到 0.2.x），docstring 还写着早已移除的
+  「MCP Server」。现在版本号对齐 **0.2.33**，并给 `check:docs` 加了断言：
+  **`cvision/__init__.py` 的 `__version__` 必须等于 `package.json` 的 version**——「版本号三处一致」
+  这条约定自己漏了第四处，靠人记是记不住的。
+
+### 七、`wait_*` 也回报几何：比例点击的基准换成「它返回的那张图」
+
+- **缺陷**：`wait_until_changed` / `wait_until_stable` 明明返回一张**新图**，却不更新
+  `operationTarget.frame`——而 `click_at` 是**按比例**点「最近一次抓取那张图」。于是
+  「`wait_until_stable` 等它变完 → `click_at(0.5, 0.5)` 点结果区」这条最自然的链路，会按**上一次
+  `see`** 的矩形换算：位置整体偏，而且**不报错**（比报错更难发现）。若上一次 `see` 带了 `region`，
+  偏差会大得离谱。
+- **修法（两侧一起）**：
+  - Python：`wait_until_changed` / `wait_until_stable` 新增 `geometry_out` 出参（与
+    `capture_with_text` 同一约定），在 `fit_for_attachment` **之前**用**原始帧**算好屏幕矩形——
+    晚一步算就会拿缩过的图去算，矩形整体算小；`cli_server` 与 `cli_capture` 两条通道都把
+    `image_screen_box`（+ 目标窗口的 `handle`/`title`）一并回报，形状与 `capture` 对齐。
+  - 宿主：两个工具解析这三个字段并调用 `noteCaptureTarget`（拿不到就清空，绝不留旧值）。
+    **刻意不进模型可见的返回值**：`WAIT_*_KEYS` 与工具 schema 都不动——那条 `additionalProperties:
+    false` 的严格路径正是 v0.2.23/24 炸过的地方，能不加键就不加键。
+- **实测**（真实链路，只取 8×8 区域）：`--wait-changed` → `changed=False`、
+  `image_screen_box={x:0,y:0,width:8,height:8}`、无 `handle`（整屏不编句柄）；
+  `--wait-stable` → `stable=True` + 同一矩形。
+
+### 八、桌面版截图按钮失效：桌面版的转发会删掉 `Origin`
+
+- **现象**（用户报告）：「截图按钮相关功能在 DSH 桌面版失效」——按钮在（能力查询正常），但点了没反应，
+  长按插入剪贴板图片同样无效。
+- **取证（四步，都是外部可复核的）**：
+  1. 桌面版的宿主进程是 `dsh-desktop-host`，它监听 `127.0.0.1:19387`，用的 profile 是 **desktop**；
+     该 profile 的 `bundles` 里**有** `vision`（不是没装）。
+  2. 界面截图确认那个相机图标**确实渲染出来了**——而当前模型 `DeepSeek-V41-Flash` 的名字不含
+     `vision|visual`，说明按钮可见是**宿主能力路由答的「收图」**（不是名字启发式兜的）；
+     `app.asar` 里也没有 DSH 自带的 `dsh-client-ui-screenshot`，所以那就是本插件的按钮。
+  3. 桌面版的页面跑在自定义源 `dsh-app://app` 上，非静态请求由主进程的 `forwardWebRequest` 转发到
+     回环 HTTP 服务。它的实现里写着：**删掉** `host`/`origin`/`cookie`/`sec-fetch-site` 再换上宿主 cookie
+     （`app.asar`）。于是插件路由收到的请求**永远没有 `Origin`**。
+  4. 旧实现的 `isSameOrigin()` 要求「`Origin` 存在且 host == `Host`」→ **必然 403**（实测：不带 `Origin`
+     打 `/cvision/clipboard/image` → `403`；只有带匹配的 `http://127.0.0.1:<port>` 才 `204`）。
+     客户端的下一步是回退 `navigator.mediaDevices.getDisplayMedia`——而桌面版把抓屏权限全关了
+     （`setPermissionCheckHandler(() => false)`、`setDevicePermissionHandler(() => false)`、
+     `setDisplayMediaRequestHandler((_req, cb) => cb({}))`），**回退路也是死的**，所以表现就是「点了没反应」。
+     web profile 不受影响：它的页面直接跑在 `http://127.0.0.1:<port>` 上，`Origin` 与 `Host` 本来就匹配。
+- **修法**：新增 `isTrustedRouteCaller(req)`（`snip` 与 `clipboard/image` 两条高权限 POST 路由共用），
+  放行三种情况之一：① `Origin` 存在且 host == `Host`（原行为）；② `Origin` 是 `dsh-app://app`；
+  ③ **`Origin` 缺失且对端是回环**（IPv4 / `::1` / `::ffff:127.0.0.1` 三种写法都认）。
+  跨站页面的 POST **一定**带 http(s) `Origin`，所以照旧被拒；而「豁免只给回环」把③的受益者限死在本机
+  ——本机进程本来就能直接调 `python -m cvision.cli_snip`，从来不是这条路由的防护边界。README 的
+  STORE 契约与故障排查表都已同步成这个准确口径。
+- **验证**：新增 3 条 JS 用例（无 Origin + 回环 → 放行且真的拉起执行器；无 Origin + **非**回环 → 403 且不碰
+  执行器；`Origin: dsh-app://app` → 放行；剪贴板取图同样补了一条）；另用**真实 HTTP 往返**验证了一遍
+  ——分别绑 `127.0.0.1` 与双栈 `::`（对端会写成 `::ffff:127.0.0.1`）：无 Origin → `204`、`dsh-app://app` → `204`、
+  跨站 `http://evil.example` → **403**、同源 HTTP → `204`。
+- **要生效需要**：把插件更新到 ≥v0.2.33（桌面 profile 里的 `vision` 也要更新）并**重启 DSH 桌面 App**
+  ——宿主路由是进程启动时注册的。
+
+### 测试与门禁
+
+- Python 292 → **308**：`tests/test_status.py` +2（**子进程**断言「探针不 import 捕获层」；
+  缺 Pillow 故障注入下 `--status` 仍须 exit 0 且 JSON 合法）；新增 `tests/test_cli_capture.py` **8 条**
+  （`--json` 的句柄/矩形透传、裸 data URL 既有契约不许破、argv → kwargs 映射、`--region`、
+  `--text` 形状、`wait_changed` 的几何/句柄透传、缺依赖时的可行动报错）——`cli_capture` 此前
+  **一行专测都没有**，而它是 server 崩掉后唯一的兜底通道；`tests/test_diff.py` +2（兼容层取值必须
+  与旧 API 逐字一致；热路径不许再触发 `getdata` 弃用警告）；`tests/test_wait_stable.py` +3
+  （几何必须用**原始帧**算、变化分支也要填、几何失败不许影响抓图）；`tests/test_cli_server.py`
+  +1 并扩了一条（`wait_changed`/`wait_stable` 的 `image_screen_box` 与句柄形状）。
+- JS 84 → **99**：体检「后端有实现但导不进来」必须拦下并给 pip 命令（不许写成「后端未实现」）；
+  `noteCaptureTarget` 的权威性两条（拿不到就清空、有值就覆盖）+ 一条**调用点数量**断言
+  （`see` 与两个 `wait_*` 都必须更新操作目标）；客户端门控三条（在途态不按名字猜、瞬时失败会重试、
+  重试有上限）；能力路由两条（外站 Origin → 403、**无 Origin 的同源 GET 必须放行**）；
+  `snipInFlight` 抛异常后必须复位（用改 `Date.now` 的方式把归属窗口推到过期之外，让 `served`
+  只反映该标记）；体检缓存一条（成功不重探 / 失败按 TTL 重探 / 复位后立刻重探）；
+  `wait_*` 一条（Python 新给的 `image_screen_box`/`handle`/`title` 必须被整形函数丢掉——
+  schema 没声明它们，多一个键就是整次调用失败）；**桌面版调用方判定三条**（无 `Origin` + 回环 → 放行且
+  真的拉起执行器；无 `Origin` + **非**回环 → 403 且不碰执行器；`Origin: dsh-app://app` → 放行）
+  ——替换掉原来那条「缺 `Origin` 一律拒绝」的用例，因为那条口径本身就是要修的缺陷（见第八节）；
+  `fakeRequest` 也补上了 `socket.remoteAddress`，否则「回环豁免」在测试里根本表达不出来。
+- **顺手修了门禁自身的一个计数缺陷**：`check:docs` 的 JS 条数用 `\btest(` 统计，会把断言里的正则调用
+  （`assert.ok(!/x/.test(v))`）也当成一条测试——于是 README 无论写多少都可能对不上。已改为**行首口径**
+  （`^\s*test(`，与 Python 侧一致）。它是被这次的体检用例照出来的：加一条测试却让计数 +2。
+- 门禁：`check:dsh` 30/30、`check:docs` **17/17**（新增「工具说明不得出现未支持的图片格式」与
+  「Python 半边版本号 == package.json」两条断言）、`check:deps` 9/9 全绿；README 的版本号、测试条数、
+  目录结构、CLI 契约表已同步（这些都由 `check:docs` 机械校验）。
+
 ## v0.2.32
 
 **跨进程输入互斥落地；并按「一个资源」把锁的边界划准——会改前台/Z 序的抓图也进锁。**

@@ -5,6 +5,7 @@
 """
 
 import unittest
+import warnings
 
 from PIL import Image
 
@@ -13,6 +14,34 @@ from cvision import diff
 
 def flat(size=(64, 48), value=100):
     return Image.new("L", size, value)
+
+
+class TestPixelRows(unittest.TestCase):
+    """`pixel_rows` 是 Pillow 新旧像素 API 的兼容层（v0.2.33）。
+
+    背景：``Image.getdata()`` 自 Pillow 12.3 起被弃用、14 起会被移除，官方替代是
+    ``get_flattened_data()``——但 requirements 的下界是 Pillow 12.0，而新 API 是 12.x 中途才加的，
+    所以不能直接换名字。这里钉住「包装后的取值与旧 API 逐字一致」与「热路径不再触发弃用警告」。
+    """
+
+    def test_matches_getdata_for_rgb_and_gray(self):
+        for image in (Image.new("RGB", (2, 3), (1, 2, 3)), Image.new("L", (2, 3), 7)):
+            with warnings.catch_warnings():
+                # 这里**就是要**拿 getdata 当参照物，所以忽略它自己的弃用警告。
+                warnings.simplefilter("ignore", DeprecationWarning)
+                expected = list(image.getdata())
+            self.assertEqual(diff.pixel_rows(image), expected, f"mode={image.mode}")
+
+    def test_diff_hot_path_does_not_touch_deprecated_getdata(self):
+        """`wait_*` 的热路径不许再用 `getdata()`：Pillow 14 一到就会直接报错。"""
+        before = flat((16, 12), 0)
+        after = flat((16, 12), 255)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            diff.diff_metrics(before, after)
+            diff.change_clusters(before, after)
+        offenders = [str(item.message) for item in caught if "getdata" in str(item.message)]
+        self.assertEqual(offenders, [], "热路径又用回了 getdata（Pillow 14 会移除它）")
 
 
 class TestThumbnail(unittest.TestCase):

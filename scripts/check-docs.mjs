@@ -69,6 +69,18 @@ check(
   `README=${String(readmeVersion)} pkg=${version}`,
 )
 
+// 版本号还有第 4 处：Python 半边的 `__version__`。它曾长期停在 0.1.0（包已到 0.2.x），
+// 于是「版本号三处一致」这条约定自己漏了一处——手写数字多一个就多一处漂移。
+const pyInitRel = 'cvision/__init__.py'
+const pyVersion = exists(pyInitRel)
+  ? read(pyInitRel).match(/__version__\s*=\s*['"]([^'"]+)['"]/)?.[1]
+  : undefined
+check(
+  'cvision/__init__.py 的 __version__ 与 package.json 一致',
+  pyVersion === version,
+  `py=${String(pyVersion)} pkg=${version}`,
+)
+
 // ── 2. 行为参数：README 里写死的阈值必须等于源码里的值 ──────────────────────
 if (exists('src/client.js')) {
   const longPressMs = Number(read('src/client.js').match(/LONG_PRESS_MS\s*=\s*(\d+)/)?.[1])
@@ -135,7 +147,10 @@ if (exists('lib/index.js')) {
 }
 
 // ── 6. 测试数量：README 声称的条数 == 实际条数 ───────────────────────────────
-const jsTests = list('tests', '.mjs').reduce((sum, name) => sum + (read(`tests/${name}`).match(/\btest\(/g)?.length ?? 0), 0)
+// ⚠️ 口径必须**行首**（`^\s*test(`），不能写成 `\btest(`：后者会把断言里的正则调用
+// （`assert.ok(!/xxx/.test(v))`、`regex.test(s)`）也算成一条测试，于是 README 无论写多少都可能
+// 对不上——而这类断言在 `wait_*`/体检用例里很常见。Python 侧本来就是行首口径（`^\s+def test_`）。
+const jsTests = list('tests', '.mjs').reduce((sum, name) => sum + (read(`tests/${name}`).match(/^\s*test\(/gm)?.length ?? 0), 0)
 const pyTests = list('tests', '.py').reduce((sum, name) => sum + (read(`tests/${name}`).match(/^\s+def test_/gm)?.length ?? 0), 0)
 const claimed = readme.match(/JS\s*(\d+)\s*条\s*\+\s*Python\s*(\d+)\s*条/)
 check(
@@ -144,7 +159,37 @@ check(
   `README=${claimed ? `${claimed[1]}/${claimed[2]}` : '未声明'} 实际=${jsTests}/${pyTests}`,
 )
 
-// ── 7. README 内部锚点都要能落到标题上 ──────────────────────────────────────
+// ── 7. 工具说明里不得出现「未支持的图片格式」 ────────────────────────────────
+// 背景（v0.2.33 修掉的一处真实漂移）：`see` 的 format 说明一直写着「PNG/JPEG/WEBP/GIF」，
+// 而宿主早就**刻意**把 GIF 从可回传类型里移除了（多帧图只会写出第一帧）。模型行事的依据是
+// 工具说明而不是 README（v0.2.21 的教训），于是它会去传 GIF：截图成功，回传时才抛
+// 「不支持的图片类型」——说明与实现互相矛盾。这里把「说明里的格式名」与 `MEDIA_TYPES`
+// （唯一事实源）机械对齐；这类**文本语义漂移**此前是门禁的盲区。
+if (exists('lib/index.js')) {
+  const lib = read('lib/index.js')
+  // 允许集从产物里的 MEDIA_TYPES 派生；解析不出来直接判失败——不许因为解析失败而静默放行。
+  const declared = lib.match(/MEDIA_TYPES\s*=\s*\[([^\]]*)\]/)?.[1] ?? ''
+  const allowed = [...declared.matchAll(/image\/([a-z+]+)/g)].map((match) => match[1].toUpperCase())
+  check('能从 lib/index.js 解析出 MEDIA_TYPES', allowed.length > 0, allowed.join(', ') || '未解析到')
+  // 只扫**工具说明**里的单引号字符串：文件头注释里解释「为什么不支持 GIF」不算违规。
+  const descriptions = [...lib.matchAll(/description:\s*'([^']*)'/g)].map((match) => match[1])
+  const universe = ['PNG', 'JPEG', 'JPG', 'WEBP', 'GIF', 'BMP', 'TIFF', 'AVIF']
+  const offenders = []
+  for (const text of descriptions) {
+    for (const name of universe) {
+      if (!allowed.includes(name) && new RegExp(`\\b${name}\\b`).test(text)) {
+        offenders.push(`${name}（${text.slice(0, 40)}）`)
+      }
+    }
+  }
+  check(
+    '工具说明里不出现未支持的图片格式',
+    descriptions.length > 0 && offenders.length === 0,
+    offenders.length > 0 ? offenders.join('; ') : `${descriptions.length} 段说明`,
+  )
+}
+
+// ── 8. README 内部锚点都要能落到标题上 ──────────────────────────────────────
 /** 按 GitHub 的 slug 规则归一化标题（保留 CJK/字母/数字/空白/连字符/下划线，其余去掉）。 */
 const slugify = (text) =>
   text

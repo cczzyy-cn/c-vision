@@ -187,6 +187,22 @@ def _make_shooter(handle: int | None, title_substr: str | None, maximize: bool, 
     return shoot
 
 
+def _fill_geometry(out: dict, img, region: str | None, handle: int | None, title_substr: str | None) -> None:
+    """把「这张图覆盖的屏幕矩形」写进 ``out``（拿不到就留空，**绝不抛**）。
+
+    与 ``cli_server._capture_image`` 同一时序要求：必须在 ``fit_for_attachment`` **之前**用**原始帧**
+    算——那一步会把图片缩小，而矩形是屏幕坐标（与图片被缩放到多少像素无关），用缩过的图去算会整体算小。
+
+    为什么两个 ``wait_until_*`` 也要它：它们返回的是**一张新图**，模型看完直接
+    ``click_at(rx, ry)`` 是最自然的用法；而 ``click_at`` 的基准是「最近一次抓取那张图」——
+    不更新基准的话，比例点击会用**上一次 see** 的矩形换算，位置整体偏掉。
+    """
+    try:
+        out.update(image_screen_frame(img, region, resolve_window(handle, title_substr)))
+    except Exception:  # noqa: BLE001 - 几何算不出来不该让抓图失败（调用方会清掉旧基准）
+        pass
+
+
 def wait_until_changed(
     *,
     handle: int | None = None,
@@ -198,6 +214,7 @@ def wait_until_changed(
     timeout_ms: float = 10000,
     threshold: float = 0.01,
     pixel_delta: int = 13,
+    geometry_out: dict | None = None,
 ) -> tuple[object, dict]:
     """反复截图直到画面变化（或超时），返回**变化后的那一帧**与差异统计。
 
@@ -211,6 +228,9 @@ def wait_until_changed(
         「变了」（那等于毫无用处）。窗口出现这类真实变化通常 ≥5%，留了足够余量。
         要更灵敏就调低，但**同时用 ``region`` 把闪烁区域排除掉**才稳。
     :param pixel_delta: 单像素算「变了」的灰度差阈值。
+    :param geometry_out: 传入一个 dict 时，会被填入这张图覆盖的**屏幕矩形**
+        （约定同 :func:`capture_with_text` 的 ``geometry_out``）——供宿主把 ``click_at`` 的比例
+        基准换到**这一张**图上。
     :returns: ``(PIL.Image, metrics)``，``metrics`` 含 ``changed`` / ``samples`` / ``elapsed_ms`` /
         ``diff_ratio`` / ``mean_diff`` / ``diff_bbox``（变化区域，原图坐标）。
     """
@@ -239,6 +259,9 @@ def wait_until_changed(
                 current.size,
             )
             # **先画框再 fit_for_attachment**：后者可能缩放图片，框得跟着一起缩才不会错位。
+            if geometry_out is not None:
+                # 同理：几何也要在缩放**之前**用原始帧算。
+                _fill_geometry(geometry_out, current, region, handle, title_substr)
             full = encoding.fit_for_attachment(diff_mod.highlight_boxes(current, boxes), format=format)
             return full, {
                 "changed": True,
@@ -251,6 +274,8 @@ def wait_until_changed(
             }
         baseline, base_thumb = current, diff_mod.thumbnail(current)
 
+    if geometry_out is not None:
+        _fill_geometry(geometry_out, baseline, region, handle, title_substr)
     full = encoding.fit_for_attachment(baseline, format=format)
     return full, {
         "changed": False,
@@ -320,6 +345,7 @@ def wait_until_stable(
     timeout_ms: float = 15000,
     threshold: float = 0.01,
     pixel_delta: int = 13,
+    geometry_out: dict | None = None,
 ) -> tuple[object, dict]:
     """反复截图，直到画面**连续若干次不再变化**（等加载完成 / 动画结束）。
 
@@ -336,6 +362,8 @@ def wait_until_stable(
     :param interval_ms: 采样间隔。默认 300ms，比 ``wait_until_changed`` 更密——这里判定的是「安静」，
         采样太稀会把中间的变化整个漏掉。
     :param timeout_ms: 总超时；仍未稳定就返回 ``stable=False`` 和当前帧（让调用方看到卡在什么状态）。
+    :param geometry_out: 传入一个 dict 时，会被填入这张图覆盖的**屏幕矩形**（同
+        :func:`wait_until_changed`）——它是 ``click_at`` 在「等它变完」之后继续按比例点击的基准。
     :returns: ``(PIL.Image, metrics)``，``metrics`` 含 ``stable`` / ``samples`` / ``elapsed_ms`` /
         ``diff_ratio``（最后一对采样的差异）/ ``max_diff_ratio``（过程最大差异）/
         ``stable_for``（最终连续安静了几次）。
@@ -348,4 +376,6 @@ def wait_until_stable(
         threshold=float(threshold),
         pixel_delta=int(pixel_delta),
     )
+    if geometry_out is not None:
+        _fill_geometry(geometry_out, frame, region, handle, title_substr)
     return encoding.fit_for_attachment(frame, format=format), metrics

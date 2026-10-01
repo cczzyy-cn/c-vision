@@ -29,6 +29,21 @@ HIGHLIGHT_COLOR = (255, 64, 64)
 HIGHLIGHT_WIDTH = 3
 
 
+def pixel_rows(img: Image.Image) -> list:
+    """取像素序列，形状与旧的 ``Image.getdata()`` **逐字一致**（RGB → ``(r,g,b)`` 元组，L → 整数）。
+
+    为什么要这层间接：Pillow 12.3 起 ``getdata()`` 被弃用、14 起会被移除，官方替代是
+    ``get_flattened_data()``（**返回形状相同**，实测 12.3）。但不能直接换名字——`requirements.txt`
+    的下界是 Pillow **12.0**，而 ``get_flattened_data`` 是 12.x 中途才加的，直接换会让下界版本
+    在这个函数上抛 ``AttributeError``（而这是 ``wait_until_changed`` 的热路径）。所以做一次能力探测。
+
+    之前这里直接写 ``list(img.getdata())``：功能没错，但每次调用都会吐弃用警告，且上界一旦推进到
+    Pillow 14（README 约定每季度审查一次）就会直接报错。
+    """
+    getter = getattr(img, "get_flattened_data", None)
+    return list(getter()) if callable(getter) else list(img.getdata())
+
+
 def thumbnail(img: Image.Image, max_side: int = THUMB_MAX_SIDE) -> Image.Image:
     """把图缩成灰度缩略图，供廉价比较（不等比缩放带来的轻微模糊本身就是抗噪）。"""
     grey = img.convert("L")
@@ -57,8 +72,8 @@ def diff_metrics(before: Image.Image, after: Image.Image, pixel_delta: int = PIX
     if w == 0 or h == 0:
         return {"diff_ratio": 0.0, "mean_diff": 0.0, "bbox": None}
 
-    b_px = list(before.getdata())
-    a_px = list(after.getdata())
+    b_px = pixel_rows(before)
+    a_px = pixel_rows(after)
     total = len(b_px)
     changed = 0
     diff_sum = 0
@@ -115,8 +130,8 @@ def change_clusters(
         return []
 
     cells: dict[tuple[int, int], int] = {}
-    before_px = list(before.getdata())
-    after_px = list(after.getdata())
+    before_px = pixel_rows(before)
+    after_px = pixel_rows(after)
     for index, (old, new) in enumerate(zip(before_px, after_px)):
         if abs(new - old) > pixel_delta:
             cell = ((index % width) // grid, (index // width) // grid)

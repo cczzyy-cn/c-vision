@@ -23,11 +23,11 @@
 
 响应::
 
-    {"ok":true,"kind":"capture","data_url":"data:...","width":int,"height":int}
-    {"ok":true,"kind":"capture_text","data_url":"data:...","width":int,"height":int,"elements":[{...}]}
+    {"ok":true,"kind":"capture","data_url":"data:...","width":int,"height":int,"image_screen_box":{...},"handle":int?,"title":str?}
+    {"ok":true,"kind":"capture_text","data_url":"data:...","width":int,"height":int,"elements":[{...}],"image_screen_box":{...},"handle":int?,"title":str?}
     {"ok":true,"kind":"ocr","text":str,"lines":[str],"words":[{...}]}
-    {"ok":true,"kind":"wait_changed","data_url":"data:...","width":int,"height":int,"changed":bool,"diff_ratio":float,...}
-    {"ok":true,"kind":"wait_stable","data_url":"data:...","width":int,"height":int,"stable":bool,"max_diff_ratio":float,...}
+    {"ok":true,"kind":"wait_changed","data_url":"data:...","width":int,"height":int,"changed":bool,"diff_ratio":float,...,"image_screen_box":{...},"handle":int?,"title":str?}
+    {"ok":true,"kind":"wait_stable","data_url":"data:...","width":int,"height":int,"stable":bool,"max_diff_ratio":float,...,"image_screen_box":{...},"handle":int?,"title":str?}
     {"ok":true,"kind":"list","windows":[{...}]}
     {"ok":true,"kind":"screen_info","displays":[{...}]}
     {"ok":true,"kind":"status","status":{...}}
@@ -108,7 +108,7 @@ def _capture(args: dict):
     box: dict = {}
     img = _capture_image(args, geometry_out=box)
     data_url = encoding.image_to_data_url(img, format=args.get("format", "PNG"))
-    return {
+    resp = {
         "ok": True,
         "kind": "capture",
         "data_url": data_url,
@@ -117,6 +117,14 @@ def _capture(args: dict):
         # 非 text 抓取（整屏/窗口）同样回报屏幕矩形：模型看完图直接按比例点击是最常见的用法。
         "image_screen_box": box,
     }
+    # 与 `--text` 一样附带目标窗口句柄：宿主靠它记住「这次看的是哪个窗口」。
+    # 缺了它，`see(window=…)`（不带 text）之后的操作就会沿用**上一次**的句柄——键盘输入会
+    # 被真的送进那个旧窗口，而整条链路报成功（v0.2.33 修的真实缺陷）。整屏抓取时这里为空。
+    win = capturer.resolve_window(args.get("handle"), args.get("window"))
+    if win is not None:
+        resp["handle"] = win.handle
+        resp["title"] = win.title
+    return resp
 
 
 def _ocr(args: dict):
@@ -165,6 +173,7 @@ def _wait_changed(args: dict):
     """
     from cvision import capturer, encoding
 
+    box: dict = {}
     img, metrics = capturer.wait_until_changed(
         handle=args.get("handle"),
         title_substr=args.get("window"),
@@ -174,8 +183,9 @@ def _wait_changed(args: dict):
         interval_ms=args.get("interval") or 500,
         timeout_ms=args.get("timeout") or 10000,
         threshold=args.get("threshold") if args.get("threshold") is not None else 0.01,
+        geometry_out=box,
     )
-    return {
+    resp = {
         "ok": True,
         "kind": "wait_changed",
         "data_url": encoding.image_to_data_url(img, format=args.get("format", "PNG")),
@@ -183,6 +193,14 @@ def _wait_changed(args: dict):
         "height": img.height,
         **metrics,
     }
+    # 与 capture 一样带上「这张图覆盖的屏幕矩形 + 目标窗口」：`wait_*` 返回的是一张**新图**，
+    # 宿主据此把 `click_at` 的比例基准换到这一张上（缺了它，比例点击会用上一次 see 的矩形）。
+    resp["image_screen_box"] = box
+    win = capturer.resolve_window(args.get("handle"), args.get("window"))
+    if win is not None:
+        resp["handle"] = win.handle
+        resp["title"] = win.title
+    return resp
 
 
 def _wait_stable(args: dict):
@@ -193,6 +211,7 @@ def _wait_stable(args: dict):
     """
     from cvision import capturer, encoding
 
+    box: dict = {}
     img, metrics = capturer.wait_until_stable(
         handle=args.get("handle"),
         title_substr=args.get("window"),
@@ -203,8 +222,9 @@ def _wait_stable(args: dict):
         stable_samples=args.get("stable_samples") or 3,
         timeout_ms=args.get("timeout") or 15000,
         threshold=args.get("threshold") if args.get("threshold") is not None else 0.01,
+        geometry_out=box,
     )
-    return {
+    resp = {
         "ok": True,
         "kind": "wait_stable",
         "data_url": encoding.image_to_data_url(img, format=args.get("format", "PNG")),
@@ -212,6 +232,12 @@ def _wait_stable(args: dict):
         "height": img.height,
         **metrics,
     }
+    resp["image_screen_box"] = box
+    win = capturer.resolve_window(args.get("handle"), args.get("window"))
+    if win is not None:
+        resp["handle"] = win.handle
+        resp["title"] = win.title
+    return resp
 
 
 def handle(req: dict) -> dict:

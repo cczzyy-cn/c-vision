@@ -15,8 +15,11 @@ import test, { mock } from 'node:test'
 /** 让出一个宏任务：用于推进被 await 的处理器（如「截图进行中」的时序用例）。 */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
 
-const { apply, snipExecutor, clipboardProbe, inputRunner, operationTarget, withLockLabel, describeRuntimeProblem, PIP_HINT, ensureRuntime, waitChangedMeta, stableMeta } =
-  await import('../lib/index.js')
+const {
+  apply, snipExecutor, clipboardProbe, inputRunner, operationTarget, noteCaptureTarget,
+  withLockLabel, describeRuntimeProblem, PIP_HINT, ensureRuntime, waitChangedMeta, stableMeta,
+  shouldProbeRuntime, RUNTIME_PROBE_RETRY_MS, resetRuntimeProbe, runtimeProbeState,
+} = await import('../lib/index.js')
 
 /** 捕获 apply 注册的路由与工具定义。 */
 function mountHost(resolveModelInfo = async () => ({ inputModalities: ['text'] })) {
@@ -66,7 +69,12 @@ function fakeResponse() {
   }
 }
 
-/** 最小 IncomingMessage 替身（路由只用到 method/headers/url/on）。 */
+/**
+ * 最小 IncomingMessage 替身（路由只用到 method/headers/url/on/socket）。
+ *
+ * `socket.remoteAddress` 默认 `127.0.0.1`：本机测试与**桌面版的转发**都来自回环，
+ * 而「无 Origin + 回环」正是桌面版那条路径（见 `isTrustedRouteCaller`）。
+ */
 function fakeRequest(options = {}) {
   return {
     method: options.method ?? 'POST',
@@ -76,6 +84,7 @@ function fakeRequest(options = {}) {
       origin: 'http://127.0.0.1:3080',
       ...options.headers,
     },
+    socket: { remoteAddress: options.remoteAddress ?? '127.0.0.1' },
     on: () => {},
   }
 }
@@ -198,6 +207,41 @@ test('缺参数 → source=unknown，且不调用适配器', async () => {
   assert.equal(calls, 0)
 })
 
+test('能力路由：带外站 Origin → 403，且不调用适配器', async () => {
+  let asked = 0
+  const { route } = mountHost(async () => {
+    asked += 1
+    return { inputModalities: ['image'] }
+  })
+  const res = await invoke(
+    route(CAPABILITY),
+    fakeRequest({
+      method: 'GET',
+      url: `${CAPABILITY}?provider=p&model=m`,
+      headers: { origin: 'http://evil.example' },
+    }),
+  )
+  assert.equal(res.statusCode, 403)
+  assert.equal(asked, 0, '跨站请求不该触发适配器查询')
+})
+
+test('能力路由：不带 Origin 的同源 GET 必须放行（浏览器不给同源 GET 加 Origin）', async () => {
+  // 若照 POST 路由那条「缺 Origin 也拒绝」的口径来卡这条只读 GET，插件自己的
+  // `fetch(CAPABILITY_PATH)` 会被一起挡掉 → 能力查询失败 → 按钮退回名字启发式：比不设防更糟。
+  // 跨站页面发起的请求一定带 Origin（CORS 语义），所以只卡「带 Origin 且不匹配」的。
+  const { route } = mountHost(async () => ({ inputModalities: ['image'] }))
+  const res = await invoke(
+    route(CAPABILITY),
+    fakeRequest({
+      method: 'GET',
+      url: `${CAPABILITY}?provider=p&model=m`,
+      headers: { origin: undefined },
+    }),
+  )
+  assert.equal(res.statusCode, 200)
+  assert.equal(JSON.parse(res.body).image, true)
+})
+
 // ── 系统截图路由 ────────────────────────────────────────────────────────────
 
 test('系统截图成功 → 200 + image/png + 原始 PNG 字节', async () => {
@@ -236,6 +280,39 @@ test('执行器故障 → 500，且原因回传', async () => {
   })
 })
 
+test('系统截图执行器抛异常 → snipInFlight 必须复位（否则按钮永久失灵）', async () => {
+  // `snipInFlight` 一旦永久为真，之后**任何**剪贴板图片都会被当成「我们自己刚产出的」，
+  // 客户端据此不点亮按钮、长按也不触发，直到宿主重启。默认执行器自己吞异常，但它是可注入的
+  // （单测/扩展会替换它），所以路由必须用 try/finally 复位。
+  // 观测手段：把「刚截图完的 4 秒归属窗口」推到过期之外（改 Date.now），于是 served 只反映 snipInFlight。
+  const { route } = mountHost()
+  const realNow = Date.now
+  Date.now = () => 9e15
+  try {
+    await withSnipExecutor(
+      () => {
+        throw new Error('executor exploded')
+      },
+      async () => {
+        await assert.rejects(invoke(route(SNIP), fakeRequest()), /executor exploded/)
+        await withClipboardProbe(
+          { state: async () => ({ supported: true, image: true, token: 'tok-after-boom', reason: '' }) },
+          async () => {
+            const res = await invoke(route(CLIPBOARD), fakeRequest({ method: 'GET', url: CLIPBOARD }))
+            assert.equal(
+              JSON.parse(res.body).served,
+              false,
+              'snipInFlight 没复位：别家刚截的图会被误判成我们产出的（按钮不再提示）',
+            )
+          },
+        )
+      },
+    )
+  } finally {
+    Date.now = realNow
+  }
+})
+
 test('非 POST 一律拒绝（405），不触碰执行器', async () => {
   const { route } = mountHost()
   await withSnipExecutor({ kind: 'captured', dataUrl: PNG_DATA_URL }, async (calls) => {
@@ -255,11 +332,37 @@ test('跨站请求一律拒绝（403），不触碰执行器', async () => {
   })
 })
 
-test('缺 Origin 的请求也拒绝（403）——系统截图是高权限动作', async () => {
+test('桌面版转发路径（无 Origin + 回环对端）必须放行——否则桌面版点按钮永远 403', async () => {
+  // DSH 桌面版的 `forwardWebRequest` 把页面（`dsh-app://app`）的非静态请求转发到回环 HTTP 服务，
+  // 并**刻意删掉** `host`/`origin`/`cookie`/`sec-fetch-site`，再换上宿主自己的 cookie。
+  // 于是这条路径上永远没有 Origin：旧实现只认「Origin 存在且 host 相等」，桌面版必然 403 →
+  // 客户端回退 getDisplayMedia，而桌面版把抓屏权限全关了（setPermissionCheckHandler(() => false)
+  // + setDisplayMediaRequestHandler(cb => cb({}))）→ 用户看到的就是「点了没反应」。
   const { route } = mountHost()
-  await withSnipExecutor({ kind: 'captured', dataUrl: PNG_DATA_URL }, async () => {
+  await withSnipExecutor({ kind: 'captured', dataUrl: PNG_DATA_URL }, async (calls) => {
     const res = await invoke(route(SNIP), fakeRequest({ headers: { origin: undefined } }))
+    assert.equal(res.statusCode, 200, '无 Origin 但来自回环：这是桌面版，必须放行')
+    assert.equal(calls.length, 1, '放行后要真的拉起系统截图')
+  })
+})
+
+test('无 Origin 且**非**回环对端仍然拒绝（403）——豁免只给本机', async () => {
+  const { route } = mountHost()
+  await withSnipExecutor({ kind: 'captured', dataUrl: PNG_DATA_URL }, async (calls) => {
+    const res = await invoke(
+      route(SNIP),
+      fakeRequest({ headers: { origin: undefined }, remoteAddress: '203.0.113.7' }),
+    )
     assert.equal(res.statusCode, 403)
+    assert.equal(calls.length, 0, '被拒的请求不该拉起系统截图')
+  })
+})
+
+test('桌面版页面源（Origin: dsh-app://app）放行', async () => {
+  const { route } = mountHost()
+  await withSnipExecutor({ kind: 'cancelled' }, async () => {
+    const res = await invoke(route(SNIP), fakeRequest({ headers: { origin: 'dsh-app://app' } }))
+    assert.equal(res.statusCode, 204)
   })
 })
 
@@ -406,6 +509,21 @@ test('剪贴板取图：剪贴板里没有图 → 204（客户端据此熄灭高
   })
 })
 
+test('剪贴板取图：桌面版转发路径（无 Origin + 回环）同样放行（长按插入靠它）', async () => {
+  const { route } = mountHost()
+  await withClipboardProbe(
+    { image: async () => ({ kind: 'captured', dataUrl: PNG_DATA_URL }) },
+    async () => {
+      const res = await invoke(
+        route(CLIPBOARD_IMAGE),
+        fakeRequest({ method: 'POST', url: CLIPBOARD_IMAGE, headers: { origin: undefined } }),
+      )
+      assert.equal(res.statusCode, 200)
+      assert.equal(res.headers['content-type'], 'image/png')
+    },
+  )
+})
+
 test('剪贴板取图：平台不支持 → 501', async () => {
   const { route } = mountHost()
   await withClipboardProbe(
@@ -470,6 +588,8 @@ function statusOf(overrides = {}) {
     backend: 'windows',
     backend_known: true,
     backend_implemented: true,
+    // 空串 = 捕获后端导得进来；非空 = 缺依赖等（v0.2.33 新增字段）。
+    backend_import_error: '',
     deps: { Pillow: true, pyautogui: true, pyperclip: true },
     ok: true,
     ...overrides,
@@ -557,6 +677,50 @@ test('体检：探针结构漂移（deps 缺失）不得被当成「没问题」
   assert.match(problem, /Pillow/)
 })
 
+test('体检：后端「有实现但导不进来」→ 拦下并给装依赖的办法，不许写成「后端未实现」', () => {
+  // 对应 v0.2.33 修的真实缺陷：探针旧实现「导入失败就返回 unknown」，于是**缺依赖**被错报成
+  // 「本平台后端未实现」——用户会去等更新，而正确动作是 pip install。两者的处置完全不同。
+  const problem = describeRuntimeProblem(
+    statusOf({ backend_import_error: "ModuleNotFoundError: No module named 'win32gui'", ok: false }),
+    null,
+  )
+  assert.ok(problem, '后端导不进来必须拦（否则 see 会在 Python 侧抛裸的 ImportError）')
+  assert.match(problem, /win32gui/, '要把真实的导入失败原因带上——那是用户唯一能自救的线索')
+  assert.match(problem, /导不进来/)
+  assert.doesNotMatch(problem, /后端未实现/, '这不是「平台未实现」，不能让用户白等一个不存在的修复')
+  assert.ok(problem.includes(PIP_HINT), '既然要靠装依赖解决，就必须给出可复制的安装命令')
+})
+
+test('体检缓存：成功只探一次；失败按 TTL 重探（装完依赖不必重启 DSH）', () => {
+  // 背景（v0.2.33 修）：体检结论曾是「整个进程只探一次」的**负缓存**，于是用户跑完
+  // `pip install` 之后 `see` 继续报同一个错，而 cvision_status()（刻意不过门）已经显示一切正常，
+  // 两个工具口径互相矛盾，只能重启宿主才能恢复。
+  const now = 1_000_000
+  const base = { everProbed: false, failed: false, lastAt: 0, now }
+  assert.equal(shouldProbeRuntime(base), true, '从没探过 → 探')
+  assert.equal(shouldProbeRuntime({ ...base, everProbed: true }), false, '上次成功 → 不再探')
+  assert.equal(
+    shouldProbeRuntime({ ...base, everProbed: true, failed: true, lastAt: now - 1000 }),
+    false,
+    '上次失败但还没过 TTL → 先不重探（否则每次工具调用都白 spawn 一个解释器）',
+  )
+  assert.equal(
+    shouldProbeRuntime({ ...base, everProbed: true, failed: true, lastAt: now - RUNTIME_PROBE_RETRY_MS }),
+    true,
+    '上次失败且已过 TTL → 重探（用户很可能刚跑完 pip install）',
+  )
+  assert.equal(
+    shouldProbeRuntime({ ...base, everProbed: true, failed: true, lastAt: now, retryMs: 50 }),
+    false,
+    'retryMs 可覆盖（测试/调试用）',
+  )
+  // 显式复位（cvision_status 成功时走的也是这个）→ 下一次门立刻重探。
+  resetRuntimeProbe()
+  const after = runtimeProbeState()
+  assert.deepEqual(after, { everProbed: false, failed: false, lastAt: 0 })
+  assert.equal(shouldProbeRuntime({ ...after, now }), true, '复位后必须立刻重探')
+})
+
 test('体检门：真实环境下 ensureRuntime 放行（本机依赖齐全）', async () => {
   // 这条会真的 spawn 一次 `python -m cvision.cli_capture --status`（本仓库 CI 装了 Pillow）。
   // 若本机没装 Python/依赖，它会抛出可操作错误——那正是门在起作用的证据，故不强断言成功。
@@ -590,6 +754,11 @@ const WAIT_CHANGED_PAYLOAD = {
   mean_diff: 12.5,
   diff_bbox: { x: 10, y: 20, w: 30, h: 40 },
   diff_boxes: [{ x: 10, y: 20, w: 30, h: 40 }],
+  // v0.2.33 起 Python 还会给这三个：宿主拿它们把 click_at 的比例基准换到这张新图上，
+  // 但**不许**进模型可见的返回值（schema 没声明它们）——所以它们出现在「真实返回形状」里正中下怀。
+  image_screen_box: { x: 0, y: 0, width: 900, height: 220 },
+  handle: 4321,
+  title: '记事本',
 }
 
 /** `wait_until_changed` 声明的可返回键（`ref` 由 execute 另加，不由整形函数产出）。 */
@@ -651,6 +820,9 @@ const WAIT_STABLE_PAYLOAD = {
   diff_ratio: 0.002,
   max_diff_ratio: 0.42,
   stable_for: 3,
+  image_screen_box: { x: 0, y: 0, width: 900, height: 220 },
+  handle: 4321,
+  title: '记事本',
 }
 
 /** `wait_until_stable` 声明的可返回键（`ref` 由 execute 另加）。 */
@@ -678,6 +850,21 @@ test('wait_until_stable：未稳定（超时）也是正常返回值，同样不
   for (const [key, value] of Object.entries(meta)) {
     assert.notEqual(value, null, `${key} 不应为 null`)
     assert.ok(declared.includes(key), `${key} 必须在 schema 里声明`)
+  }
+})
+
+test('wait_*：Python 新给的 image_screen_box/handle/title 必须被整形函数丢掉', () => {
+  // v0.2.33 给 wait_* 的 Python 响应加了这三个字段（宿主拿它们更新 click_at 的基准，见 noteCaptureTarget），
+  // 但它们**不进模型可见的返回值**：工具 schema 是 `additionalProperties: false`，
+  // 多一个未声明的键 = `returned invalid output` = **整次调用失败**（v0.2.23/24 正是这样炸的）。
+  const extra = { image_screen_box: { x: 0, y: 0, width: 900, height: 220 }, handle: 4321, title: '记事本' }
+  const changed = waitChangedMeta({ ...WAIT_CHANGED_PAYLOAD, ...extra })
+  for (const key of Object.keys(extra)) {
+    assert.ok(!(key in changed), `${key} 不该出现在返回值里（schema 未声明，多键会致命）`)
+  }
+  const stable = stableMeta({ ...WAIT_STABLE_PAYLOAD, ...extra })
+  for (const key of Object.keys(extra)) {
+    assert.ok(!(key in stable), `${key} 不该出现在返回值里（schema 未声明，多键会致命）`)
   }
 })
 
@@ -818,4 +1005,46 @@ test('输入锁的等待上限必须给动作留出足够时间（锁等待 + �
       `${name}: 锁等待 ${lockWaitMs}ms 超过它超时的 1/3（${tool.timeoutMs}ms）——等待会把动作预算吃光`,
     )
   }
+})
+
+// ── 「抓取结果就是权威」（v0.2.33）：旧句柄/旧矩形绝不能被沿用 ────────────────
+//
+// 背景（真实缺陷）：非 text 抓取与整屏抓取在修复前拿不到句柄，而宿主只在「非 null」时写入
+// `operationTarget`——于是旧句柄一直留着，后续 `type_text`/`press_key` 会把**上一个窗口**当成
+// 目标：它会真的把那个窗口置前、把按键送进去，而键盘类动作没有坐标可校验（CLI 的判据是
+// `focused`），**整条链路报成功**。点击类动作虽会被前置校验拦下，但也会先真的动一下鼠标。
+//
+// 这条不变量没法靠真桌面回归（那要往窗口里真的打字、真的移鼠标），所以直接钉在纯函数上。
+
+test('抓取目标：拿不到句柄/矩形时必须清掉旧值（否则键盘输入会进上一个窗口）', () => {
+  operationTarget.handle = 4242
+  operationTarget.frame = { x: 1, y: 2, width: 3, height: 4 }
+  noteCaptureTarget(null, null) // 整屏抓取：本来就没有目标窗口
+  assert.equal(operationTarget.handle, null, '旧句柄必须被清掉，绝不能留给后续输入使用')
+  assert.equal(operationTarget.frame, null, '旧矩形同样要清：click_at 不能用上一张图的矩形换算坐标')
+})
+
+test('抓取目标：新的抓取结果覆盖旧值（不是「有值才覆盖」）', () => {
+  operationTarget.handle = 111
+  operationTarget.frame = { x: 0, y: 0, width: 10, height: 10 }
+  noteCaptureTarget(222, { x: 5, y: 6, width: 7, height: 8 })
+  assert.equal(operationTarget.handle, 222)
+  assert.deepEqual(operationTarget.frame, { x: 5, y: 6, width: 7, height: 8 })
+  // 这两项是进程级状态：收尾清掉，别影响后面的用例。
+  operationTarget.handle = null
+  operationTarget.frame = null
+})
+
+test('抓取目标：see 与两个 wait_* 都必须调用它（wait 返回的是新图，基准得跟着换）', () => {
+  // `wait_*` 返回一张**新图**，而 `click_at` 是按比例点「最近一次抓取那张图」：不更新基准的话，
+  // 「等它变完 → 按比例点结果区」会按上一次 see 的矩形换算——位置整体偏，而且不报错。
+  // 这条不变量没法在单测里端到端跑（真实实现要 spawn Python 并阻塞轮询），所以钉**调用点数量**：
+  // 少一处、或将来多一处没写进这里的，都会让这条红。
+  const lib = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const occurrences = [...lib.matchAll(/noteCaptureTarget\(/g)].length
+  assert.equal(
+    occurrences,
+    4,
+    `noteCaptureTarget 应为 1 处定义 + 3 处调用（see + wait_until_changed + wait_until_stable），实际 ${occurrences} 处`,
+  )
 })

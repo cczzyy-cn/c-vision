@@ -10,7 +10,7 @@ Python 版 cvision** 截屏/OCR/输入 → 写入 Harness 附件服务（`ctx.at
 
 同一个包还带一个**浏览器半边**：输入框工具栏的「截图」按钮（人工一键抓屏，或把剪贴板里的图片作为附件）。
 
-**版本**：`0.2.32` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
+**版本**：`0.2.33` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
 **许可**：BSD-3-Clause · 变更历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 目录
@@ -199,6 +199,10 @@ GET /cvision/model-capability?provider=<id>&model=<id>
   抓完会**自动还原**窗口原状态（`GetWindowPlacement` / `SetWindowPlacement` 成对使用）。
 - **`focus_window` 只置前**：它不会改窗口尺寸/最大化状态（v0.2.7 起）；**置前失败会如实报错**（v0.2.25 起，
   不再假报成功）。只有真的需要键盘焦点、或要操作一个还没 `see` 过的窗口时才调用它。
+- ✅ **每次 `see` 都会重设「操作目标」（v0.2.33 起）**：`see(handle=…)`、`see(window=…)`、`see(text=true)`
+  都会把**这一次**看的窗口记为后续点击/输入的目标（此前 `see(window=…)` 拿不到句柄时会**沿用上一次**的窗口，
+  于是 `type_text` 会被静默送进那个旧窗口）。**整屏 `see()` 会把目标清空**——整屏没有「目标窗口」，
+  此后输入动作按当前焦点/坐标执行；`click_at` 则需要先有一次能算出屏幕矩形的抓取。
 - **推荐流程**：先 `list_windows()` → 直接 `see(handle=<句柄>)`（标题会变时优先 `handle`）；整屏用 `see()`。
 - **要点击就用 `see(text=true)`**：它返回的 `screen_center` 是**屏幕绝对坐标**，可直接喂给 `click`。
   **不要自己从截图估算像素**——裁剪、窗口位置、多屏、DPI 四层差异都由插件换算好了。
@@ -319,12 +323,12 @@ npm ci
 npm run build        # tsc -p tsconfig.json && node scripts/copy-client.mjs
 npm run test:js      # node --test：客户端半边 + 宿主四条路由
 npm run check:dsh    # DSH 组合包/客户端契约自检（30 项）
-npm run check:docs   # 文档一致性自检（14 项）
+npm run check:docs   # 文档一致性自检（17 项）
 npm run check:deps   # Python 依赖锁定自检（9 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
-当前规模：**JS 84 条 + Python 292 条**。
+当前规模：**JS 99 条 + Python 308 条**。
 
 ### 文档约定（自动校验）
 
@@ -332,13 +336,14 @@ python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pill
 
 | 断言 | 防止的漂移 |
 | --- | --- |
-| `package.json` 版本 == README 头部版本 == CHANGELOG 最新条目 | 改了代码忘了升版/记条目 |
+| `package.json` 版本 == README 头部版本 == CHANGELOG 最新条目 == `cvision/__init__.py` 的 `__version__` | 改了代码忘了升版/记条目（Python 侧那个数真的停在 0.1.0 过） |
 | CHANGELOG 最新条目有实质内容、无 `TODO/待填` | 占位条目混进发布 |
 | README 里的长按阈值 == `src/client.js` 的 `LONG_PRESS_MS`（且不残留旧值） | 改了行为忘了改文档（真的发生过：550ms → 900ms） |
 | `cvision/`、`tests/`、`scripts/` 下每个文件都出现在 README 目录结构里 | 新增文件忘了写文档（也真的发生过） |
 | 全部顶层文档都在 `package.json` 的 `files` 里 | 新文档没随包发布 |
 | README 覆盖宿主注册的**全部工具**与**全部路由** | 加了工具/路由却没有文档 |
-| README 声称的测试条数 == 实际条数 | 测试增减后数字过期 |
+| README 声称的测试条数 == 实际条数（**行首**口径，正则调用 `.test(` 不算测试） | 测试增减后数字过期 |
+| 工具说明里不出现 `MEDIA_TYPES` 之外的图片格式名 | 说明与实现互相矛盾（真的发生过：`see` 承诺 GIF 而宿主已移除它） |
 | README 内部锚点都能落到标题 | 目录断链 |
 | `requirements.txt` 每条依赖都有下界与上界（`npm run check:deps`） | 依赖被静默升级到破坏性版本（供应链面失控） |
 
@@ -347,7 +352,7 @@ python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pill
 `.github/workflows/ci.yml` 在每次 `push` / `pull_request` 时：
 
 - `npm ci && npm run build`，并校验 **`lib/` 与源码编译产物一致**（改了 `src` 却忘编译会失败）；
-- `npm run check:dsh`（30 项契约）+ `npm run check:docs`（14 项文档一致性）+ `npm run check:deps`（9 项依赖锁定）；
+- `npm run check:dsh`（30 项契约）+ `npm run check:docs`（17 项文档一致性）+ `npm run check:deps`（9 项依赖锁定）；
 - `npm run test:js`（客户端半边 + 宿主路由）；
 - Python 单测跑在 **ubuntu + macOS** 矩阵（仅装 Pillow，不需要桌面）；
 - **windows-latest 冒烟**：按 `requirements.txt` 真装依赖，再断言 `backend=windows`、
@@ -393,7 +398,7 @@ git push origin v0.2.14          # ⚠️ 一次只推一个 tag，见下
 
 | 入口 | 参数 | 结果 |
 | --- | --- | --- |
-| `cvision.cli_capture` | `--list` / `--screen-info` / `--status` / `--window` / `--handle` / `--region` / `--delay` / `--format` / **`--text`** / **`--wait-changed`** / `--maximize` | 截图时是**裸 data URL 字符串**（不是 JSON）；`--list`/`--screen-info`/`--status` 是各自的 JSON；`--text` → `{ok:true,kind:"capture_text",data_url,width,height,elements:[{text,box,center,screen_box,screen_center,word_count}]}`；`--wait-changed` → `{ok:true,kind:"wait_changed",data_url,changed,samples,elapsed_ms,diff_ratio,mean_diff,diff_bbox}`；**会改前台**的抓取（`--maximize`、还原最小化窗口、兜底读屏）被跨进程锁挡住时 → 一行 `ForegroundBusy` 说明 + 退出 1 |
+| `cvision.cli_capture` | `--list` / `--screen-info` / `--status` / `--window` / `--handle` / `--region` / `--delay` / `--format` / **`--json`** / **`--text`** / **`--wait-changed`** / **`--wait-stable`** / `--maximize` | 截图时是**裸 data URL 字符串**（不是 JSON）；`--json` 改为输出 `{ok:true,kind:"capture",data_url,width,height,image_screen_box,handle?,title?}`（宿主 CLI 回退路径靠它记住「这次看的是哪个窗口/哪一块屏幕」，缺它会让后续键盘输入沿用**上一次**的窗口——v0.2.33 修）；`--list`/`--screen-info`/`--status` 是各自的 JSON；`--text` → `{ok:true,kind:"capture_text",data_url,width,height,elements:[{text,box,center,screen_box,screen_center,word_count}]}`；`--wait-changed` → `{ok:true,kind:"wait_changed",data_url,changed,samples,elapsed_ms,diff_ratio,mean_diff,diff_bbox}`；**会改前台**的抓取（`--maximize`、还原最小化窗口、兜底读屏）被跨进程锁挡住时 → 一行 `ForegroundBusy` 说明 + 退出 1 |
 | `cvision.cli_ocr` | `--window` / `--handle` / `--region` / `--delay` | `{ok:true,text,lines,words:[{text,x,y,w,h}]}` |
 | `cvision.cli_input` | `--click/--double/--move/--scroll/--scroll-h/--drag/--type/--keys/--focus/--focus-handle/--get-clipboard/--set-clipboard`，以及前置校验 `--ensure-front H [--unblock] [--at X Y]`、互斥开关 `--lock-timeout SECONDS` / `--no-lock`、会话身份 `--lock-label TEXT` | 动作类 `{ok:true}`；`--get-clipboard` → `{text}`；前置校验失败 → `{ok:false,stale?,error}` + 退出 1 且**动作不执行**；`--ensure-front` 与动作可以**合成一次调用**（置前、校验、动作同在**一个持锁区间**内）；锁超时 → `{ok:false,error}` + 退出 1；互斥被跳过/降级时多一个 `lock` 字段 |
 | `cvision.cli_snip` | `--timeout 60` / `--format` | `{ok:true,data_url}`（退出 0）/ `{ok:false,reason:"cancelled"}`（2）/ `"unsupported"`（3）/ `"error"`（1） |
@@ -423,7 +428,7 @@ vision/                      # 仓库根 = 插件本体
   scripts/
     copy-client.mjs      #   把 src/client.js 拷到 lib/
     check-dsh-contract.mjs #  DSH 组合包/客户端契约自检（30 项，CI 跑）
-    check-docs.mjs       #   文档一致性自检（14 项：版本号/阈值/目录/工具/路由/测试数/锚点，CI 跑）
+    check-docs.mjs       #   文档一致性自检（17 项：版本号/阈值/目录/工具/路由/说明用词/测试数/锚点，CI 跑）
     check-deps.mjs       #   Python 依赖锁定自检（9 项：上下界/具体版本/预发布上界/重复/marker，CI 跑）
   tsconfig.json          # TS 配置
   package.json           # 声明 dsh.bundle + dsh.client，files 含 lib/cvision/requirements.txt/CHANGELOG
@@ -456,6 +461,7 @@ vision/                      # 仓库根 = 插件本体
   tests/
     test_detect.py test_encoding.py test_ocr_words.py test_pick_window.py test_screen.py test_status.py
     test_input.py         #   置前语义（假 win32：最大化绝不被降级）+ 能力清单按平台
+    test_cli_capture.py   #   cli_capture stdout 契约（--json 的句柄/矩形透传、裸 data URL 不许破、argv 映射）
     test_cli_ocr.py       #   cli_ocr stdout 契约（词框透传/字段形状/缺字段兜底/--region 转发）
     test_cli_server.py    #   **常驻 server 的 JSON-line 协议**（响应形状 + 真 spawn 进程往返）
     test_cli_input.py     #   cli_input 参数层（子命令 → input 函数的逐条映射）+ 动作必须落在持锁区间内
@@ -467,6 +473,7 @@ vision/                      # 仓库根 = 插件本体
     test_capture_foreground.py #  抓图前的窗口准备：普通窗口不碰前台/最小化窗口会被置前
     test_wgc_probe.py      #   WGC 可用性探测的缓存语义（指纹/过期/时钟回拨/损坏文件 → 必须失效）
     test_wait_stable.py    #   wait_until_stable 的判定：必须是**连续**安静，中途变一次要重新计数
+    test_status.py         #   体检探针必须零依赖（子进程断言）+ 缺 Pillow 故障注入下 --status 仍须出结论
     test_diagnose.py      #   窗口跟踪诊断（改动字段判定 / 开关 / 关闭时不写文件 / 写失败不抛）
     test_snip.py          #   系统截图 CLI 的 JSON 契约
     test_snip_windows.py  #   取消识别（假时钟/覆盖层/剪贴板：取消立即返回、晚到图片不算本次）
@@ -484,11 +491,12 @@ vision/                      # 仓库根 = 插件本体
 | 现象 | 先看这里 |
 | --- | --- |
 | 截图按钮不显示 | 当前模型是否收图（`inputModalities` 不含 `image` 时按设计隐藏）；`cvision_status()`；控制台 `[vision]` 日志；若**出现两个按钮**，是旧插件 `@deepseek-ai/dsh-client-ui-screenshot` 仍在挂载 |
+| **桌面版**（DSH App）点按钮没反应 | v0.2.33 修的真实缺陷：桌面版页面跑在 `dsh-app://app` 上，主进程把它们转发到回环 HTTP 服务时**会删掉 `Origin`**，而旧实现要求「`Origin` 存在且 host == `Host`」→ 必然 **403** → 客户端回退浏览器抓屏，可桌面版把抓屏权限全关了（`setPermissionCheckHandler(() => false)`、`setDisplayMediaRequestHandler(cb => cb({}))`）→ 表现为「点了没反应」。升级到 v0.2.33 并在**桌面 profile** 里更新插件后重启 App 即可（web profile 不受影响） |
 | 点按钮没反应 | 控制台 `[vision] …` 一定给了原因（插入链的失败在 v0.2.4 起不再静默）；附件栏被拒时会自动重试 6 次 |
 | 按钮变蓝、长按却没插入 | 长按阈值 **0.9s**；按住时应看到底部进度条；按钮未点亮时按住不做任何事（按设计） |
 | 单击截图后按钮变蓝 | 已由 `served` 归属解决（v0.2.10/0.2.11）；若仍出现，见 README「取消与归属」的时序说明 |
 | 取消了截图，之后别的截图却进了附件栏 | v0.2.13 起修复（覆盖层判据）；若先前的旧版本仍在跑，重启宿主 |
-| 工具报 `python` 找不到 / 依赖缺失 | 装 Python 3.10+ 与 `python -m pip install -r requirements.txt`；**v0.2.18 起首次调用会直接给出带绝对路径的安装命令**；`cvision_status()` 会列出缺哪个模块 |
+| 工具报 `python` 找不到 / 依赖缺失 | 装 Python 3.10+ 与 `python -m pip install -r requirements.txt`；**v0.2.18 起首次调用会直接给出带绝对路径的安装命令**；`cvision_status()` 会列出缺哪个模块——**v0.2.33 起体检探针自己不依赖任何第三方包**，所以「一个依赖都没装」的环境里它照样能给出结论（此前缺 Pillow 时探针会先崩在 import 上） |
 | 抓窗口是黑图/空白 | 依次看：① `cvision_status()` 的 `capture_backends.wgc` —— 它会**真实探测**并给出 `reason`，别只看依赖装没装；② 装了 PyWinRT（`winrt-*`，见 `requirements.txt`）时 WGC 走标准 D3D11 互操作，**虚拟机上也能抓被遮挡窗口**；只装了 `winsdk` 时它要借 WinML 拿设备，虚拟机常见 `DXGI_ERROR_UNSUPPORTED`，此时 WGC 不可用、自动回退 `PrintWindow`／桌面区域；③ 微信等 Qt 窗口属已知空白帧场景 |
 | **抓图后窗口位置/大小变了**（如分屏被破坏） | 用内置**窗口跟踪诊断**取证，别猜：`$env:CVISION_TRACE_WINDOWS='1'; $env:CVISION_TRACE_FILE='C:\Temp\cv-trace.jsonl'` → 复现一次 → `python -m cvision.diagnose`。日志按阶段（`prepare`/`wgc`/`printwindow`/`grab_region`）记录 `rect`/`showCmd`/`zoomed`/`iconic`/`foreground` 的前后值，能区分「抓取过程中动的」与「抓取前后被别的因素动的」。默认关闭、零开销 |
 | 中文窗口标题匹配不上 | v0.2.2 起所有 Python 子进程强制 UTF-8；若自行调用 Python，请一并设 `PYTHONUTF8=1` |
@@ -556,14 +564,18 @@ vision/                      # 仓库根 = 插件本体
 - **宿主入站路由**：四条，都通过 `ctx.inject(['webServer', ...])` 可选挂载，组合里没有 web 服务器时整段跳过。
   - `GET /cvision/model-capability`：**只读**、同源、无副作用、不回传任何凭据，供浏览器半边判断当前模型是否
     收图。
-  - `POST /cvision/snip`：**仅 POST、仅同源**（`Origin` host 必须等于 `Host`，否则 403），拉起系统截图 UI 并
-    把用户框选的那张图回传（200 图片字节 / 204 用户取消 / 501 平台不支持）。抓屏动作由用户在系统 UI 里完成，
-    本路由只读「调用之后新出现」的剪贴板图片，因此不构成静默抓屏能力；客户端断开（关页/取消）会中止等待中的
-    Python 子进程。
+  - `POST /cvision/snip`：**仅 POST、仅同源**，拉起系统截图 UI 并把用户框选的那张图回传（200 图片字节 /
+    204 用户取消 / 501 平台不支持）。抓屏动作由用户在系统 UI 里完成，本路由只读「调用之后新出现」的剪贴板
+    图片，因此不构成静默抓屏能力；客户端断开（关页/取消）会中止等待中的 Python 子进程。
+    「同源」的**准确口径**（v0.2.33 起，三条之一即放行）：① `Origin` 存在且 host == `Host`（浏览器直接访问
+    HTTP 端口，web profile 走这条）；② `Origin` 是桌面版页面源 `dsh-app://app`；③ **`Origin` 缺失且对端是
+    本机回环**——DSH 桌面版把页面请求转发给回环 HTTP 服务时会**刻意删掉 `Origin`**（连同 `host`/`cookie`/
+    `sec-fetch-site`），只认前两条的话桌面版永远 403（桌面版抓屏按钮「点了没反应」的根因）。跨站页面的 POST
+    **一定带 http(s) 的 `Origin`**，所以它照旧被拒；本机进程则从来不是这条路由的防护边界。
   - `GET /cvision/clipboard`：**只读**、廉价（只查剪贴板格式 + token，不解码图片），供页面每秒轮询「剪贴板里
     有没有图片」，并附 `served` 标记（这张图是不是我们自己刚产出的）。不回传图片内容本身。
-  - `POST /cvision/clipboard/image`：**仅 POST、仅同源**，返回剪贴板里的图片（200 图片字节 / 204 没有图片 /
-    501 平台不支持）。**注意**：它让页面里的脚本（含其它客户端插件）也能读到剪贴板图片——这是「按钮要看见
+  - `POST /cvision/clipboard/image`：**仅 POST、仅同源**（口径与 `snip` 完全相同，见上），返回剪贴板里的图片
+    （200 图片字节 / 204 没有图片 / 501 平台不支持）。**注意**：它让页面里的脚本（含其它客户端插件）也能读到剪贴板图片——这是「按钮要看见
     其它软件的截图」的固有代价，故限制为同源 + 仅 POST + 只在用户长按时调用。
 
 ### 权限说明（真实高权限）
