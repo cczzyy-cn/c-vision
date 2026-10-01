@@ -254,5 +254,72 @@ class TestEnsureFrontUnblock(unittest.TestCase):
         self.assertFalse(info["inside"])
 
 
+class TestTypeTextPathSelection(unittest.TestCase):
+    """``type_text`` 的路径选择：什么时候逐键、什么时候必须走剪贴板粘贴。
+
+    回归的 bug（v0.2.34 现场实测）：在开着讯飞输入法的桌面里 ``type_text("cvision smoke 12345")``
+    实际输入成了 ``才visionsmoke12345``——ASCII 字母被当成拼音、空格被当成候选提交键，而且**不报错**。
+    剪贴板粘贴路径（Ctrl+V）完全不受输入法影响，代价是短暂占用剪贴板。
+    """
+
+    def test_needs_paste_rules(self):
+        self.assertFalse(input_module._needs_paste("hello 123"))
+        self.assertTrue(input_module._needs_paste("你好"))
+        self.assertTrue(input_module._needs_paste("line1\nline2"), "pyautogui.write 打不出换行，会静默丢")
+        self.assertTrue(input_module._needs_paste("a\tb"))
+
+    def test_langid_mapping(self):
+        self.assertTrue(input_module._langid_may_be_ime(0x0804), "zh-CN 布局可能挂着输入法")
+        self.assertTrue(input_module._langid_may_be_ime(0x0411), "ja-JP")
+        self.assertTrue(input_module._langid_may_be_ime(0x0412), "ko-KR")
+        self.assertFalse(input_module._langid_may_be_ime(0x0409), "en-US 不会被输入法改写按键")
+        self.assertFalse(input_module._langid_may_be_ime(None), "探测不到就别假设有输入法")
+
+    def _paths(self, text, *, langid=0x0409, paste=None, direct_env=None):
+        """跑一次 ``type_text``，返回它实际走了哪条路径：逐键记 ("write", 文本)，粘贴记 ("paste", 文本)。"""
+        seen = []
+        fake_pg = mock.Mock()
+        fake_pg.write.side_effect = lambda value, interval=0: seen.append(("write", value))
+        env = {} if direct_env is None else {"CVISION_TYPE_DIRECT": direct_env}
+        with mock.patch.object(input_module, "_foreground_layout_langid", return_value=langid), \
+             mock.patch.object(input_module, "_require_pyautogui", return_value=fake_pg), \
+             mock.patch.object(input_module, "_paste_clipboard",
+                               side_effect=lambda value: seen.append(("paste", value))), \
+             mock.patch.dict("os.environ", env, clear=False):
+            input_module.type_text(text, paste=paste)
+        return seen
+
+    def test_ascii_on_english_layout_types_directly(self):
+        """纯英文布局：逐键更快，也不动用户的剪贴板（保持 v0.2.34 之前的行为）。"""
+        self.assertEqual(self._paths("hello 123"), [("write", "hello 123")])
+
+    def test_ascii_on_cjk_layout_pastes(self):
+        """本机实测到的那条：zh 布局 + 输入法 → 逐键会被改写成 ``才visionsmoke12345``。"""
+        self.assertEqual(
+            self._paths("cvision smoke 12345", langid=0x0804),
+            [("paste", "cvision smoke 12345")],
+        )
+
+    def test_non_ascii_always_pastes(self):
+        self.assertEqual(self._paths("你好", langid=0x0409), [("paste", "你好")])
+
+    def test_multiline_pastes(self):
+        self.assertEqual(self._paths("a\nb", langid=0x0409), [("paste", "a\nb")])
+
+    def test_empty_text_does_nothing(self):
+        """空串绝不能走粘贴：那会把剪贴板里已有的内容粘进目标（凭空多出用户的数据）。"""
+        self.assertEqual(self._paths("", langid=0x0804), [])
+
+    def test_explicit_overrides_win(self):
+        self.assertEqual(self._paths("hello", langid=0x0804, paste=False), [("write", "hello")])
+        self.assertEqual(self._paths("hello", langid=0x0409, paste=True), [("paste", "hello")])
+
+    def test_env_can_force_direct(self):
+        """``CVISION_TYPE_DIRECT=1`` 是排错/不想被占用剪贴板时的全局逃生口。"""
+        self.assertEqual(self._paths("hello", langid=0x0804, direct_env="1"), [("write", "hello")])
+        self.assertEqual(self._paths("hello", langid=0x0804, direct_env="0"),
+                         [("paste", "hello")], "只有真值才强制逐键")
+
+
 if __name__ == "__main__":
     unittest.main()

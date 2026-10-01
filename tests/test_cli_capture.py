@@ -167,6 +167,30 @@ class TestCliCaptureContract(unittest.TestCase):
         self.assertEqual(payload["handle"], 1234)
         self.assertIn("geometry_out", wait.call_args.kwargs, "geometry_out 必须真的传给捕获层")
 
+    def test_find_window_shape_matches_the_server_op(self):
+        """``--find-window`` 与常驻 server 的 ``{"op":"find_window"}`` **同形状**（宿主两条通道读同一份）。
+
+        它存在的理由（v0.2.34）：``wait_for_window`` 要按标题解析窗口，而匹配语义只有一份
+        ——``pick_window``（精确标题优先）。宿主不该自己扫子串，CLI 也不该另给一个形状。
+        """
+        with mock.patch("cvision.capturer.resolve_window", return_value=WINDOW) as resolver:
+            code, out = run_cli(["--find-window", "记事本"])
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["kind"], "window")
+        self.assertEqual(payload["window"], WINDOW.to_dict())
+        resolver.assert_called_once_with(None, "记事本")
+
+    def test_find_window_none_is_ok(self):
+        """没命中时 ``window`` 为 null 且仍然 ``ok:true``：轮询路径靠它区分「还没出现」与「出错了」。"""
+        with mock.patch("cvision.capturer.resolve_window", return_value=None):
+            code, out = run_cli(["--find-window", "不存在"])
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertTrue(payload["ok"])
+        self.assertIsNone(payload["window"])
+
     def test_missing_dependency_message_is_actionable(self):
         """捕获层导不进来时（缺依赖），给出的必须是可行动的一句话：装什么、怎么装、怎么复查。
 

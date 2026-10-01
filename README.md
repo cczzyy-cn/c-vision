@@ -10,7 +10,7 @@ Python 版 cvision** 截屏/OCR/输入 → 写入 Harness 附件服务（`ctx.at
 
 同一个包还带一个**浏览器半边**：输入框工具栏的「截图」按钮（人工一键抓屏，或把剪贴板里的图片作为附件）。
 
-**版本**：`0.2.33` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
+**版本**：`0.2.34` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
 **许可**：BSD-3-Clause · 变更历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 目录
@@ -79,7 +79,7 @@ python -m pip install -r <插件安装目录>\requirements.txt
 | `list_windows()` | 列出可见窗口（标题 + 句柄 + 尺寸） |
 | `screen_info()` | 列出显示器/DPI 布局（`x/y/width/height/primary/scale`），高 DPI 折算坐标用 |
 | `cvision_status()` | 运行环境健康探针（Python 版本、平台后端、OCR 引擎、依赖/后端是否可用、`platform_support` 三态、本平台能力清单、跨进程输入互斥的 `input_lock` 真实探测含 `holder`：谁在持锁） |
-| `wait_for_window(title?, timeout?)` | 轮询等某个窗口出现（默认 500ms/次，10s 超时） |
+| `wait_for_window(title?, timeout?)` | 轮询等某个窗口出现（默认 500ms/次，10s 超时）。标题匹配与 `see(window=…)` **同一套语义**：**精确标题优先**、其次子串（v0.2.34 修：此前是「枚举顺序里第一个含子串的」，等「运行」会等到标题含「以非管理员身份运行」的窗口） |
 | `wait_until_stable(window?, handle?, region?, interval?, stable_samples?, timeout?, threshold?, format?)` | 轮询截图，**直到画面连续若干次不再变化**才返回（等加载完成/等动画结束）。返回 `stable`/`diff_ratio`/`max_diff_ratio`/`stable_for`/`width`/`height`；与上一个的区别是「等**变完**」而非「等开始变」（v0.2.29 起） |
 | `wait_until_changed(window?, handle?, region?, interval?, timeout?, threshold?, format?)` | 轮询截图，**直到画面真的变了**才把那一帧返回（等进度条/等弹窗）。返回 `changed`/`diff_ratio`/`diff_bbox`/`diff_boxes`/`width`/`height`（未变化时没有 `diff_bbox`）；**返回的图里变化区域已用红框标出**，`diff_boxes` 是**分开的**变化区域（v0.2.30 起）；默认阈值 0.01 |
 
@@ -109,7 +109,7 @@ see(text=true)  →  图片 + elements: [{ text, screen_center:{x,y}, screen_box
 | `mouse_move(x, y)` | 移动鼠标到屏幕坐标（不点击） |
 | `scroll(x, y, dy?, dx?)` | 在 (x,y) 处滚动（dy>0 上滚；dx 水平滚动） |
 | `drag(x1, y1, x2, y2, button?)` | 从 (x1,y1) 拖拽到 (x2,y2)（框选/拖文件） |
-| `type_text(text)` | 像键盘一样输入文本到**当前焦点** |
+| `type_text(text, direct?)` | 像键盘一样输入文本到**当前焦点**。默认自动选路径：非 ASCII、含换行制表符、或前台挂着 CJK 输入法时走**剪贴板粘贴**（逐键会被输入法改写成拼音/候选，v0.2.34 修），其余情况逐键输入（不动剪贴板）；`direct=true` 强制逐键 |
 | `press_key(keys)` | 发送快捷键，如 `ctrl+l`、`enter`、`ctrl+shift+t`、`alt+tab` |
 | `get_clipboard()` / `set_clipboard(text)` | 读写剪贴板**文本**（Windows 原生；macOS/Linux 走 `pyperclip`） |
 | `focus_window(title?, handle?)` | 把窗口**置前**（用户级激活）；`handle` 优先；**只改前后层级，不改窗口尺寸/最大化状态**（仅最小化的窗口会被还原）；**置前失败会报错**（v0.2.25 起） |
@@ -226,6 +226,16 @@ GET /cvision/model-capability?provider=<id>&model=<id>
 - ✅ **`wait_until_changed` 返回的图里，变化区域已经用红框标出（v0.2.30 起）**：直接看框就知道
   「哪里变了」，不必去读 `diff_bbox` 的数字。另外注意 `diff_bbox` 是**把所有变化包在一起**的总框——
   两处同时变时它会横跨整屏、基本没有信息量；要看**分开的**改动请用 `diff_boxes`（最多 5 处，按变化量排序）。
+- ✅ **输入文字前先想一下输入法（v0.2.34 起已自动处理，但要知道它做了什么）**：`type_text` 默认按环境选
+  路径——非 ASCII、含换行制表符、或前台挂着 CJK 输入法时走**剪贴板粘贴**（逐键输入会被输入法改写成拼音/
+  候选，实测 `cvision smoke 12345` → `才visionsmoke12345` 且不报错）；其余情况逐键输入、不动剪贴板。
+  所以：**`type_text` 偶尔会短暂占用剪贴板**（打完按 v0.2.19 的规则还原，用户期间复制的新内容优先）；
+  想强制某条路径就传 `direct=true`（逐键），或命令行 `--type-paste` / `--type-direct`、
+  环境变量 `CVISION_TYPE_DIRECT=1`。
+- ✅ **等窗口出现用 `wait_for_window`，但要给它一个「独特的」标题（v0.2.34 起匹配口径已统一）**：它按
+  **精确标题优先、其次子串**匹配（与 `see(window=…)` 同一套）。此前它取「枚举顺序里第一个含子串的窗口」，
+  于是等「运行」会等到标题含「以非管理员身份运行」的 v2rayN——**拿错窗口是静默的**：之后对着那个 handle 的
+  抓图/点击全作用在错窗口上。要更保险就直接用 `list_windows()` 拿 handle。
 
 ## 电脑使用（computer-use）推荐流程
 
@@ -328,7 +338,7 @@ npm run check:deps   # Python 依赖锁定自检（9 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
-当前规模：**JS 99 条 + Python 308 条**。
+当前规模：**JS 101 条 + Python 323 条**。
 
 ### 文档约定（自动校验）
 
@@ -398,9 +408,9 @@ git push origin v0.2.14          # ⚠️ 一次只推一个 tag，见下
 
 | 入口 | 参数 | 结果 |
 | --- | --- | --- |
-| `cvision.cli_capture` | `--list` / `--screen-info` / `--status` / `--window` / `--handle` / `--region` / `--delay` / `--format` / **`--json`** / **`--text`** / **`--wait-changed`** / **`--wait-stable`** / `--maximize` | 截图时是**裸 data URL 字符串**（不是 JSON）；`--json` 改为输出 `{ok:true,kind:"capture",data_url,width,height,image_screen_box,handle?,title?}`（宿主 CLI 回退路径靠它记住「这次看的是哪个窗口/哪一块屏幕」，缺它会让后续键盘输入沿用**上一次**的窗口——v0.2.33 修）；`--list`/`--screen-info`/`--status` 是各自的 JSON；`--text` → `{ok:true,kind:"capture_text",data_url,width,height,elements:[{text,box,center,screen_box,screen_center,word_count}]}`；`--wait-changed` → `{ok:true,kind:"wait_changed",data_url,changed,samples,elapsed_ms,diff_ratio,mean_diff,diff_bbox}`；**会改前台**的抓取（`--maximize`、还原最小化窗口、兜底读屏）被跨进程锁挡住时 → 一行 `ForegroundBusy` 说明 + 退出 1 |
+| `cvision.cli_capture` | `--list` / **`--find-window`** / `--screen-info` / `--status` / `--window` / `--handle` / `--region` / `--delay` / `--format` / **`--json`** / **`--text`** / **`--wait-changed`** / **`--wait-stable`** / `--maximize` | 截图时是**裸 data URL 字符串**（不是 JSON）；`--json` 改为输出 `{ok:true,kind:"capture",data_url,width,height,image_screen_box,handle?,title?}`（宿主 CLI 回退路径靠它记住「这次看的是哪个窗口/哪一块屏幕」，缺它会让后续键盘输入沿用**上一次**的窗口——v0.2.33 修）；`--list`/`--screen-info`/`--status` 是各自的 JSON；**`--find-window TITLE` → `{ok:true,kind:"window",window:{…}\|null}`（精确标题优先的解析，与常驻 server 的 `{"op":"find_window"}` 同形状，`wait_for_window` 的轮询靠它——v0.2.34 加）**；`--text` → `{ok:true,kind:"capture_text",data_url,width,height,elements:[{text,box,center,screen_box,screen_center,word_count}]}`；`--wait-changed` → `{ok:true,kind:"wait_changed",data_url,changed,samples,elapsed_ms,diff_ratio,mean_diff,diff_bbox}`；**会改前台**的抓取（`--maximize`、还原最小化窗口、兜底读屏）被跨进程锁挡住时 → 一行 `ForegroundBusy` 说明 + 退出 1 |
 | `cvision.cli_ocr` | `--window` / `--handle` / `--region` / `--delay` | `{ok:true,text,lines,words:[{text,x,y,w,h}]}` |
-| `cvision.cli_input` | `--click/--double/--move/--scroll/--scroll-h/--drag/--type/--keys/--focus/--focus-handle/--get-clipboard/--set-clipboard`，以及前置校验 `--ensure-front H [--unblock] [--at X Y]`、互斥开关 `--lock-timeout SECONDS` / `--no-lock`、会话身份 `--lock-label TEXT` | 动作类 `{ok:true}`；`--get-clipboard` → `{text}`；前置校验失败 → `{ok:false,stale?,error}` + 退出 1 且**动作不执行**；`--ensure-front` 与动作可以**合成一次调用**（置前、校验、动作同在**一个持锁区间**内）；锁超时 → `{ok:false,error}` + 退出 1；互斥被跳过/降级时多一个 `lock` 字段 |
+| `cvision.cli_input` | `--click/--double/--move/--scroll/--scroll-h/--drag/--type/--keys/--focus/--focus-handle/--get-clipboard/--set-clipboard`，输入路径开关 **`--type-direct`** / **`--type-paste`**（默认按文本与输入法自动选，见上表 `type_text`），以及前置校验 `--ensure-front H [--unblock] [--at X Y]`、互斥开关 `--lock-timeout SECONDS` / `--no-lock`、会话身份 `--lock-label TEXT` | 动作类 `{ok:true}`；`--get-clipboard` → `{text}`；前置校验失败 → `{ok:false,stale?,error}` + 退出 1 且**动作不执行**；`--ensure-front` 与动作可以**合成一次调用**（置前、校验、动作同在**一个持锁区间**内）；锁超时 → `{ok:false,error}` + 退出 1；互斥被跳过/降级时多一个 `lock` 字段 |
 | `cvision.cli_snip` | `--timeout 60` / `--format` | `{ok:true,data_url}`（退出 0）/ `{ok:false,reason:"cancelled"}`（2）/ `"unsupported"`（3）/ `"error"`（1） |
 | `cvision.cli_clipboard` | `--state` / `--image` | `{ok:true,supported,image,token,reason}` / `{ok:true,data_url}`、`{ok:false,reason:"empty"\|"unsupported"\|"error"}` |
 
@@ -500,6 +510,8 @@ vision/                      # 仓库根 = 插件本体
 | 抓窗口是黑图/空白 | 依次看：① `cvision_status()` 的 `capture_backends.wgc` —— 它会**真实探测**并给出 `reason`，别只看依赖装没装；② 装了 PyWinRT（`winrt-*`，见 `requirements.txt`）时 WGC 走标准 D3D11 互操作，**虚拟机上也能抓被遮挡窗口**；只装了 `winsdk` 时它要借 WinML 拿设备，虚拟机常见 `DXGI_ERROR_UNSUPPORTED`，此时 WGC 不可用、自动回退 `PrintWindow`／桌面区域；③ 微信等 Qt 窗口属已知空白帧场景 |
 | **抓图后窗口位置/大小变了**（如分屏被破坏） | 用内置**窗口跟踪诊断**取证，别猜：`$env:CVISION_TRACE_WINDOWS='1'; $env:CVISION_TRACE_FILE='C:\Temp\cv-trace.jsonl'` → 复现一次 → `python -m cvision.diagnose`。日志按阶段（`prepare`/`wgc`/`printwindow`/`grab_region`）记录 `rect`/`showCmd`/`zoomed`/`iconic`/`foreground` 的前后值，能区分「抓取过程中动的」与「抓取前后被别的因素动的」。默认关闭、零开销 |
 | 中文窗口标题匹配不上 | v0.2.2 起所有 Python 子进程强制 UTF-8；若自行调用 Python，请一并设 `PYTHONUTF8=1` |
+| **输入的文字变成了别的**（如 `cvision smoke 12345` → `才visionsmoke12345`） | 输入法把 ASCII 字母当成了拼音、把空格当成候选提交键。v0.2.34 起 `type_text` 在 CJK 布局 / 非 ASCII / 含换行时**自动改走剪贴板粘贴**（粘贴不受输入法影响）；若你的环境没被识别出来（探测是「布局级」的），用 `type_text(text, direct=false)` 的默认即可，或命令行加 `--type-paste`；反过来不想让插件碰剪贴板就设 `CVISION_TYPE_DIRECT=1` 或加 `--type-direct` |
+| **`wait_for_window` 等到了错的窗口** | v0.2.34 前它按「枚举顺序里第一个标题含子串的窗口」命中（拿「运行」会等到 v2rayN，因为标题里有「以非管理员身份运行」）。现在走与 `see(window=…)` 相同的解析（精确标题优先）；要更精确就直接传 `handle` 给其它工具、或用一个更独特的标题 |
 | 升级后行为没变 | 见[升级后必须做什么](#升级后必须做什么)：客户端半边要**硬刷新**，宿主半边要**重启** |
 | `plugin add` 报 `ERR_PNPM_EPERM … rename '…vision_tmp_…' -> '…vision'` | 安装目录被占用（≤0.2.15 的插件 Python 子进程以它为 cwd）。**先关 DSH** 再装；0.2.16 起不会再有此问题（cwd 已改为系统临时目录） |
 | macOS 上窗口标题为空 | 需在「系统设置 → 隐私与安全 → 屏幕录制」授权 |
@@ -531,7 +543,7 @@ vision/                      # 仓库根 = 插件本体
 
   | 动作 | 取锁 | 为什么 |
   | --- | --- | --- |
-  | 输入类（click/drag/scroll/type/keys/focus/剪贴板读写） | 是（10s） | 直接驱动设备、改前台；读剪贴板也算，因为非 ASCII 输入会**临时改写**剪贴板 |
+  | 输入类（click/drag/scroll/type/keys/focus/剪贴板读写） | 是（10s） | 直接驱动设备、改前台；读剪贴板也算，因为**只要可能撞上输入法（CJK 布局）、或是非 ASCII / 含换行，就会临时改写**剪贴板——v0.2.34 起这类 ASCII 也走粘贴，`--type-direct`（或 `CVISION_TYPE_DIRECT=1`）可强制逐键 |
   | 抓图且**会**改前台/窗口状态（`maximize=true`、还原最小化窗口、兜底读屏；macOS 的解除最小化同理） | 是（**2s**） | 与输入抢同一个前台；它正好能插进「已校验坐标、还没点下去」的那个窗口期 |
   | 抓图但不改状态（WGC/PrintWindow 成功、整屏抓取） | 否 | 纯只读，锁进去只会让「另一个会话在打字」时连截图都做不了（已实测：持锁期间只读抓图照常成功） |
   | OCR / `list_windows` / `screen_info` / `status` / `wait_*` | 否 | 只读；`wait_*` 还会阻塞 10–45s，锁进去等于把桌面串行化 |

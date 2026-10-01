@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 
@@ -508,12 +509,97 @@ def _paste_clipboard(text: str) -> None:
             pass
 
 
-def type_text(text: str) -> None:
-    pg = _require_pyautogui()
-    if text.isascii():
-        pg.write(text, interval=0.03)
+def _needs_paste(text: str) -> bool:
+    """逐键输入**打不出来**的文本：非 ASCII，或含换行/制表符。
+
+    ``pyautogui.write`` 只认单字符键：``\\n``/``\\t`` 不是键名（会被静默跳过），中文等非 ASCII
+    更是打不进去。所以这些内容必须走剪贴板粘贴。
+    """
+    return (not text.isascii()) or any(ch in text for ch in "\n\r\t")
+
+
+#: LANGID 的 primary language 落在 CJK 语言里（zh=0x04 / ja=0x11 / ko=0x12）。
+_CJK_PRIMARY_LANGUAGES = frozenset({0x04, 0x11, 0x12})
+
+
+def _langid_may_be_ime(langid: int | None) -> bool:
+    """这个键盘布局 LANGID 是否**可能**挂着一个会改写按键的输入法（纯函数，便于单测）。"""
+    if langid is None:
+        return False
+    return (langid & 0x3FF) in _CJK_PRIMARY_LANGUAGES
+
+
+def _foreground_layout_langid() -> int | None:
+    """前台窗口的键盘布局 LANGID（如 ``0x0804``=zh-CN、``0x0409``=en-US）；拿不到返回 None。
+
+    为什么用「前台窗口所在线程的布局」而不是 ``ImmGetConversionStatus``：后者要拿 HIMC，而 HIMC
+    只在**自己线程**的窗口上可靠（跨线程取/放属于未定义行为）。``GetKeyboardLayout(threadId)``
+    线程安全、也不需要额外依赖（ctypes 直接调 user32）。代价是它只能看出「这个窗口挂的是哪国
+    布局」，看不出输入法当前是「中文」还是「英文」模式——所以判定**偏保守**：CJK 布局就当可能被拦截。
+    """
+    if not _is_windows():  # pragma: no cover - 平台分支
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetKeyboardLayout.argtypes = [wintypes.DWORD]
+        user32.GetKeyboardLayout.restype = ctypes.c_void_p  # HKL 是句柄
+
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        thread_id = user32.GetWindowThreadProcessId(hwnd, None)
+        hkl = user32.GetKeyboardLayout(thread_id)
+        if not hkl:
+            return None
+        return int(hkl) & 0xFFFF
+    except Exception:  # noqa: BLE001 - 探测失败不该让输入整体失败
+        return None
+
+
+def _ime_may_intercept() -> bool:
+    """前台窗口是否**可能**被输入法改写按键（Windows 且挂的是 CJK 布局）。
+
+    为什么需要它（v0.2.34 的现场实测）：在开着讯飞输入法的桌面里
+    ``type_text("cvision smoke 12345")`` 实际输入成了 ``才visionsmoke12345``——ASCII 字母被当成
+    拼音、空格被当成候选提交键。而剪贴板粘贴路径（Ctrl+V）**完全不受输入法影响**。
+    逐键路径保留给不挂 CJK 布局的场景：它更快，也不用动用户的剪贴板。
+    """
+    return _langid_may_be_ime(_foreground_layout_langid())
+
+
+def _type_direct_from_env() -> bool:
+    """``CVISION_TYPE_DIRECT=1`` 强制逐键输入（排错 / 不想被占用剪贴板时用）。"""
+    raw = os.environ.get("CVISION_TYPE_DIRECT", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def type_text(text: str, *, paste: bool | None = None) -> None:
+    """输入文本；默认**按文本与输入法自动选**最稳的那条路径，可用 ``paste`` 强制。
+
+    - 非 ASCII / 含换行制表符 → 必须粘贴（逐键打不出来，或会被静默丢掉）；
+    - Windows 且前台是 CJK 布局 → 粘贴（逐键会被输入法改写，见 :func:`_ime_may_intercept`）；
+    - 其余情况 → 逐键输入（不动用户的剪贴板）。
+
+    代价要说清：粘贴路径会**短暂占用剪贴板**，打完按 :func:`_paste_clipboard` 的规则还原
+    ——若期间用户复制了别的东西，那份新内容优先、不会被覆盖（v0.2.19 起）。
+
+    :param paste: True 强制粘贴 / False 强制逐键 / None 自动（环境变量 ``CVISION_TYPE_DIRECT``
+        可全局强制逐键）。
+    """
+    if text == "":
         return
-    _paste_clipboard(text)
+    if paste is None:
+        paste = (not _type_direct_from_env()) and (_needs_paste(text) or _ime_may_intercept())
+    if paste:
+        _paste_clipboard(text)
+        return
+    _require_pyautogui().write(text, interval=0.03)
 
 
 def press_keys(keys: str) -> None:

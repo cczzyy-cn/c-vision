@@ -395,4 +395,30 @@
 
 ---
 
-*本报告为分析产物；§7 对应的代码改动已落地为 v0.2.33（未提交，工作区改动即全部内容）。*
+## 8. 桌面版全量冒烟测试中新发现的两项缺陷（v0.2.34）
+
+用户在桌面版里实测「截图按钮」修好后，要求「测试桌面板插件其它功能是否正常」。16 个工具 + 4 条路由 + 客户端半边逐个实跑（靶子用自建的系统「运行」对话框，全程不按回车、事后还原剪贴板与鼠标位置），**其它都正常，暴露出两项新缺陷**——它们不在 §4 的清单里，是**跑出来**的。
+
+### 8.1 `wait_for_window` 会等到错的窗口（静默拿错 handle）
+
+- **现象**：`wait_for_window("运行")` 返回 `v2rayN - V7.24.1 - X64 - 以非管理员身份运行`，而标题精确等于「运行」的对话框被跳过。
+- **根因**：宿主自写扫描——`src/index.ts` 里 `windows.find(w => w.title.toLowerCase().includes(needle))`，取的是**枚举顺序里第一个命中**。项目本来已有唯一一份匹配语义 `capture.base.pick_window`（精确标题优先 → 非最小化 → 面积大），`see(window=…)`/`ocr(window=…)`/`cli_capture --window` 全走它。
+- **危害**：静默。拿错 handle 之后，对着它的抓图/点击全作用在错窗口上；`detail` 里虽写了 found 的是谁，但调用方很容易只读 `found: true`。
+- **修法**：新增 server op `{"op":"find_window","window":…}` 与同形状 CLI `--find-window TITLE`（内部都调 `capturer.resolve_window`，不重写匹配），`wait_for_window` 每轮改调它；匹配语义回到一份实现。
+- **验证**：Python 4 条（op 形状 / 无命中→`null` 且 `ok:true` / CLI 形状 / CLI 无命中）+ JS 1 条（宿主改调解析器、`includes(needle)` 自写扫描已消失）；并在本机**真实撞车现场**（v2rayN 与「运行」对话框同时在列表里）跑了两条通道，都返回精确标题那个。
+
+### 8.2 `type_text` 逐键输入会被输入法改写（静默写错内容）
+
+- **现象**：`type_text("cvision smoke 12345")` → 实际 `才visionsmoke12345`；同环境下 `type_text("测试中文 123")` 与 `type_text("98765")` 逐字精确。
+- **根因**：`input.type_text` 只对**非 ASCII** 走剪贴板粘贴，ASCII 走 `pyautogui.write` 逐键——逐键会被活动 IME 拦截（字母当拼音、空格当候选提交键）。现场证据：任务栏是讯飞输入法指示器（已截图存档）。粘贴路径（Ctrl+V）与输入法无关。
+- **修法**：`type_text(text, *, paste=None)` 默认按环境选路径：非 ASCII / 含换行制表符 / **前台是 CJK 布局** → 粘贴；其余 → 逐键。空串直接返回（否则会把剪贴板里已有的内容粘进目标）。探测用 `GetKeyboardLayout(前台窗口线程)`——不用 `ImmGetConversionStatus`：它需要 HIMC，而 HIMC 跨线程取放是未定义行为；代价是只能判到「布局级」，所以判定**偏保守**（CJK 布局就当可能被拦截）。逃生口：`--type-direct`/`--type-paste`/`CVISION_TYPE_DIRECT=1`，工具侧 `type_text(direct=true)`。
+- **代价（已写进 README）**：CJK 环境下 ASCII 输入也会短暂占用剪贴板；占用期间的竞态仍由 v0.2.19 的「只在剪贴板仍是我们写的那份时才还原」保护兜着。
+- **验证**：Python 9 条路径选择用例（含「空串不粘贴」「en-US 才逐键」「env 强制逐键」）+ CLI 2 条参数映射 + JS 1 条 argv 映射；另在本机跑**真机链路**（`cli_input --ensure-front … --type` → 复制回读），ASCII 文本原样进入目标。
+
+### 8.3 冒烟测试里确认正常的项（记录，供以后回归对照）
+
+`cvision_status`（含 `backend_import_error`、`input_lock.available`、`wgc.available`）、`screen_info`、`list_windows`、`see()`/`see(text=true)`/`see(ocr=true)`、`ocr`、`wait_until_stable`（stable=true）、`wait_until_changed`（超时 unchanged，返回画面）、`click`/`click_at`/`double_click`/`mouse_move`/`drag`/`scroll`/`press_key`/`focus_window`/`get_clipboard`/`set_clipboard`，以及 §7.5 那条修复的**现场复核**：`wait_until_stable(region=…)` 之后 `click_at(0.5,0.5)` 报出的是**该区域**的中心（68,1314），而不是上一次 `see` 整窗矩形的中心（214,1269）。
+
+---
+
+*本报告为分析产物；§7 与 §8 对应的代码改动已分别落地为 **v0.2.33** 与 **v0.2.34**（均已提交并发布 Release）。*

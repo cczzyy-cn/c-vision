@@ -1035,6 +1035,32 @@ test('抓取目标：新的抓取结果覆盖旧值（不是「有值才覆盖�
   operationTarget.frame = null
 })
 
+test('type_text：默认不带开关，direct=true 才加 --type-direct（路径由 Python 按输入法决定）', async () => {
+  // 回归（v0.2.34 现场）：ASCII 文本逐键输入会被输入法改写成拼音/候选（实测
+  // `cvision smoke 12345` → `才visionsmoke12345`，且不报错）。默认路径交给 Python 的
+  // `input.type_text` 判断（非 ASCII/换行/CJK 布局 → 粘贴），这里只钉「开关确实传下去了」。
+  const { tool } = mountHost()
+  operationTarget.handle = null
+  await captureInputArgs([{ ok: true }, { ok: true }], async (calls) => {
+    await tool('type_text').execute({ text: 'abc' }, fakeExec())
+    await tool('type_text').execute({ text: 'abc', direct: true }, fakeExec())
+    assert.deepEqual(calls[0], ['--type', 'abc'], '默认不带任何路径开关')
+    assert.deepEqual(calls[1], ['--type', 'abc', '--type-direct'])
+  })
+})
+
+test('wait_for_window：按标题找窗口必须交给 Python 解析器，不许自己扫子串', () => {
+  // 回归（v0.2.34 现场）：宿主原先取「枚举顺序里第一个标题含子串的窗口」，于是
+  // wait_for_window("运行") 拿到的是「v2rayN … 以非管理员身份运行」，而精确标题就叫「运行」的
+  // 那个对话框排在它后面。拿错窗口是**静默**的：之后对着这个 handle 的抓图/点击全作用在错窗口上。
+  // 真正的匹配语义（精确标题优先 → 非最小化 → 面积大）在 `capture.base.pick_window` 里只有一份，
+  // 所以这里钉「宿主改成了调 find_window 解析入口」+「自写扫描已消失」。
+  // 端到端跑不了：那要 spawn Python 并真的轮询窗口（CI 的 JS 任务不装 Pillow/pywin32）。
+  const lib = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  assert.ok(lib.includes('find_window'), 'wait_for_window 必须走 find_window 这个解析入口')
+  assert.ok(!lib.includes('.includes(needle)'), '不许再出现「标题里含子串」的自写扫描')
+})
+
 test('抓取目标：see 与两个 wait_* 都必须调用它（wait 返回的是新图，基准得跟着换）', () => {
   // `wait_*` 返回一张**新图**，而 `click_at` 是按比例点「最近一次抓取那张图」：不更新基准的话，
   // 「等它变完 → 按比例点结果区」会按上一次 see 的矩形换算——位置整体偏，而且不报错。

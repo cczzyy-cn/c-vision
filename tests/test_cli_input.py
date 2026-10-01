@@ -149,6 +149,16 @@ class TestArgumentMapping(unittest.TestCase):
         _, _, (name, args, _) = self._one(["--type", "你好 world"])
         self.assertEqual((name, args), ("type_text", ("你好 world",)))
 
+    def test_type_text_direct_flag(self):
+        """``--type-direct`` 必须把 ``paste=False`` 传下去：输入法环境里强制逐键的逃生口。"""
+        _, _, (name, args, kwargs) = self._one(["--type", "abc", "--type-direct"])
+        self.assertEqual((name, args, kwargs), ("type_text", ("abc",), {"paste": False}))
+
+    def test_type_text_paste_flag(self):
+        """``--type-paste`` 相反，强制走剪贴板（默认是「按文本与输入法自动选」）。"""
+        _, _, (name, args, kwargs) = self._one(["--type", "abc", "--type-paste"])
+        self.assertEqual((name, args, kwargs), ("type_text", ("abc",), {"paste": True}))
+
     def test_press_keys(self):
         _, _, (name, args, _) = self._one(["--keys", "ctrl+shift+t"])
         self.assertEqual((name, args), ("press_keys", ("ctrl+shift+t",)))

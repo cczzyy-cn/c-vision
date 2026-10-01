@@ -10,6 +10,42 @@
 > - `v0.1.0` ~ `v0.1.9` 的说明只在 [GitHub Releases](https://github.com/cczzyy-cn/c-vision/releases) 里
 >   （那时还没有本文件）。
 
+## v0.2.34
+
+**修两项「在桌面版真机上实测」时发现的新缺陷（都不是分析阶段列出来的，是跑出来的）：**
+
+### 一、`wait_for_window` 会等到**错的窗口**
+
+- **现象**：`wait_for_window("运行")` 返回的是 `v2rayN - V7.24.1 - X64 - 以非管理员身份运行`，
+  而真正标题就叫「运行」的那个对话框被跳过。
+- **根因**：宿主自己扫「枚举顺序里第一个标题含子串的窗口」（旧 `src/index.ts` 里一行
+  `.toLowerCase().includes(needle)`），而项目**本来就有唯一一份匹配语义**：
+  `capture.base.pick_window`（精确标题优先 → 非最小化 → 面积大），`see(window=…)`/`ocr(window=…)`/
+  `cli_capture --window` 全走它。危害是**静默**的——拿错 handle 之后，对着它的抓图/点击全作用在错窗口上。
+- **修法**：新增常驻 server op `{"op":"find_window","window":…}` 与**同形状**的 CLI
+  `--find-window TITLE`（内部都直接调 `capturer.resolve_window`，不重写匹配），`wait_for_window`
+  每轮改调它；工具说明改成「精确标题优先、其次子串」。找不到时 `window:null` 且 `ok:true`（轮询要能继续等）。
+- **验证**：Python 侧 4 条（op 形状 / 无命中 → null / CLI 形状 / CLI 无命中）+ JS 1 条（宿主改调解析器、
+  自写扫描已消失）；另外在本机用**真实撞车现场**（v2rayN 与「运行」对话框同时在窗口列表里）跑了两条通道。
+
+### 二、`type_text` 逐键输入会被输入法改写
+
+- **现象**：`type_text("cvision smoke 12345")` 实际输入成了 `才visionsmoke12345`（字母被当拼音、空格被当
+  候选提交键），而且**不报错**；同一环境下 `type_text("测试中文 123")` 与 `type_text("98765")` 逐字精确。
+- **根因**：`input.type_text` 只对**非 ASCII** 走剪贴板粘贴，ASCII 走 `pyautogui.write` 逐键——逐键会被
+  活动的 IME 拦截（现场证据：任务栏是讯飞输入法）。粘贴路径（Ctrl+V）不受输入法影响。
+- **修法**：`type_text(text, *, paste=None)` 默认按环境选路径：非 ASCII / 含换行制表符 / **前台是 CJK 布局**
+  → 粘贴；其余 → 逐键（不动剪贴板）。空串直接返回（否则会把剪贴板里已有的内容粘进目标）。IME 探测用
+  `GetKeyboardLayout(前台窗口线程)`（不用 `ImmGetConversionStatus`：它要 HIMC，而 HIMC 跨线程取放是未定义
+  行为），判定**偏保守**——CJK 布局就当可能被拦截。逃生口：`--type-direct` / `--type-paste` /
+  `CVISION_TYPE_DIRECT=1`，工具侧 `type_text(text, direct=true)`。
+- **如实写进文档的代价**：CJK 环境下 ASCII 输入也会短暂占用剪贴板；占用期间的竞态仍由 v0.2.19 的保护兜着。
+- **验证**：Python 侧 9 条路径选择用例（含「空串不粘贴」「en-US 才逐键」「env 强制逐键」）+ CLI 2 条参数映射
+  + JS 1 条 argv 映射。
+
+**测试与门禁**：Python 308 → **323**、JS 99 → **101**；`check:dsh` 30/30、`check:docs` 17/17、
+`check:deps` 9/9 全绿。
+
 ## v0.2.33
 
 **修三个真实缺陷：抓取目标不再沿用旧值（键盘输入曾被静默送进上一个窗口）、体检探针不再依赖

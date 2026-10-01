@@ -155,6 +155,8 @@ def _wait_stable(args) -> int:
 def _run(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="截屏输出 base64 data URL，或列出窗口")
     parser.add_argument("--list", action="store_true", help="列出可见窗口(JSON)，不截图")
+    parser.add_argument("--find-window", dest="find_window", default=None,
+                        help="按标题解析窗口并输出 JSON（**精确标题优先**，与 see(window=…) 同一语义；不截图）")
     parser.add_argument("--screen-info", action="store_true", help="输出显示器/DPI 布局(JSON)，不截图")
     parser.add_argument("--status", action="store_true", help="输出运行环境健康状态(JSON)，不截图")
     parser.add_argument("--text", action="store_true", help="截图后同时 OCR，返回可点击元素（含屏幕坐标）")
@@ -186,6 +188,19 @@ def _run(argv: list[str] | None = None) -> int:
         capturer, _ = _capture_deps()
         sys.stdout.write(
             json.dumps([w.to_dict() for w in capturer.list_windows()], ensure_ascii=True)
+        )
+        return 0
+
+    if args.find_window is not None:
+        # 与常驻 server 的 {"op":"find_window"} **同形状**：宿主轮询等窗口时读它。
+        # 走的是 `pick_window`（精确标题优先），不是在标题里扫子串——见 README 的匹配口径说明。
+        capturer, _ = _capture_deps()
+        win = capturer.resolve_window(None, args.find_window)
+        sys.stdout.write(
+            json.dumps(
+                {"ok": True, "kind": "window", "window": win.to_dict() if win is not None else None},
+                ensure_ascii=True,
+            )
         )
         return 0
 

@@ -152,7 +152,9 @@ def _resolve_action(args) -> tuple[str, Callable[[], tuple[dict, int]]] | None:
     if args.get_clipboard:
         return "get_clipboard", lambda: ({"text": inp.get_clipboard()}, 0)
     if args.text is not None:
-        return "type_text", lambda: _act(lambda: inp.type_text(args.text))
+        # 两种强制开关互斥；都不给就交给 `input.type_text` 按文本与输入法自动选路径（见那里的说明）。
+        forced = True if args.type_paste else (False if args.type_direct else None)
+        return "type_text", lambda: _act(lambda: inp.type_text(args.text, paste=forced))
     if args.keys:
         return f"press_keys({args.keys})", lambda: _act(lambda: inp.press_keys(args.keys))
     return None
@@ -189,6 +191,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--scroll-h", nargs=3, type=int, metavar=("X", "Y", "DX"), help="在 (X,Y) 水平滚动 DX 格")
     p.add_argument("--drag", nargs=4, type=int, metavar=("X1", "Y1", "X2", "Y2"), help="从 (X1,Y1) 拖到 (X2,Y2)")
     p.add_argument("--type", dest="text", default=None, help="输入/键入文本")
+    p.add_argument("--type-direct", dest="type_direct", action="store_true",
+                   help="强制**逐键**输入（默认按文本与输入法自动选：CJK 布局下逐键会被输入法改写）")
+    p.add_argument("--type-paste", dest="type_paste", action="store_true",
+                   help="强制走剪贴板粘贴（会短暂占用剪贴板，见 README 的输入说明）")
     p.add_argument("--keys", default=None, help="发送快捷键，如 ctrl+l / enter / ctrl+shift+t")
     p.add_argument("--get-clipboard", action="store_true", help="读取剪贴板文本并输出 JSON")
     p.add_argument("--set-clipboard", default=None, help="把文本写入剪贴板")

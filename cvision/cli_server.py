@@ -17,6 +17,7 @@
     {"op":"wait_stable","window":str?,"handle":int?,"region":"x,y,w,h"?,"interval":ms,"stable_samples":int,"timeout":ms,"threshold":float}
     {"op":"ocr","window":str?,"handle":int?,"maximize":bool,"region":"x,y,w,h"?,"delay":ms}
     {"op":"list"}
+    {"op":"find_window","window":str}   # 按标题解析窗口（精确标题优先），返回 window 或 null
     {"op":"screen_info"}
     {"op":"status"}
     {"op":"clipboard_state"}   # 廉价剪贴板状态（页面每秒轮询用）
@@ -29,6 +30,7 @@
     {"ok":true,"kind":"wait_changed","data_url":"data:...","width":int,"height":int,"changed":bool,"diff_ratio":float,...,"image_screen_box":{...},"handle":int?,"title":str?}
     {"ok":true,"kind":"wait_stable","data_url":"data:...","width":int,"height":int,"stable":bool,"max_diff_ratio":float,...,"image_screen_box":{...},"handle":int?,"title":str?}
     {"ok":true,"kind":"list","windows":[{...}]}
+    {"ok":true,"kind":"window","window":{...}|null}
     {"ok":true,"kind":"screen_info","displays":[{...}]}
     {"ok":true,"kind":"status","status":{...}}
     {"ok":true,"kind":"clipboard_state","supported":bool,"image":bool,"token":str?,"reason":str}
@@ -145,6 +147,20 @@ def _list():
     }
 
 
+def _find_window(args: dict):
+    """按标题解析窗口，**与 `see(window=…)` 共用同一套匹配语义**。
+
+    为什么要有这个 op（v0.2.34 修的缺陷）：宿主原先自己扫「标题里含子串」的第一个命中，于是
+    `wait_for_window("运行")` 把标题为「v2rayN … 以非管理员身份运行」的窗口当成了目标——而真正的
+    「运行」对话框标题就是精确的「运行」，却排在它后面。匹配语义只该有一份：
+    ``capture.base.pick_window``（精确标题优先 → 非最小化 → 面积大）。
+    """
+    from cvision import capturer
+
+    win = capturer.resolve_window(args.get("handle"), args.get("window"))
+    return {"ok": True, "kind": "window", "window": win.to_dict() if win is not None else None}
+
+
 def _screen_info():
     from cvision import screen
 
@@ -254,6 +270,8 @@ def handle(req: dict) -> dict:
         return _ocr(req)
     if op == "list":
         return _list()
+    if op == "find_window":
+        return _find_window(req)
     if op == "screen_info":
         return _screen_info()
     if op == "status":

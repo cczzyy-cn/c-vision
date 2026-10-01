@@ -109,6 +109,28 @@ class TestHandleContract(unittest.TestCase):
         self.assertTrue(resp["ok"])
         self.assertEqual(resp["windows"][0]["title"], "记事本")
 
+    def test_find_window_uses_the_python_resolver(self):
+        """按标题找窗口必须走 ``capturer.resolve_window``（= ``pick_window``：精确标题优先）。
+
+        v0.2.34 修的缺陷正是「宿主自己扫标题子串的第一个命中」：``wait_for_window("运行")`` 拿到的是
+        「v2rayN … 以非管理员身份运行」而不是精确标题为「运行」的对话框。语义只许有一份。
+        """
+        window = Window(handle=7, title="运行", left=1, top=2, width=3, height=4)
+        with mock.patch.object(capturer, "resolve_window", return_value=window) as resolver:
+            resp = cli_server.handle({"op": "find_window", "window": "运行"})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["kind"], "window")
+        self.assertEqual(resp["window"]["handle"], 7)
+        self.assertEqual(resp["window"]["title"], "运行")
+        resolver.assert_called_once_with(None, "运行")
+
+    def test_find_window_reports_null_when_nothing_matches(self):
+        """找不到**不是错误**：轮询要能继续等到它出现。"""
+        with mock.patch.object(capturer, "resolve_window", return_value=None):
+            resp = cli_server.handle({"op": "find_window", "window": "还没出现的窗口"})
+        self.assertTrue(resp["ok"])
+        self.assertIsNone(resp["window"])
+
     def test_exception_becomes_ok_false(self):
         """任何 op 抛错都必须被 main 的 try 包成 ``ok:false``，不能让整个进程死掉。"""
         with mock.patch.object(capturer, "capture_screen", side_effect=RuntimeError("截图炸了")):
