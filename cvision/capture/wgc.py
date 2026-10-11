@@ -205,6 +205,41 @@ def device() -> Any:
     return _DEVICE
 
 
+def _is_bgra(pixel_format: Any) -> bool:
+    """判断帧缓冲的字节序是不是 BGRA（拿不到格式信息时**按 BGRA 算**）。
+
+    默认必须是 BGRA：帧池就是按 ``B8_G8_R8_A8_UINT_NORMALIZED`` 建的（见
+    :func:`capture_window`），而 ``create_copy_from_surface_async`` 只是原样复制
+    surface，格式不变。只有**明确**看出是 ``R8G8B8A8`` 才当 RGBA——猜错的代价是红蓝对调，
+    那比"什么都不做"更糟。
+    """
+    if pixel_format is None:
+        return True
+    name = str(pixel_format).upper().replace("_", "").replace(" ", "")
+    if "R8G8B8A8" in name and "B8G8R8A8" not in name:
+        return False
+    return True
+
+
+def decode_frame(raw: bytes, width: int, height: int, pixel_format: Any = None):
+    """把 WGC 的一帧原始缓冲解码成 PIL ``RGB`` 图像。
+
+    ⚠️ 缓冲里第一个字节是**蓝**（BGRA），不是红。v0.2.35 前这里写成
+    ``Image.frombytes("RGBA", …)``，于是**红蓝两通道整体对调**：纯蓝 (0,0,255) 读成纯红
+    (255,0,0)、黄 (204,204,0) 读成青 (0,204,204)，而绿色不受影响——看起来只是"偏色"，
+    所以能长期不被发现（真机上用四色块窗口才测出来）。用 PIL 的 rawmode ``"BGRA"``
+    交给它自己拆字节序，别再按点位手算。
+    """
+    from PIL import Image
+
+    rawmode = "BGRA" if _is_bgra(pixel_format) else "RGBA"
+    # PIL 只允许 ``RGBA`` 模式配 ``BGRA`` rawmode（``RGB`` 配 ``BGRA`` 直接报 unknown raw mode），
+    # 所以先带 alpha 解出来、再丢掉 alpha。屏幕内容本就不透明。
+    return Image.frombytes(
+        "RGBA", (int(width), int(height)), raw, "raw", rawmode, 0, 1
+    ).convert("RGB")
+
+
 def capture_window(handle: int, timeout: float = 4.0):
     """用 WGC 抓一帧窗口画面；任何失败都返回 ``None``（由调用方回退到别的后端）。"""
     found = binding()
@@ -247,11 +282,12 @@ def capture_window(handle: int, timeout: float = 4.0):
         finally:
             buffer.close()
 
-        from PIL import Image
-
-        return Image.frombytes(
-            "RGBA", (bitmap.pixel_width, bitmap.pixel_height), raw
-        ).convert("RGB")
+        return decode_frame(
+            raw,
+            bitmap.pixel_width,
+            bitmap.pixel_height,
+            getattr(bitmap, "bitmap_pixel_format", None),
+        )
     except Exception:
         return None
     finally:

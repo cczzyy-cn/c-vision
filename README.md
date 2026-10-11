@@ -10,7 +10,7 @@ Python 版 cvision** 截屏/OCR/输入 → 写入 Harness 附件服务（`ctx.at
 
 同一个包还带一个**浏览器半边**：输入框工具栏的「截图」按钮（人工一键抓屏，或把剪贴板里的图片作为附件）。
 
-**版本**：`0.2.34` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
+**版本**：`0.2.35` · **平台**：Windows（完整，实测）/ macOS（Phase 1，未真机验证）/ Linux（Phase 2 占位）·
 **许可**：BSD-3-Clause · 变更历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 目录
@@ -338,7 +338,7 @@ npm run check:deps   # Python 依赖锁定自检（9 项）
 python -m unittest discover -s tests -v   # Python 纯逻辑单测（仅需 Pillow）
 ```
 
-当前规模：**JS 101 条 + Python 323 条**。
+当前规模：**JS 101 条 + Python 329 条**。
 
 ### 文档约定（自动校验）
 
@@ -482,6 +482,7 @@ vision/                      # 仓库根 = 插件本体
     test_clipboard_race.py #  剪贴板竞态回归（用户占用期间复制的内容绝不被覆盖）
     test_capture_foreground.py #  抓图前的窗口准备：普通窗口不碰前台/最小化窗口会被置前
     test_wgc_probe.py      #   WGC 可用性探测的缓存语义（指纹/过期/时钟回拨/损坏文件 → 必须失效）
+    test_wgc_decode.py     #   WGC 帧缓冲的字节序（BGRA 缓冲读出红蓝对调 → 纯蓝必须还是纯蓝）
     test_wait_stable.py    #   wait_until_stable 的判定：必须是**连续**安静，中途变一次要重新计数
     test_status.py         #   体检探针必须零依赖（子进程断言）+ 缺 Pillow 故障注入下 --status 仍须出结论
     test_diagnose.py      #   窗口跟踪诊断（改动字段判定 / 开关 / 关闭时不写文件 / 写失败不抛）
@@ -508,6 +509,7 @@ vision/                      # 仓库根 = 插件本体
 | 取消了截图，之后别的截图却进了附件栏 | v0.2.13 起修复（覆盖层判据）；若先前的旧版本仍在跑，重启宿主 |
 | 工具报 `python` 找不到 / 依赖缺失 | 装 Python 3.10+ 与 `python -m pip install -r requirements.txt`；**v0.2.18 起首次调用会直接给出带绝对路径的安装命令**；`cvision_status()` 会列出缺哪个模块——**v0.2.33 起体检探针自己不依赖任何第三方包**，所以「一个依赖都没装」的环境里它照样能给出结论（此前缺 Pillow 时探针会先崩在 import 上） |
 | 抓窗口是黑图/空白 | 依次看：① `cvision_status()` 的 `capture_backends.wgc` —— 它会**真实探测**并给出 `reason`，别只看依赖装没装；② 装了 PyWinRT（`winrt-*`，见 `requirements.txt`）时 WGC 走标准 D3D11 互操作，**虚拟机上也能抓被遮挡窗口**；只装了 `winsdk` 时它要借 WinML 拿设备，虚拟机常见 `DXGI_ERROR_UNSUPPORTED`，此时 WGC 不可用、自动回退 `PrintWindow`／桌面区域；③ 微信等 Qt 窗口属已知空白帧场景 |
+| **抓图颜色不对（红蓝对调：蓝的发红、黄的发青、绿色正常）** | v0.2.35 修的真实缺陷：WGC 帧池按 `B8G8R8A8`（首字节是蓝）建，解码却按 `RGBA` 读 → 红蓝整对对调。症状是「偏色」而非「黑图」，且**整屏抓图正常**（只有 WGC 这一路错），所以容易误判成主题色。升级到 v0.2.35 即可；要自查就用已知颜色的窗口对照 `PrintWindow` 抓同一窗口，或在真机上跑 `python -m pytest tests/test_wgc_decode.py` |
 | **抓图后窗口位置/大小变了**（如分屏被破坏） | 用内置**窗口跟踪诊断**取证，别猜：`$env:CVISION_TRACE_WINDOWS='1'; $env:CVISION_TRACE_FILE='C:\Temp\cv-trace.jsonl'` → 复现一次 → `python -m cvision.diagnose`。日志按阶段（`prepare`/`wgc`/`printwindow`/`grab_region`）记录 `rect`/`showCmd`/`zoomed`/`iconic`/`foreground` 的前后值，能区分「抓取过程中动的」与「抓取前后被别的因素动的」。默认关闭、零开销 |
 | 中文窗口标题匹配不上 | v0.2.2 起所有 Python 子进程强制 UTF-8；若自行调用 Python，请一并设 `PYTHONUTF8=1` |
 | **输入的文字变成了别的**（如 `cvision smoke 12345` → `才visionsmoke12345`） | 输入法把 ASCII 字母当成了拼音、把空格当成候选提交键。v0.2.34 起 `type_text` 在 CJK 布局 / 非 ASCII / 含换行时**自动改走剪贴板粘贴**（粘贴不受输入法影响）；若你的环境没被识别出来（探测是「布局级」的），用 `type_text(text, direct=false)` 的默认即可，或命令行加 `--type-paste`；反过来不想让插件碰剪贴板就设 `CVISION_TYPE_DIRECT=1` 或加 `--type-direct` |
